@@ -28,8 +28,15 @@ actor ContainerRenameMap {
     }
 
     /// The container a retired ID now refers to, if that ID belonged to a renamed container.
+    ///
+    /// Accepts a prefix, because Docker clients truncate: `docker ps` prints 12 characters and
+    /// feeds them straight back into `rm`/`inspect`. An ambiguous prefix resolves to nothing rather
+    /// than to an arbitrary one of the candidates.
     func nativeId(forRetiredHexId hexId: String) -> String? {
-        nativeIdsByRetiredHexId[hexId]
+        if let exact = nativeIdsByRetiredHexId[hexId] { return exact }
+        guard !hexId.isEmpty else { return nil }
+        let matches = Set(nativeIdsByRetiredHexId.filter { $0.key.hasPrefix(hexId) }.values)
+        return matches.count == 1 ? matches.first : nil
     }
 
     /// Drops every retired ID that pointed at `nativeId`. Called when the container is deleted:

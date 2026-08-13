@@ -33,21 +33,126 @@ struct ContainerRenameRouteTests {
 
     private func withRoute(
         containers: [ContainerSnapshot],
-        test: @escaping (Application) async throws -> Void
+        refusesDelete: Bool = false,
+        recreate: (@Sendable (RenameContainerStore, ContainerConfiguration) async throws -> Void)? = nil,
+        discard: ContainerRenameRoute.Discard? = nil,
+        test: @escaping (Application, RenameContainerStore) async throws -> Void
     ) async throws {
+        let store = RenameContainerStore(containers: containers, refusesDelete: refusesDelete)
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
             regexRouter.installMiddleware(on: app)
-            try app.register(collection: ContainerRenameRoute(client: RenameMock(containers: containers)))
-            try await test(app)
+            try app.register(
+                collection: ContainerRenameRoute(
+                    client: RenameMock(store: store),
+                    // Defaults to the store's own create, so the rename is observable end to end.
+                    recreate: { configuration in
+                        if let recreate {
+                            try await recreate(store, configuration)
+                        } else {
+                            await store.add(configuration)
+                        }
+                    },
+                    discard: discard ?? { name in try? await store.remove(name) }
+                )
+            )
+            try await test(app, store)
         }
+    }
+
+    @Test("A rename recreates the container under the new name and removes the original")
+    func renameRecreatesUnderTheNewName() async throws {
+        let recorder = RenameRecorder()
+        let container = Self.snapshot(id: "web", status: .stopped)
+
+        try await withRoute(
+            containers: [container],
+            recreate: { store, configuration in
+                await recorder.recordCreate(configuration)
+                await store.add(configuration)
+            }
+        ) { app, store in
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
+                #expect(res.status == .noContent)
+            }
+            // The rename has to be observable in the runtime, not merely attempted: exactly one
+            // container, under the new name.
+            #expect(await store.names() == ["web-old"])
+            #expect(await store.get("web") == nil, "the original must be gone, not merely shadowed")
+        }
+
+        let created = await recorder.created
+        #expect(created?.id == "web-old", "the replacement must carry the new name as its id")
+        // Everything the client asked to keep travels with the configuration.
+        #expect(created?.image.reference == container.configuration.image.reference)
+        #expect(await recorder.discarded == nil, "nothing to roll back on the happy path")
+    }
+
+    @Test("The replacement gets a hostname of its own, since the original still holds its own")
+    func replacementGetsAFreshHostname() async throws {
+        let recorder = RenameRecorder()
+        var configuration = Self.snapshot(id: "web", status: .stopped).configuration
+        configuration.networks = [AttachmentConfiguration(network: "demo", options: AttachmentOptions(hostname: "web-abc123"))]
+        let container = ContainerSnapshot(configuration: configuration, status: .stopped, networks: [], startedDate: nil)
+
+        try await withRoute(
+            containers: [container],
+            recreate: { store, configuration in
+                await recorder.recordCreate(configuration)
+                await store.add(configuration)
+            }
+        ) { app, _ in
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        let hostname = await recorder.created?.networks.first?.options.hostname
+        #expect(hostname != "web-abc123", "copying the retired container's hostname is what the runtime rejects")
+        #expect(hostname?.hasPrefix("web-old-") == true, "the hostname follows the new name, as in Docker")
+        #expect(await recorder.created?.networks.first?.network == "demo", "the attachment itself is preserved")
+    }
+
+    @Test("A failed create leaves the original alone rather than half-renaming it")
+    func failedRecreateIsReported() async throws {
+        try await withRoute(
+            containers: [Self.snapshot(id: "web", status: .stopped)],
+            recreate: { _, _ in throw RenameFailure() }
+        ) { app, _ in
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
+                #expect(res.status == .internalServerError)
+                #expect(res.body.string.contains("Failed to rename container"))
+            }
+        }
+    }
+
+    @Test("A replacement that cannot take over is discarded, so the name is not doubled")
+    func failedDeleteRollsBackTheReplacement() async throws {
+        let recorder = RenameRecorder()
+
+        try await withRoute(
+            containers: [Self.snapshot(id: "web", status: .stopped)],
+            refusesDelete: true,
+            recreate: { store, configuration in
+                await recorder.recordCreate(configuration)
+                await store.add(configuration)
+            },
+            discard: { name in await recorder.recordDiscard(name) }
+        ) { app, _ in
+            // The original refuses to go away, which is the case this rollback exists for.
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=undeletable") { res async in
+                #expect(res.status == .internalServerError)
+            }
+        }
+
+        #expect(await recorder.discarded == "undeletable")
     }
 
     @Test("Renaming to a name already in use is a conflict, as in Docker")
     func nameConflictIsRejected() async throws {
         let containers = [Self.snapshot(id: "web", status: .stopped), Self.snapshot(id: "taken", status: .stopped)]
-        try await withRoute(containers: containers) { app in
+        try await withRoute(containers: containers) { app, _ in
             try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=taken") { res async in
                 #expect(res.status == .conflict)
                 #expect(res.body.string.contains("already in use"))
@@ -57,7 +162,7 @@ struct ContainerRenameRouteTests {
 
     @Test("A running container is refused, because recreating it would kill the process")
     func runningContainerIsRefused() async throws {
-        try await withRoute(containers: [Self.snapshot(id: "web", status: .running)]) { app in
+        try await withRoute(containers: [Self.snapshot(id: "web", status: .running)]) { app, _ in
             try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
                 #expect(res.status == .conflict)
                 #expect(res.body.string.contains("stop it first"))
@@ -67,7 +172,7 @@ struct ContainerRenameRouteTests {
 
     @Test("An unknown container is a 404")
     func unknownContainerIsNotFound() async throws {
-        try await withRoute(containers: []) { app in
+        try await withRoute(containers: []) { app, _ in
             try await app.testing().test(.POST, "/v1.51/containers/ghost/rename?name=whatever") { res async in
                 #expect(res.status == .notFound)
             }
@@ -76,7 +181,7 @@ struct ContainerRenameRouteTests {
 
     @Test("A missing name is rejected before anything is touched")
     func missingNameIsRejected() async throws {
-        try await withRoute(containers: [Self.snapshot(id: "web", status: .stopped)]) { app in
+        try await withRoute(containers: [Self.snapshot(id: "web", status: .stopped)]) { app, _ in
             try await app.testing().test(.POST, "/v1.51/containers/web/rename") { res async in
                 #expect(res.status == .badRequest)
             }
@@ -85,7 +190,7 @@ struct ContainerRenameRouteTests {
 
     @Test("Renaming a container to its current name succeeds without recreating it")
     func renameToSameNameIsANoOp() async throws {
-        try await withRoute(containers: [Self.snapshot(id: "web", status: .stopped)]) { app in
+        try await withRoute(containers: [Self.snapshot(id: "web", status: .stopped)]) { app, _ in
             try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web") { res async in
                 #expect(res.status == .noContent)
             }
@@ -95,7 +200,7 @@ struct ContainerRenameRouteTests {
     @Test("A leading slash on the requested name is accepted, as Docker hands names out that way")
     func leadingSlashIsStripped() async throws {
         let containers = [Self.snapshot(id: "web", status: .stopped), Self.snapshot(id: "taken", status: .stopped)]
-        try await withRoute(containers: containers) { app in
+        try await withRoute(containers: containers) { app, _ in
             // Reaching the conflict check proves the slash was stripped before the lookup.
             try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=/taken") { res async in
                 #expect(res.status == .conflict)
@@ -145,17 +250,44 @@ struct ContainerRenameMapTests {
     }
 }
 
-private struct RenameMock: ClientContainerProtocol {
-    let containers: [ContainerSnapshot]
+/// Holds the container set the way the runtime does, so a rename is observable: the replacement
+/// becomes queryable and the original stops being. An immutable list would let a route that created
+/// nothing, or deleted nothing, still pass.
+private actor RenameContainerStore {
+    private var containers: [ContainerSnapshot]
+    private let refusesDelete: Bool
 
-    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { containers }
-    func getContainer(id: String) async throws -> ContainerSnapshot? { containers.first { $0.id == id } }
+    init(containers: [ContainerSnapshot], refusesDelete: Bool) {
+        self.containers = containers
+        self.refusesDelete = refusesDelete
+    }
+
+    func all() -> [ContainerSnapshot] { containers }
+    func get(_ id: String) -> ContainerSnapshot? { containers.first { $0.id == id } }
+
+    func add(_ configuration: ContainerConfiguration) {
+        containers.append(ContainerSnapshot(configuration: configuration, status: .stopped, networks: [], startedDate: nil))
+    }
+
+    func remove(_ id: String) throws {
+        if refusesDelete { throw RenameFailure() }
+        containers.removeAll { $0.id == id }
+    }
+
+    func names() -> [String] { containers.map(\.id).sorted() }
+}
+
+private struct RenameMock: ClientContainerProtocol {
+    let store: RenameContainerStore
+
+    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { await store.all() }
+    func getContainer(id: String) async throws -> ContainerSnapshot? { await store.get(id) }
     func enforceContainerRunning(container: ContainerSnapshot) throws {}
     func start(id: String, detachKeys: String?) async throws {}
     func stop(id: String, signal: String?, timeout: Int?) async throws {}
     func restart(id: String, signal: String?, timeout: Int?) async throws {}
     func kill(id: String, signal: String?) async throws {}
-    func delete(id: String) async throws {}
+    func delete(id: String) async throws { try await store.remove(id) }
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait {
         RESTContainerWait(statusCode: 0)
     }
@@ -163,3 +295,20 @@ private struct RenameMock: ClientContainerProtocol {
         ([], 0)
     }
 }
+
+/// Captures what the route asked the runtime to do, so the success path is asserted on the
+/// configuration that would have been created rather than on a live daemon.
+private actor RenameRecorder {
+    private(set) var created: ContainerConfiguration?
+    private(set) var discarded: String?
+
+    func recordCreate(_ configuration: ContainerConfiguration) {
+        created = configuration
+    }
+
+    func recordDiscard(_ name: String) {
+        discarded = name
+    }
+}
+
+private struct RenameFailure: Error {}
