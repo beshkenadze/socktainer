@@ -62,11 +62,15 @@ extension ContainerInspectRoute {
                 throw Abort(.notFound, reason: "No such container: \(id)")
             }
 
+            // Two host ports can publish one container port (`-p 3000:3000 -p 3100:3000`), and
+            // `ExposedPorts` is keyed by `port/proto`, so those collapse to a single key.
+            // `uniqueKeysWithValues` traps on that, taking the whole daemon down with it; the
+            // host bindings are still reported individually under `NetworkSettings.Ports`.
             let exposedPorts = Dictionary(
-                uniqueKeysWithValues:
-                    container.configuration.publishedPorts.map {
-                        ("\($0.containerPort)/\($0.proto.rawValue)", EmptyObject())
-                    }
+                container.configuration.publishedPorts.map {
+                    ("\($0.containerPort)/\($0.proto.rawValue)", EmptyObject())
+                },
+                uniquingKeysWith: { first, _ in first }
             )
 
             // Apple Container has no native healthcheck field; we round-trip
