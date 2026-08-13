@@ -94,8 +94,8 @@ struct LabelNormalizationTests {
     @Test("Reserved mapping key in input is detected by containsReservedKey")
     func reservedMappingKeyDetected() {
         let labels = [LabelNormalization.mappingKey: "anything"]
-        #expect(LabelNormalization.containsReservedKey(labels) == true)
-        #expect(LabelNormalization.containsReservedKey(["normal-key": "value"]) == false)
+        #expect((LabelNormalization.reservedKey(in: labels) != nil) == true)
+        #expect((LabelNormalization.reservedKey(in: ["normal-key": "value"]) != nil) == false)
     }
 
     @Test("Collision on lowercase keeps last value")

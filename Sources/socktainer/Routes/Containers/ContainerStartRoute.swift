@@ -235,6 +235,7 @@ extension ContainerStartRoute {
                     nativeId: nativeId,
                     fallbackImage: image,
                     fallbackLabels: labels,
+                    dnsNames: ContainerAliasCleanup.dnsNames(in: exitSnapshot?.configuration.labels ?? [:]),
                     dnsServer: dnsServer,
                     broadcaster: broadcaster
                 )
@@ -262,6 +263,9 @@ extension ContainerStartRoute {
                     let cached = await ContainerInfoCache.shared.get(id: nativeId)
                     ContainerAliasCleanup.unregisterAllAliases(
                         nativeId: nativeId,
+                        // The recorded names live on the container's raw labels; the set carried
+                        // through this observer has been through `restore`, which strips them.
+                        dnsNames: ContainerAliasCleanup.dnsNames(in: exitSnapshot?.configuration.labels ?? [:]),
                         labels: cached?.labels ?? labels,
                         cachedIP: cached?.ip,
                         dnsServer: dnsServer
@@ -430,7 +434,7 @@ extension ContainerStartRoute {
                 }
 
                 // Names stored at create time (Compose service aliases via socktainer.dns.names)
-                if let namesLabel = snapshot.configuration.labels["socktainer.dns.names"] {
+                if let namesLabel = snapshot.configuration.labels[ContainerAliasCleanup.dnsNamesLabel] {
                     for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
                         dnsServer.register(hostname: name, ip: ip)
                     }
@@ -518,7 +522,7 @@ extension ContainerStartRoute {
         guard let ip = ContainerStartRoute.dnsAttachmentIP(in: container) else { return }
 
         dnsServer.register(hostname: container.id, ip: ip)
-        if let namesLabel = container.configuration.labels["socktainer.dns.names"] {
+        if let namesLabel = container.configuration.labels[ContainerAliasCleanup.dnsNamesLabel] {
             for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
                 dnsServer.register(hostname: name, ip: ip)
             }

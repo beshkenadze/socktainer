@@ -86,11 +86,25 @@ enum LabelNormalization {
         return normalizedLabels
     }
 
-    /// Returns true if the labels dict contains a key reserved for socktainer's own bookkeeping.
-    /// Create routes must reject such inputs: the mapping key would cause silent data loss, and a
-    /// client-supplied Docker ID would let it forge another container's identity.
-    static func containsReservedKey(_ labels: [String: String]) -> Bool {
-        labels[mappingKey] != nil || labels[DockerContainerID.idLabel] != nil
+    /// Labels socktainer stores on a container for its own bookkeeping. None of them came from the
+    /// client, and each has a first-class home in the Docker API — the id is reported in `Id`, the
+    /// healthcheck in `Config.Healthcheck`, the restart policy in `HostConfig.RestartPolicy` — so
+    /// they are stripped from client-visible labels, hidden from label filters, and refused on
+    /// create. Refusing matters beyond tidiness: the healthcheck label carries the command the probe
+    /// executes, and the DNS label decides which hostnames a container answers on.
+    static var internalKeys: Set<String> {
+        [
+            mappingKey,
+            DockerContainerID.idLabel,
+            HealthCheckManager.healthcheckLabel,
+            RestartPolicyManager.label,
+            ContainerAliasCleanup.dnsNamesLabel
+        ]
+    }
+
+    /// The reserved key a client tried to set, if any. Create routes reject the request and name it.
+    static func reservedKey(in labels: [String: String]) -> String? {
+        labels.keys.first { internalKeys.contains($0) || internalKeys.contains(sanitizeKey($0)) }
     }
 
     // MARK: - Mapping: build and restore
@@ -117,7 +131,7 @@ enum LabelNormalization {
     /// `label=socktainer.docker-id` matches every container socktainer created, including for
     /// `prune`, selecting containers the client never labelled.
     private static func isReserved(_ key: String) -> Bool {
-        key == mappingKey || key == DockerContainerID.idLabel
+        internalKeys.contains(key)
     }
 
     /// Looks up a label value using both the filter key as-is and its normalized form.
@@ -139,10 +153,9 @@ enum LabelNormalization {
     /// (the mapping key is always stripped regardless).
     static func restore(_ labels: [String: String]) -> [String: String] {
         var labelsWithoutMappingKey = labels
-        labelsWithoutMappingKey.removeValue(forKey: mappingKey)
-        // Storage detail, not something the client set: Docker reports the ID in `Id`, not as a
-        // label, and a client filtering on labels must not see it.
-        labelsWithoutMappingKey.removeValue(forKey: DockerContainerID.idLabel)
+        for key in internalKeys {
+            labelsWithoutMappingKey.removeValue(forKey: key)
+        }
 
         guard let mappingJSON = labels[mappingKey],
             let mappingData = mappingJSON.data(using: .utf8),

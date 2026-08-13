@@ -369,6 +369,7 @@ extension ContainerAttachRoute {
                             nativeId: container.id,
                             fallbackImage: container.configuration.image.reference,
                             fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                            dnsNames: ContainerAliasCleanup.dnsNames(in: container.configuration.labels),
                             dnsServer: req.application.storage[SocktainerDNSServerKey.self],
                             broadcaster: req.application.storage[EventBroadcasterKey.self],
                             runEpoch: runEpoch
@@ -534,6 +535,7 @@ extension ContainerAttachRoute {
                             nativeId: container.id,
                             fallbackImage: container.configuration.image.reference,
                             fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                            dnsNames: ContainerAliasCleanup.dnsNames(in: container.configuration.labels),
                             dnsServer: req.application.storage[SocktainerDNSServerKey.self],
                             broadcaster: req.application.storage[EventBroadcasterKey.self],
                             runEpoch: runEpoch
@@ -784,6 +786,7 @@ extension ContainerAttachRoute {
                         nativeId: container.id,
                         fallbackImage: container.configuration.image.reference,
                         fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                            dnsNames: ContainerAliasCleanup.dnsNames(in: container.configuration.labels),
                         dnsServer: req.application.storage[SocktainerDNSServerKey.self],
                         broadcaster: req.application.storage[EventBroadcasterKey.self],
                         runEpoch: runEpoch
