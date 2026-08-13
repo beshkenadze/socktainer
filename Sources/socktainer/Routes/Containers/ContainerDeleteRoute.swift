@@ -45,6 +45,9 @@ extension ContainerDeleteRoute {
                 // exit monitor still resolving the exit of a container that is now gone would
                 // otherwise find no record of the run and emit a `die` for it a second time.
                 await DieEventOwnership.shared.forget(id: eventName)
+                // A rename leaves the container reachable under the id it had before; once it is
+                // deleted that id must 404 like any other unknown reference.
+                await ContainerRenameMap.shared.forget(nativeId: eventName)
                 guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else { return }
                 await broadcaster.broadcast(
                     DockerEvent.simpleEvent(
