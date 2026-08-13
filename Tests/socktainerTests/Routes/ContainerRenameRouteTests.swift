@@ -35,7 +35,6 @@ struct ContainerRenameRouteTests {
         containers: [ContainerSnapshot],
         refusesDelete: Bool = false,
         recreate: (@Sendable (RenameContainerStore, ContainerConfiguration) async throws -> Void)? = nil,
-        discard: ContainerRenameRoute.Discard? = nil,
         test: @escaping (Application, RenameContainerStore) async throws -> Void
     ) async throws {
         let store = RenameContainerStore(containers: containers, refusesDelete: refusesDelete)
@@ -53,8 +52,7 @@ struct ContainerRenameRouteTests {
                         } else {
                             await store.add(configuration)
                         }
-                    },
-                    discard: discard ?? { name in try? await store.remove(name) }
+                    }
                 )
             )
             try await test(app, store)
@@ -87,6 +85,34 @@ struct ContainerRenameRouteTests {
         // Everything the client asked to keep travels with the configuration.
         #expect(created?.image.reference == container.configuration.image.reference)
         #expect(await recorder.discarded == nil, "nothing to roll back on the happy path")
+    }
+
+    @Test("A rename preserves the container's Docker id, as Docker does")
+    func renamePreservesTheDockerId() async throws {
+        let recorder = RenameRecorder()
+        let storedId = String(repeating: "ab12", count: 16)
+        var configuration = Self.snapshot(id: "web", status: .stopped).configuration
+        configuration.labels[DockerContainerID.idLabel] = storedId
+        let container = ContainerSnapshot(configuration: configuration, status: .stopped, networks: [], startedDate: nil)
+        let idBefore = DockerContainerID.hexId(for: container)
+
+        try await withRoute(
+            containers: [container],
+            recreate: { store, configuration in
+                await recorder.recordCreate(configuration)
+                await store.add(configuration)
+            }
+        ) { app, store in
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
+                #expect(res.status == .noContent)
+            }
+            let renamed = await store.get("web-old")
+            #expect(renamed.map(DockerContainerID.hexId(for:)) == idBefore, "the id must not change with the name")
+        }
+
+        // Nothing to redirect: clients holding the id still reach the container natively.
+        #expect(await ContainerRenameMap.shared.nativeId(forRetiredHexId: idBefore) == nil)
+        #expect(await recorder.created?.labels[DockerContainerID.idLabel] == storedId)
     }
 
     @Test("The replacement gets a hostname of its own, since the original still holds its own")
@@ -127,8 +153,8 @@ struct ContainerRenameRouteTests {
         }
     }
 
-    @Test("A replacement that cannot take over is discarded, so the name is not doubled")
-    func failedDeleteRollsBackTheReplacement() async throws {
+    @Test("A delete that fails leaves the container alone: no replacement is created")
+    func failedDeleteAbortsBeforeCreating() async throws {
         let recorder = RenameRecorder()
 
         try await withRoute(
@@ -137,16 +163,39 @@ struct ContainerRenameRouteTests {
             recreate: { store, configuration in
                 await recorder.recordCreate(configuration)
                 await store.add(configuration)
-            },
-            discard: { name in await recorder.recordDiscard(name) }
-        ) { app, _ in
-            // The original refuses to go away, which is the case this rollback exists for.
-            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=undeletable") { res async in
+            }
+        ) { app, store in
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
                 #expect(res.status == .internalServerError)
             }
+            #expect(await store.names() == ["web"], "the container must survive a failed rename")
         }
 
-        #expect(await recorder.discarded == "undeletable")
+        #expect(await recorder.created == nil, "nothing may be created while the original still exists")
+    }
+
+    @Test("A create that fails puts the container back under the name the client still knows")
+    func failedRecreateRestoresTheOriginal() async throws {
+        let attempts = RenameRecorder()
+
+        try await withRoute(
+            containers: [Self.snapshot(id: "web", status: .stopped)],
+            recreate: { store, configuration in
+                // The rename attempt fails; the rollback recreates the original and must succeed.
+                if configuration.id == "web-old" {
+                    await attempts.recordCreate(configuration)
+                    throw RenameFailure()
+                }
+                await store.add(configuration)
+            }
+        ) { app, store in
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
+                #expect(res.status == .internalServerError)
+            }
+            #expect(await store.names() == ["web"], "a failed rename must not leave the container deleted")
+        }
+
+        #expect(await attempts.created?.id == "web-old")
     }
 
     @Test("Renaming to a name already in use is a conflict, as in Docker")
