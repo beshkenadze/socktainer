@@ -246,7 +246,13 @@ struct ClientContainerService: ClientContainerProtocol {
             case .ambiguous(let matches):
                 throw ClientContainerError.ambiguousId(reference: id, matches: matches)
             case .none:
-                return nil
+                // A rename recreates the container under a new id, retiring its Docker ID.
+                // Clients keep using the id they inspected — Compose deletes the moved-aside
+                // container by it — so a retired id resolves to the container it became.
+                guard let renamed = await ContainerRenameMap.shared.nativeId(forRetiredHexId: id) else {
+                    return nil
+                }
+                return allContainers.first { $0.id == renamed }
             }
         }
     }
