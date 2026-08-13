@@ -426,6 +426,10 @@ extension ContainerCreateRoute {
             if let mapping = LabelNormalization.buildMapping(originalLabels) {
                 containerLabels[LabelNormalization.mappingKey] = mapping
             }
+            // The container's Docker ID, minted here and carried on the container itself. It rides
+            // along in the configuration a rename copies, so renaming preserves the ID as Docker
+            // does instead of deriving a new one from the new name.
+            containerLabels[DockerContainerID.idLabel] = DockerContainerID.mint()
 
             // Persist the requested healthcheck across create → start so the
             // start route can launch the probe loop and inspect can return it

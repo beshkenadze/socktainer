@@ -24,25 +24,17 @@ struct ContainerRenameRoute: RouteCollection {
     /// Creates the replacement container. Injected so the success path — which is the whole point
     /// of the route — can be exercised without an Apple Container daemon.
     typealias Recreate = @Sendable (ContainerConfiguration) async throws -> Void
-    /// Removes a replacement that was created but could not take over, used only for rollback.
-    typealias Discard = @Sendable (String) async throws -> Void
-
     let client: ClientContainerProtocol
     let recreate: Recreate
-    let discard: Discard
 
     init(
         client: ClientContainerProtocol,
-        recreate: Recreate? = nil,
-        discard: Discard? = nil
+        recreate: Recreate? = nil
     ) {
         self.client = client
         self.recreate = recreate ?? { configuration in
             let kernel = try await ClientKernel.getDefaultKernel(for: .current)
             try await ContainerClient().create(configuration: configuration, options: .default, kernel: kernel)
-        }
-        self.discard = discard ?? { name in
-            try await ContainerClient().delete(id: name, force: true)
         }
     }
 
@@ -50,7 +42,7 @@ struct ContainerRenameRoute: RouteCollection {
         try routes.registerVersionedRoute(
             .POST,
             pattern: "/containers/{id}/rename",
-            use: ContainerRenameRoute.handler(client: client, recreate: recreate, discard: discard)
+            use: ContainerRenameRoute.handler(client: client, recreate: recreate)
         )
     }
 
@@ -60,8 +52,7 @@ struct ContainerRenameRoute: RouteCollection {
 
     static func handler(
         client: ClientContainerProtocol,
-        recreate: @escaping Recreate,
-        discard: @escaping Discard
+        recreate: @escaping Recreate
     ) -> @Sendable (Request) async throws -> Response {
         { req in
             guard let id = req.parameters.get("id") else {
@@ -116,32 +107,43 @@ struct ContainerRenameRoute: RouteCollection {
                 )
             }
 
-            do {
-                try await recreate(configuration)
-            } catch {
-                req.logger.error("Failed to recreate \(container.id) as \(newName): \(error)")
-                throw Abort(.internalServerError, reason: "Failed to rename container: \(error)")
-            }
-
+            // The original goes first. Creating the replacement while it still exists would put two
+            // containers on the same Docker ID — the id now travels with the configuration — so
+            // every lookup by that id would be ambiguous and `docker ps` would list it twice. A
+            // container that is briefly absent is a transient 404; two containers claiming one id
+            // is wrong data.
             do {
                 try await client.delete(id: container.id)
             } catch {
-                // The replacement exists, so leaving the original behind would double the name in
-                // every listing. Roll back to the state the client asked us to change.
-                req.logger.error("Failed to delete \(container.id) after recreating it as \(newName): \(error)")
-                try? await discard(newName)
+                req.logger.error("Failed to delete \(container.id) before recreating it as \(newName): \(error)")
                 throw Abort(.internalServerError, reason: "Failed to rename container: \(error)")
             }
 
-            // Record the alias before anything that can fail: past the delete the rename has
-            // happened, and returning 500 without the mapping would leave every client holding an
-            // id that resolves to nothing.
-            await ContainerRenameMap.shared.record(
-                retiredHexId: retiredHexId,
-                previousNativeId: container.id,
-                nativeId: newName
-            )
+            do {
+                try await recreate(configuration)
+            } catch {
+                // Nothing holds the container now, so put it back under the name the client still
+                // thinks it has rather than leaving it deleted.
+                req.logger.error("Failed to recreate \(container.id) as \(newName): \(error)")
+                var rollback = container.configuration
+                rollback.id = container.id
+                try? await recreate(rollback)
+                throw Abort(.internalServerError, reason: "Failed to rename container: \(error)")
+            }
+
             let renamed = try? await client.getContainer(id: newName)
+            let renamedHexId = renamed.map(DockerContainerID.hexId(for:))
+                ?? DockerContainerID.hexId(nativeId: newName, createdAt: nil)
+            // A container carrying its own Docker ID keeps it through the recreate, so there is
+            // nothing to redirect. Comparing the ids rather than looking for the label also covers a
+            // malformed label, which `hexId` ignores in favour of the derived form.
+            if renamedHexId != retiredHexId {
+                await ContainerRenameMap.shared.record(
+                    retiredHexId: retiredHexId,
+                    previousNativeId: container.id,
+                    nativeId: newName
+                )
+            }
             await ContainerRenameRoute.transferSideState(
                 from: container,
                 to: renamed,
@@ -200,7 +202,10 @@ struct ContainerRenameRoute: RouteCollection {
         // reuse; leaving it running makes the new container inherit the retired one's probe.
         await req.application.storage[HealthCheckManagerKey.self]?.stop(containerId: previous.id)
 
-        await ContainerInfoCache.shared.remove(id: retiredHexId)
+        // The exit code is filed under both ids. The name-keyed entry is scrubbed by every start
+        // path, but the id-keyed one is only cleaned by the delete *route*, which a rename bypasses
+        // by deleting through the client — so it would linger for the life of the daemon.
+        await ContainerExitCodeStore.shared.remove(id: retiredHexId)
 
         // `previous.id` is the name being freed, and in Compose's recreate that is the *canonical*
         // service name — Compose renames the old container aside and gives the replacement the name
@@ -218,11 +223,18 @@ struct ContainerRenameRoute: RouteCollection {
 
         guard let renamed else { return }
         let renamedHexId = DockerContainerID.hexId(for: renamed)
-        // A `docker update` override lives under the Docker id, which the recreate changed. Without
-        // moving it the container silently reverts to its create-time restart policy.
-        if let override = await RestartPolicyOverrideStore.shared.get(id: retiredHexId) {
-            await RestartPolicyOverrideStore.shared.set(id: renamedHexId, policy: override)
-            await RestartPolicyOverrideStore.shared.remove(id: retiredHexId)
+
+        // The cache entry has to be rewritten even when the id did not change: it carries the native
+        // name, and a stale one makes the event paths report the retired name — and lets a delete of
+        // this container clear state that by then belongs to whichever container took that name.
+        if renamedHexId != retiredHexId {
+            await ContainerInfoCache.shared.remove(id: retiredHexId)
+            // A `docker update` override is filed under the Docker id; without moving it the
+            // container silently reverts to its create-time restart policy.
+            if let override = await RestartPolicyOverrideStore.shared.get(id: retiredHexId) {
+                await RestartPolicyOverrideStore.shared.set(id: renamedHexId, policy: override)
+                await RestartPolicyOverrideStore.shared.remove(id: retiredHexId)
+            }
         }
         await ContainerInfoCache.shared.set(
             hexId: renamedHexId,
