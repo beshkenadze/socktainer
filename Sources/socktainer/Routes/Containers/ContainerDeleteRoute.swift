@@ -85,6 +85,8 @@ extension ContainerDeleteRoute {
                     let containerIP = ContainerStartRoute.dnsAttachmentIP(in: container)
                     ContainerAliasCleanup.unregisterAllAliases(
                         nativeId: container.id,
+                        // Raw labels: the recorded DNS names are stripped from restored label sets.
+                        dnsNames: ContainerAliasCleanup.dnsNames(in: container.configuration.labels),
                         labels: cached?.labels ?? LabelNormalization.restore(container.configuration.labels),
                         cachedIP: cached?.ip ?? containerIP,
                         dnsServer: dnsServer

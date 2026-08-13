@@ -82,7 +82,7 @@ struct DockerContainerIDStorageTests {
         #expect(restored[DockerContainerID.idLabel] == nil, "Docker reports the id in Id, never as a label")
         #expect(restored["com.example.app"] == "demo")
         #expect(
-            LabelNormalization.containsReservedKey([DockerContainerID.idLabel: Self.storedId]),
+            (LabelNormalization.reservedKey(in: [DockerContainerID.idLabel: Self.storedId]) != nil),
             "a client-supplied id would let it forge another container's identity"
         )
     }

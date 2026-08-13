@@ -19,6 +19,9 @@ enum ContainerProcessExitMonitor {
         nativeId: String,
         fallbackImage: String,
         fallbackLabels: [String: String],
+        /// Recorded DNS names, read from the container's raw configuration labels by the caller:
+        /// `fallbackLabels` has been through `restore`, which strips them.
+        dnsNames: [String] = [],
         dnsServer: SocktainerDNSServer?,
         broadcaster: EventBroadcaster?,
         /// Epoch of the run being watched, from `DieEventOwnership.beginRun`.
@@ -80,6 +83,7 @@ enum ContainerProcessExitMonitor {
                 nativeId: nativeId,
                 fallbackImage: fallbackImage,
                 fallbackLabels: fallbackLabels,
+                dnsNames: dnsNames,
                 dnsServer: dnsServer,
                 broadcaster: broadcaster
             )

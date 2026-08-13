@@ -11,6 +11,9 @@ enum ContainerAutoRemoveCleanup {
         nativeId: String,
         fallbackImage: String,
         fallbackLabels: [String: String],
+        /// Read from the container's raw configuration labels by the caller: `restore` strips the
+        /// recorded names, so neither the cache nor a restored fallback set still carries them.
+        dnsNames: [String] = [],
         dnsServer: SocktainerDNSServer?,
         broadcaster: EventBroadcaster?
     ) async {
@@ -20,6 +23,7 @@ enum ContainerAutoRemoveCleanup {
         if let dnsServer {
             ContainerAliasCleanup.unregisterAllAliases(
                 nativeId: nativeId,
+                dnsNames: dnsNames,
                 labels: labels,
                 cachedIP: cached?.ip,
                 dnsServer: dnsServer

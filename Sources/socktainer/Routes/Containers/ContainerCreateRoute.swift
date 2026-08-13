@@ -419,8 +419,8 @@ extension ContainerCreateRoute {
                 ?? []
 
             let originalLabels = body.Labels ?? [:]
-            guard !LabelNormalization.containsReservedKey(originalLabels) else {
-                throw Abort(.badRequest, reason: "Label key '\(LabelNormalization.mappingKey)' is reserved for internal use")
+            if let reserved = LabelNormalization.reservedKey(in: originalLabels) {
+                throw Abort(.badRequest, reason: "Label key '\(reserved)' is reserved for internal use")
             }
             var containerLabels = LabelNormalization.sanitize(originalLabels)
             if let mapping = LabelNormalization.buildMapping(originalLabels) {
@@ -453,7 +453,7 @@ extension ContainerCreateRoute {
             }
 
             if !dnsNames.isEmpty {
-                containerLabels["socktainer.dns.names"] = dnsNames.joined(separator: ",")
+                containerLabels[ContainerAliasCleanup.dnsNamesLabel] = dnsNames.joined(separator: ",")
             }
 
             // Ensure a DNS forwarder container for any named (non-default) network.

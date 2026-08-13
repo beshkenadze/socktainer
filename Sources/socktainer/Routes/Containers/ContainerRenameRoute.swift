@@ -192,6 +192,7 @@ struct ContainerRenameRoute: RouteCollection {
         if let dnsServer = req.application.storage[SocktainerDNSServerKey.self] {
             ContainerAliasCleanup.unregisterAllAliases(
                 nativeId: previous.id,
+                dnsNames: ContainerAliasCleanup.dnsNames(in: previous.configuration.labels),
                 labels: previous.configuration.labels,
                 cachedIP: cached?.ip,
                 dnsServer: dnsServer
