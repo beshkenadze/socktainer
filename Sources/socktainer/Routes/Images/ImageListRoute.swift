@@ -21,7 +21,101 @@ struct CustomImageDetail: Decodable {
     public let name: String
 }
 
+/// The two fields grouping needs from a runtime image record, so the rules below can be exercised
+/// without an Apple Container store behind them.
+protocol ImageDigestNamed {
+    var digest: String { get }
+    var reference: String { get }
+}
+
+extension ClientImage: ImageDigestNamed {}
+
 extension ImageListRoute {
+    /// Apple Container names an image it no longer has a tag for `untagged@sha256:…`, the same trick
+    /// moby's containerd store plays with `moby-dangling@sha256:…`. moby never reports that internal
+    /// name: `singlePlatformImage` fails to parse it as a reference, sees `isDanglingImage`, and leaves
+    /// both name arrays empty (daemon/containerd/image_list.go). `docker images` renders the `<none>`
+    /// row itself. Passing the raw marker through instead makes it look like a repository tag, so
+    /// `--filter dangling=true` finds nothing and `--filter reference=…` can match a nameless image.
+    static func repoTags(forReference reference: String) -> [String] {
+        if isUntagged(reference) || isDigestOnly(reference) {
+            return []
+        }
+        return [reference]
+    }
+
+    /// A reference that is only a digest is the image's sole name, and moby files it under
+    /// `RepoDigests`; the legacy `digests` query flag governs the tagged case alone.
+    static func repoDigests(forReference reference: String, includeDigests: Bool) -> [String] {
+        if isUntagged(reference) {
+            return []
+        }
+        if isDigestOnly(reference) {
+            return [reference]
+        }
+        return includeDigests && reference.contains("@sha256:") ? [reference] : []
+    }
+
+    private static func isUntagged(_ reference: String) -> Bool {
+        reference.isEmpty || reference.hasPrefix("untagged@")
+    }
+
+    /// `alpine@sha256:…` carries a digest and no tag; `alpine:3.20@sha256:…` carries both.
+    private static func isDigestOnly(_ reference: String) -> Bool {
+        guard let at = reference.firstIndex(of: "@") else { return false }
+        return !reference[reference.startIndex..<at].contains(":")
+    }
+
+    /// One image is one entry per digest, carrying every name that points at it. moby builds exactly
+    /// that: `uniqueImages[dgst]` keeps a single record per digest and `RepoTags: tagsByDigest[digest]`
+    /// fills it with all of them (daemon/containerd/image_list.go). Apple Container instead stores one
+    /// record per reference, so `docker tag alpine:3.20 myalpine:1` produced two rows sharing an ID,
+    /// and an image whose tag was removed kept an `untagged@sha256:…` record beside the tagged one —
+    /// which made `docker images` list the same ID twice and offered a tagged image to
+    /// `docker image prune` under `--filter dangling=true`.
+    ///
+    /// Grouping subsumes both: the untagged marker contributes no name, so it disappears into a named
+    /// group and only survives as its own dangling entry when nothing names that digest.
+    struct DigestGroup<Image: ImageDigestNamed> {
+        let representative: Image
+        let references: [String]
+
+        /// Sorted so a client sees a stable order; moby's own order comes from map iteration.
+        var repoTags: [String] {
+            references.filter { !ImageListRoute.repoTags(forReference: $0).isEmpty }.sorted()
+        }
+
+        func repoDigests(includeDigests: Bool) -> [String] {
+            references.flatMap { ImageListRoute.repoDigests(forReference: $0, includeDigests: includeDigests) }.sorted()
+        }
+    }
+
+    static func groupByDigest<Image: ImageDigestNamed>(_ images: [Image]) -> [DigestGroup<Image>] {
+        var order: [String] = []
+        var referencesByDigest: [String: [String]] = [:]
+        var representatives: [String: Image] = [:]
+
+        for image in images {
+            if referencesByDigest[image.digest] == nil {
+                order.append(image.digest)
+                representatives[image.digest] = image
+            }
+            referencesByDigest[image.digest, default: []].append(image.reference)
+            // A named record is the better representative: its index and config are the ones moby
+            // reports, and an untagged marker can outlive the content it pointed at.
+            if !ImageListRoute.repoTags(forReference: image.reference).isEmpty,
+                let current = representatives[image.digest],
+                ImageListRoute.repoTags(forReference: current.reference).isEmpty
+            {
+                representatives[image.digest] = image
+            }
+        }
+
+        return order.compactMap { digest in
+            guard let representative = representatives[digest] else { return nil }
+            return DigestGroup(representative: representative, references: referencesByDigest[digest] ?? [])
+        }
+    }
     private static func makeOCIDescriptor(
         from descriptor: Descriptor,
         appSupportURL: URL? = nil,
@@ -80,7 +174,8 @@ extension ImageListRoute {
             let includeDigests = query.digests ?? false
             var imagesSummaries: [RESTImageSummary] = []
 
-            for image in images {
+            for group in Self.groupByDigest(images) {
+                let image = group.representative
                 let imageIndex = try await image.index()
                 let manifests = imageIndex.manifests
                 var manifestSummaries: [ImageManifestSummary] = []
@@ -162,9 +257,10 @@ extension ImageListRoute {
                     }
                 }
 
-                let repoTags = image.reference.isEmpty ? [] : [image.reference]
-                let repoDigests = includeDigests && image.reference.contains("@sha256:") ? [image.reference] : []
-                let containersUsingImage = containers.filter { $0.configuration.image.reference == image.reference }
+                let repoTags = group.repoTags
+                let repoDigests = group.repoDigests(includeDigests: includeDigests)
+                let groupReferences = Set(group.references)
+                let containersUsingImage = containers.filter { groupReferences.contains($0.configuration.image.reference) }
                 let summary = RESTImageSummary(
                     Id: image.digest,
                     ParentId: "",

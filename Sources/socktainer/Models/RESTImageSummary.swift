@@ -38,15 +38,11 @@ struct RESTImageSummary: Content {
         try container.encode(SharedSize, forKey: .SharedSize)
         try container.encode(Labels, forKey: .Labels)
         try container.encode(Containers, forKey: .Containers)
-        if let Manifests {
-            try container.encode(Manifests, forKey: .Manifests)
-        } else {
-            try container.encodeNil(forKey: .Manifests)
-        }
-        if let Descriptor {
-            try container.encode(Descriptor, forKey: .Descriptor)
-        } else {
-            try container.encodeNil(forKey: .Descriptor)
-        }
+        // moby tags both with `omitempty` (api/types/image/summary.go), so an image with neither
+        // reports neither key. Sending an explicit null instead contradicts the schema, which types
+        // them as an array and an object: a generated client decoding into those types has to special
+        // case a value the daemon it targets never sends.
+        try container.encodeIfPresent(Manifests, forKey: .Manifests)
+        try container.encodeIfPresent(Descriptor, forKey: .Descriptor)
     }
 }
