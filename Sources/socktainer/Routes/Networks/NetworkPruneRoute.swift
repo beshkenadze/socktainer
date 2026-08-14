@@ -3,11 +3,10 @@ import Vapor
 struct NetworkPruneRoute: RouteCollection {
     let client: ClientNetworkProtocol
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/networks/prune", use: NetworkPruneRoute.handler)
+        try routes.registerVersionedRoute(.POST, pattern: "/networks/prune", use: handler)
     }
 
-    static func handler(_ req: Request) async throws -> Response {
-        let networkClient = ClientNetworkService()
+    func handler(_ req: Request) async throws -> Response {
         let query = try req.query.decode(RESTNetworksListQuery.self)
         let filtersParam = query.filters
 
@@ -20,7 +19,7 @@ struct NetworkPruneRoute: RouteCollection {
         var deletedNetworks: [String] = []
         var errors: [String: String] = [:]
         do {
-            let networks = try await networkClient.list(filters: filtersJSONString, logger: req.logger)
+            let networks = try await client.list(filters: filtersJSONString, logger: req.logger)
             for network in networks {
                 if network.Name == "default" {
                     req.logger.info("Skipping deletion of default network: \(network.Id)")
@@ -31,7 +30,7 @@ struct NetworkPruneRoute: RouteCollection {
                     if let dnsManager = req.application.storage[NetworkDNSManagerKey.self] {
                         await dnsManager.cleanupDNSContainer(networkId: network.Id)
                     }
-                    try await networkClient.delete(id: network.Id, logger: req.logger)
+                    try await client.delete(id: network.Id, logger: req.logger)
                     deletedNetworks.append(network.Id)
                     // moby fires a `destroy` per removed network before the aggregate prune.
                     if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
@@ -58,9 +57,9 @@ struct NetworkPruneRoute: RouteCollection {
                         type: "network", action: "prune", actorID: "",
                         attributes: ["reclaimed": "0"]))
             }
-            return Response(status: .ok, body: .init(data: responseData))
+            return .json(responseData)
         } catch {
-            return Response(status: .internalServerError, body: .init(string: "Failed to prune networks: \(error)"))
+            throw Abort(.internalServerError, reason: "Failed to prune networks: \(error)")
         }
     }
 }
