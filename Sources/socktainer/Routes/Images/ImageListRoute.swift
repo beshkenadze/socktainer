@@ -31,41 +31,6 @@ protocol ImageDigestNamed {
 extension ClientImage: ImageDigestNamed {}
 
 extension ImageListRoute {
-    /// Apple Container names an image it no longer has a tag for `untagged@sha256:…`, the same trick
-    /// moby's containerd store plays with `moby-dangling@sha256:…`. moby never reports that internal
-    /// name: `singlePlatformImage` fails to parse it as a reference, sees `isDanglingImage`, and leaves
-    /// both name arrays empty (daemon/containerd/image_list.go). `docker images` renders the `<none>`
-    /// row itself. Passing the raw marker through instead makes it look like a repository tag, so
-    /// `--filter dangling=true` finds nothing and `--filter reference=…` can match a nameless image.
-    static func repoTags(forReference reference: String) -> [String] {
-        if isUntagged(reference) || isDigestOnly(reference) {
-            return []
-        }
-        return [reference]
-    }
-
-    /// A reference that is only a digest is the image's sole name, and moby files it under
-    /// `RepoDigests`; the legacy `digests` query flag governs the tagged case alone.
-    static func repoDigests(forReference reference: String, includeDigests: Bool) -> [String] {
-        if isUntagged(reference) {
-            return []
-        }
-        if isDigestOnly(reference) {
-            return [reference]
-        }
-        return includeDigests && reference.contains("@sha256:") ? [reference] : []
-    }
-
-    private static func isUntagged(_ reference: String) -> Bool {
-        reference.isEmpty || reference.hasPrefix("untagged@")
-    }
-
-    /// `alpine@sha256:…` carries a digest and no tag; `alpine:3.20@sha256:…` carries both.
-    private static func isDigestOnly(_ reference: String) -> Bool {
-        guard let at = reference.firstIndex(of: "@") else { return false }
-        return !reference[reference.startIndex..<at].contains(":")
-    }
-
     /// One image is one entry per digest, carrying every name that points at it. moby builds exactly
     /// that: `uniqueImages[dgst]` keeps a single record per digest and `RepoTags: tagsByDigest[digest]`
     /// fills it with all of them (daemon/containerd/image_list.go). Apple Container instead stores one
@@ -82,11 +47,11 @@ extension ImageListRoute {
 
         /// Sorted so a client sees a stable order; moby's own order comes from map iteration.
         var repoTags: [String] {
-            references.filter { !ImageListRoute.repoTags(forReference: $0).isEmpty }.sorted()
+            references.flatMap { ImageReferenceNames.repoTags(for: $0) }.sorted()
         }
 
         func repoDigests(includeDigests: Bool) -> [String] {
-            references.flatMap { ImageListRoute.repoDigests(forReference: $0, includeDigests: includeDigests) }.sorted()
+            references.flatMap { ImageReferenceNames.repoDigests(for: $0, includeDigests: includeDigests) }.sorted()
         }
     }
 
@@ -103,9 +68,9 @@ extension ImageListRoute {
             referencesByDigest[image.digest, default: []].append(image.reference)
             // A named record is the better representative: its index and config are the ones moby
             // reports, and an untagged marker can outlive the content it pointed at.
-            if !ImageListRoute.repoTags(forReference: image.reference).isEmpty,
+            if !ImageReferenceNames.isUnnamed(image.reference),
                 let current = representatives[image.digest],
-                ImageListRoute.repoTags(forReference: current.reference).isEmpty
+                ImageReferenceNames.isUnnamed(current.reference)
             {
                 representatives[image.digest] = image
             }
@@ -281,8 +246,15 @@ extension ImageListRoute {
                 imagesSummaries.append(summary)
             }
 
-            return try ImageListRoute.applyFilters(imagesSummaries, filters: filters)
+            return try ImageListRoute.applyFilters(Self.newestFirst(imagesSummaries), filters: filters)
         }
+    }
+
+    /// moby sorts finished summaries newest first. Apple Container enumerates its reference store,
+    /// whose order can shuffle between calls, so `docker images` rows would reshuffle without this. The
+    /// digest breaks ties, keeping images created in the same second in a stable order.
+    static func newestFirst(_ summaries: [RESTImageSummary]) -> [RESTImageSummary] {
+        summaries.sorted { ($0.Created, $0.Id) > ($1.Created, $1.Id) }
     }
 
     /// Applies the `dangling` and `reference` image-ls filters. Different keys
@@ -306,7 +278,7 @@ extension ImageListRoute {
             guard isTrue != isFalse else {
                 throw Abort(.badRequest, reason: "invalid filter 'dangling=[\(dangling.joined(separator: " "))]'")
             }
-            result = result.filter { ImageListFilter.isDangling(repoTags: $0.RepoTags) == isTrue }
+            result = result.filter { ImageListFilter.isDangling(repoTags: $0.RepoTags, repoDigests: $0.RepoDigests) == isTrue }
         }
         // A present `reference` key with zero values (an empty array, or a
         // boolean map with no true entries) is a real Docker filter that

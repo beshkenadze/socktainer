@@ -4,10 +4,12 @@ import Foundation
 /// GET /images/json. Multiple values of one key are ORed; different keys AND.
 /// Other image-ls keys (label/since/before/until) are not yet honored.
 enum ImageListFilter {
-    /// A summary is "dangling" when it carries no repository tags (moby shows
-    /// such an image as `<none>:<none>`).
-    static func isDangling(repoTags: [String]) -> Bool {
-        repoTags.isEmpty || repoTags == ["<none>:<none>"]
+    /// A summary is dangling when nothing names it — no tag and no digest. A digest reference is a
+    /// name, so `alpine@sha256:…` is not dangling even without a tag, and `docker image prune` must
+    /// not claim it. `ImageReferenceNames` owns the rule; this forwards so the filter and the prune
+    /// path cannot drift apart.
+    static func isDangling(repoTags: [String], repoDigests: [String]) -> Bool {
+        ImageReferenceNames.isDangling(repoTags: repoTags, repoDigests: repoDigests)
     }
 
     /// moby matches `reference=<pattern>` with `reference.FamiliarMatch`, which

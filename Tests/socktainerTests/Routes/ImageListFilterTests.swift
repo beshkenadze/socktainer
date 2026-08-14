@@ -13,11 +13,13 @@ struct ImageListFilterTests {
 
     // MARK: - dangling
 
-    @Test("isDangling is true only for images with no repo tags")
+    @Test("isDangling is true only when nothing names the image")
     func danglingDetection() {
-        #expect(ImageListFilter.isDangling(repoTags: []))
-        #expect(ImageListFilter.isDangling(repoTags: ["<none>:<none>"]))
-        #expect(!ImageListFilter.isDangling(repoTags: ["docker.io/library/alpine:latest"]))
+        #expect(ImageListFilter.isDangling(repoTags: [], repoDigests: []))
+        #expect(!ImageListFilter.isDangling(repoTags: ["docker.io/library/alpine:latest"], repoDigests: []))
+        // A digest is a name: moby reserves dangling for an image nothing refers to, and prune keys
+        // on the same rule, so calling this dangling would delete an image a client can still pull.
+        #expect(!ImageListFilter.isDangling(repoTags: [], repoDigests: ["docker.io/library/alpine@sha256:abc"]))
     }
 
     // MARK: - reference familiar-form matching
