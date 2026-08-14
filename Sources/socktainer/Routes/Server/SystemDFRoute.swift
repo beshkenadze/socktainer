@@ -175,8 +175,8 @@ extension SystemDFRoute {
 
                     // Same name rules as GET /images/json: Apple Container's `untagged@…` marker is
                     // internal, so a nameless image reports neither tag nor digest.
-                    let repoTags = ImageListRoute.repoTags(forReference: image.reference)
-                    let repoDigests = ImageListRoute.repoDigests(forReference: image.reference, includeDigests: true)
+                    let repoTags = ImageReferenceNames.repoTags(for: image.reference)
+                    let repoDigests = ImageReferenceNames.repoDigests(for: image.reference, includeDigests: true)
                     let containerCount = usageByImageReference[image.reference] ?? 0
 
                     return RESTImageSummary(
