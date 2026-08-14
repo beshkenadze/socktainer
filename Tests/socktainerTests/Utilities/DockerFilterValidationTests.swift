@@ -143,18 +143,22 @@ struct DockerFilterValidationTests {
 
     @Test("string value is the accepted superset shape in every parser")
     func stringValueAcceptedEverywhere() throws {
-        #expect(try DockerNetworkFilterUtility.parseNetworkFilters(
-            filtersParam: #"{"dangling": "true"}"#, defaultDangling: false, logger: logger)
-            == ["dangling": ["true"]])
-        #expect(try DockerContainerFilterUtility.parseContainerFilters(
-            filtersParam: #"{"status": "running"}"#, logger: logger)
-            == ["status": ["running"]])
-        #expect(try DockerVolumeFilterUtility.parseVolumeFilters(
-            filtersParam: #"{"dangling": "true"}"#, logger: logger)
-            == ["dangling": ["true"]])
-        #expect(try DockerBuildFilterUtility.parseBuildPruneFilters(
-            filtersParam: #"{"until": "24h"}"#, logger: logger)
-            == ["until": ["24h"]])
+        #expect(
+            try DockerNetworkFilterUtility.parseNetworkFilters(
+                filtersParam: #"{"dangling": "true"}"#, defaultDangling: false, logger: logger)
+                == ["dangling": ["true"]])
+        #expect(
+            try DockerContainerFilterUtility.parseContainerFilters(
+                filtersParam: #"{"status": "running"}"#, logger: logger)
+                == ["status": ["running"]])
+        #expect(
+            try DockerVolumeFilterUtility.parseVolumeFilters(
+                filtersParam: #"{"dangling": "true"}"#, logger: logger)
+                == ["dangling": ["true"]])
+        #expect(
+            try DockerBuildFilterUtility.parseBuildPruneFilters(
+                filtersParam: #"{"until": "24h"}"#, logger: logger)
+                == ["until": ["24h"]])
     }
 
     @Test("unknown keys still throw as before")
