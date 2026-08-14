@@ -80,7 +80,8 @@ struct ImageSummarySchemaTests {
         #expect(ImageReferenceNames.repoTags(for: reference).isEmpty)
         #expect(ImageReferenceNames.repoDigests(for: reference, includeDigests: true).isEmpty)
         // Empty names are what `--filter dangling=true` keys on; the raw marker reads as a tag.
-        #expect(ImageListFilter.isDangling(repoTags: ImageReferenceNames.repoTags(for: reference), repoDigests: ImageReferenceNames.repoDigests(for: reference, includeDigests: true)))
+        #expect(
+            ImageListFilter.isDangling(repoTags: ImageReferenceNames.repoTags(for: reference), repoDigests: ImageReferenceNames.repoDigests(for: reference, includeDigests: true)))
         #expect(ImageListFilter.isDangling(repoTags: [reference], repoDigests: []) == false)
         // And a nameless image must not answer a reference filter.
         #expect(ImageListFilter.referenceMatches(patterns: ["*"], repoTags: ImageReferenceNames.repoTags(for: reference)) == false)
