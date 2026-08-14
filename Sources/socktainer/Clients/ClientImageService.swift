@@ -440,7 +440,10 @@ struct ClientImageService: ClientImageProtocol {
                     continue
                 }
 
-                let isDangling = reference.contains("<none>") || reference.contains("@sha256:")
+                // The same rule the image list reports, because this one deletes: an image is dangling
+                // when nothing names it. Treating every `@sha256:` reference as dangling made
+                // `docker image prune` delete an image a client still refers to by digest.
+                let isDangling = ImageReferenceNames.isUnnamed(reference)
 
                 if let danglingFilters = filters["dangling"] {
                     if let danglingValue = danglingFilters.first {

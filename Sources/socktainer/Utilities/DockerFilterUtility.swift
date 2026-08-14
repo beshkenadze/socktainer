@@ -18,7 +18,13 @@ import Vapor
 /// contradictory bool (`{"dangling":{"true":false}}`) resolves from the value
 /// string rather than 400ing the way `GetBoolOrDefault` does.
 enum DockerFilterDecoder {
-    static func decode(_ filtersParam: String?) throws -> [String: [String]] {
+    /// `booleanKeys` are the keys a caller reads as a single truth rather than a set of values —
+    /// `dangling` and friends. moby resolves those through `GetBoolOrDefault`, which reads the
+    /// booleans stored under the `"true"`/`"1"` and `"false"`/`"0"` entries and errors when they
+    /// agree, so `{"dangling":{"true":true,"false":false}}` is `true` there and
+    /// `{"dangling":{"true":false}}` is a 400. Passing the raw key set on instead let a consumer that
+    /// reads the first value decide from `"false"` and, on a prune, delete every unused image.
+    static func decode(_ filtersParam: String?, booleanKeys: Set<String> = []) throws -> [String: [String]] {
         guard let filtersParam, !filtersParam.isEmpty, let data = filtersParam.data(using: .utf8) else {
             return [:]
         }
@@ -39,21 +45,47 @@ enum DockerFilterDecoder {
                 guard let strings = array as? [String] else {
                     throw Abort(.badRequest, reason: "invalid filter '\(key)'")
                 }
-                decoded[key] = strings
+                // The legacy array encoding stores every value as true, so moby sees the same map.
+                // Its order is the client's own, so it is kept as given.
+                decoded[key] = try resolve(strings.map { ($0, true) }, forKey: key, booleanKeys: booleanKeys, sorted: false)
             } else if let map = value as? [String: Any] {
                 // `as? Bool` bridges any NSNumber so a JSON `1` would pass as
                 // `true`; require actual JSON booleans, matching real Docker.
                 guard map.values.allSatisfy({ DockerImageFilterUtility.isJSONBool($0) }) else {
                     throw Abort(.badRequest, reason: "invalid filter '\(key)'")
                 }
-                decoded[key] = map.keys.sorted()
+                decoded[key] = try resolve(
+                    map.map { ($0.key, $0.value as? Bool == true) }, forKey: key, booleanKeys: booleanKeys, sorted: true)
             } else if let str = value as? String {
-                decoded[key] = [str]
+                decoded[key] = try resolve([(str, true)], forKey: key, booleanKeys: booleanKeys, sorted: false)
             } else {
                 throw Abort(.badRequest, reason: "invalid filter '\(key)'")
             }
         }
         return decoded
+    }
+
+    /// Keeps every key for a value-set filter, as `Args.Get` does, and collapses a boolean filter to
+    /// the one truth `GetBoolOrDefault` would report. A map's keys are sorted because Swift's
+    /// dictionary order is not stable; an array's order is the client's and is left alone.
+    private static func resolve(
+        _ entries: [(String, Bool)],
+        forKey key: String,
+        booleanKeys: Set<String>,
+        sorted: Bool
+    ) throws -> [String] {
+        guard booleanKeys.contains(key) else {
+            let values = entries.map(\.0)
+            return sorted ? values.sorted() : values
+        }
+        guard !entries.isEmpty else { return [] }
+
+        let isTrue = entries.contains { ($0.0 == "true" || $0.0 == "1") && $0.1 }
+        let isFalse = entries.contains { ($0.0 == "false" || $0.0 == "0") && $0.1 }
+        guard isTrue != isFalse else {
+            throw Abort(.badRequest, reason: "invalid filter '\(key)'")
+        }
+        return [isTrue ? "true" : "false"]
     }
 }
 // utility for parsing network filters from query string
@@ -61,7 +93,7 @@ struct DockerNetworkFilterUtility {
     // parses network filters from a query string, optionally defaulting to dangling only
     // dangling networks are networks with no containers are attached to them
     static func parseNetworkFilters(filtersParam: String?, defaultDangling: Bool, logger: Logger) throws -> [String: [String]] {
-        let decoded = try DockerFilterDecoder.decode(filtersParam)
+        let decoded = try DockerFilterDecoder.decode(filtersParam, booleanKeys: ["dangling"])
 
         // Validate keys — the full set moby accepts for network list
         // (docker network ls -f): dangling, driver, id, label, name,
@@ -179,7 +211,7 @@ struct DockerImageFilterUtility {
     /// unrestricted prune that reports 200.
     static func parseImagePruneFilters(filterParam: String?, logger: Logger) throws -> [String: [String]] {
         let allowedKeys: Set<String> = ["dangling", "label", "until"]
-        let decoded = try DockerFilterDecoder.decode(filterParam)
+        let decoded = try DockerFilterDecoder.decode(filterParam, booleanKeys: ["dangling"])
         for key in decoded.keys where !allowedKeys.contains(key) {
             logger.warning("Invalid filter key '\(key)' for image prune")
             throw Abort(.badRequest, reason: "invalid filter '\(key)'")
@@ -210,7 +242,7 @@ struct DockerImageFilterUtility {
     /// absent key does.
     static func parseImageListFilters(filterParam: String?, logger: Logger) throws -> [String: [String]] {
         let allowedKeys: Set<String> = ["before", "dangling", "label", "reference", "since", "until"]
-        let decoded = try DockerFilterDecoder.decode(filterParam)
+        let decoded = try DockerFilterDecoder.decode(filterParam, booleanKeys: ["dangling"])
         for key in decoded.keys {
             guard allowedKeys.contains(key) else {
                 throw Abort(.badRequest, reason: "invalid filter '\(key)'")

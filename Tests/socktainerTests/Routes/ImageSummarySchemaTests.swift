@@ -15,15 +15,17 @@ struct ImageSummarySchemaTests {
     }
 
     private static func summary(
+        id: String = "sha256:abc",
+        created: Int = 1_700_000_000,
         manifests: [ImageManifestSummary]? = nil,
         descriptor: OCIDescriptor? = nil
     ) -> RESTImageSummary {
         RESTImageSummary(
-            Id: "sha256:abc",
+            Id: id,
             ParentId: "",
             RepoTags: ["alpine:3.20"],
             RepoDigests: [],
-            Created: 1_700_000_000,
+            Created: created,
             Size: 123,
             SharedSize: -1,
             Labels: [:],
@@ -75,25 +77,25 @@ struct ImageSummarySchemaTests {
         // counterpart of moby's `moby-dangling@sha256:…`, which moby never puts in a name array.
         let reference = "untagged@sha256:4c2bdddbf3e88a7c990a1b60c3a55aba31c902ecc45b2b1df9e6531e7ad4ca89"
 
-        #expect(ImageListRoute.repoTags(forReference: reference).isEmpty)
-        #expect(ImageListRoute.repoDigests(forReference: reference, includeDigests: true).isEmpty)
+        #expect(ImageReferenceNames.repoTags(for: reference).isEmpty)
+        #expect(ImageReferenceNames.repoDigests(for: reference, includeDigests: true).isEmpty)
         // Empty names are what `--filter dangling=true` keys on; the raw marker reads as a tag.
-        #expect(ImageListFilter.isDangling(repoTags: ImageListRoute.repoTags(forReference: reference)))
-        #expect(ImageListFilter.isDangling(repoTags: [reference]) == false)
+        #expect(ImageListFilter.isDangling(repoTags: ImageReferenceNames.repoTags(for: reference), repoDigests: ImageReferenceNames.repoDigests(for: reference, includeDigests: true)))
+        #expect(ImageListFilter.isDangling(repoTags: [reference], repoDigests: []) == false)
         // And a nameless image must not answer a reference filter.
-        #expect(ImageListFilter.referenceMatches(patterns: ["*"], repoTags: ImageListRoute.repoTags(forReference: reference)) == false)
+        #expect(ImageListFilter.referenceMatches(patterns: ["*"], repoTags: ImageReferenceNames.repoTags(for: reference)) == false)
     }
 
     @Test("A tagged image is untouched, and its digest still honours the query flag")
     func taggedImageKeepsItsReference() {
         let tagged = "docker.io/library/alpine:3.20"
-        #expect(ImageListRoute.repoTags(forReference: tagged) == [tagged])
-        #expect(ImageListRoute.repoDigests(forReference: tagged, includeDigests: true).isEmpty)
+        #expect(ImageReferenceNames.repoTags(for: tagged) == [tagged])
+        #expect(ImageReferenceNames.repoDigests(for: tagged, includeDigests: true).isEmpty)
 
         let both = "docker.io/library/alpine:3.20@sha256:abc"
-        #expect(ImageListRoute.repoTags(forReference: both) == [both])
-        #expect(ImageListRoute.repoDigests(forReference: both, includeDigests: true) == [both])
-        #expect(ImageListRoute.repoDigests(forReference: both, includeDigests: false).isEmpty)
+        #expect(ImageReferenceNames.repoTags(for: both) == [both])
+        #expect(ImageReferenceNames.repoDigests(for: both, includeDigests: true) == [both])
+        #expect(ImageReferenceNames.repoDigests(for: both, includeDigests: false).isEmpty)
     }
 
     @Test("A digest-only reference is a digest, not a tag, whatever the query flag says")
@@ -101,15 +103,29 @@ struct ImageSummarySchemaTests {
         // moby derives RepoDigests from the target digest and leaves RepoTags empty for such an
         // image; it is named, so it is not dangling either.
         let digested = "docker.io/library/alpine@sha256:abc"
-        #expect(ImageListRoute.repoTags(forReference: digested).isEmpty)
-        #expect(ImageListRoute.repoDigests(forReference: digested, includeDigests: false) == [digested])
-        #expect(ImageListRoute.repoDigests(forReference: digested, includeDigests: true) == [digested])
+        #expect(ImageReferenceNames.repoTags(for: digested).isEmpty)
+        #expect(ImageReferenceNames.repoDigests(for: digested, includeDigests: false) == [digested])
+        #expect(ImageReferenceNames.repoDigests(for: digested, includeDigests: true) == [digested])
     }
 
     @Test("An empty reference is the same case as an untagged one")
     func emptyReferenceReportsNoNames() {
-        #expect(ImageListRoute.repoTags(forReference: "").isEmpty)
-        #expect(ImageListRoute.repoDigests(forReference: "", includeDigests: true).isEmpty)
+        #expect(ImageReferenceNames.repoTags(for: "").isEmpty)
+        #expect(ImageReferenceNames.repoDigests(for: "", includeDigests: true).isEmpty)
+    }
+
+    @Test("Images come back newest first, and ties break on the digest so the order is stable")
+    func newestFirstOrdering() {
+        let old = Self.summary(id: "sha256:aaa", created: 100)
+        let new = Self.summary(id: "sha256:bbb", created: 300)
+        let tieLow = Self.summary(id: "sha256:ccc", created: 200)
+        let tieHigh = Self.summary(id: "sha256:ddd", created: 200)
+
+        let ordered = ImageListRoute.newestFirst([old, tieLow, new, tieHigh])
+        #expect(ordered.map(\.Id) == ["sha256:bbb", "sha256:ddd", "sha256:ccc", "sha256:aaa"])
+
+        // Whatever order the store hands them over in, the answer is the same one.
+        #expect(ImageListRoute.newestFirst([new, tieHigh, tieLow, old]).map(\.Id) == ordered.map(\.Id))
     }
 }
 
@@ -149,7 +165,7 @@ struct ImageDigestGroupingTests {
             // The tagged record is the one whose index and config get read.
             #expect(groups[0].representative.reference == "socktainer-dns:embedded")
             // And the entry is no longer dangling, so `image prune` cannot claim it.
-            #expect(ImageListFilter.isDangling(repoTags: groups[0].repoTags) == false)
+            #expect(ImageListFilter.isDangling(repoTags: groups[0].repoTags, repoDigests: groups[0].repoDigests(includeDigests: true)) == false)
         }
     }
 
@@ -163,7 +179,7 @@ struct ImageDigestGroupingTests {
         #expect(groups.count == 1)
         #expect(groups[0].repoTags.isEmpty)
         #expect(groups[0].repoDigests(includeDigests: true).isEmpty)
-        #expect(ImageListFilter.isDangling(repoTags: groups[0].repoTags))
+        #expect(ImageListFilter.isDangling(repoTags: groups[0].repoTags, repoDigests: groups[0].repoDigests(includeDigests: true)))
     }
 
     @Test("Digest-only references collect under RepoDigests, tags under RepoTags")
