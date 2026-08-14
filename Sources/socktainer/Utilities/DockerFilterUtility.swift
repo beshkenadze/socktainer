@@ -1,45 +1,84 @@
 import Foundation
 import Vapor
 
+/// Decodes the `filters` query parameter into `[key: [values]]`, rejecting
+/// with a 400 the shapes whose meaning would otherwise be silently dropped:
+/// malformed JSON, a non-object top level, and values that are not an array
+/// of strings, a map of string->bool, or a single string.
+///
+/// A map's values are ignored, keeping every key: moby's `Args.Get` walks the
+/// inner map's keys and never reads their booleans, so `{"status":{"exited":
+/// false}}` filters on `exited` there. Dropping such a key discarded the
+/// filter instead, which for a prune endpoint widens the request into an
+/// unfiltered sweep. Keys are sorted so a multi-value filter is deterministic.
+///
+/// Two documented divergences from `filters.FromJSON`, both narrower than the
+/// silent drops they replace: a bare string is accepted (moby 400s it) because
+/// it is unambiguous and honoured, and a boolean filter written with a
+/// contradictory bool (`{"dangling":{"true":false}}`) resolves from the value
+/// string rather than 400ing the way `GetBoolOrDefault` does.
+enum DockerFilterDecoder {
+    static func decode(_ filtersParam: String?) throws -> [String: [String]] {
+        guard let filtersParam, !filtersParam.isEmpty, let data = filtersParam.data(using: .utf8) else {
+            return [:]
+        }
+
+        let object: Any
+        do {
+            object = try JSONSerialization.jsonObject(with: data, options: [])
+        } catch {
+            throw Abort(.badRequest, reason: "invalid filter '\(filtersParam)'")
+        }
+        guard let filters = object as? [String: Any] else {
+            throw Abort(.badRequest, reason: "invalid filter '\(filtersParam)'")
+        }
+
+        var decoded: [String: [String]] = [:]
+        for (key, value) in filters {
+            if let array = value as? [Any] {
+                guard let strings = array as? [String] else {
+                    throw Abort(.badRequest, reason: "invalid filter '\(key)'")
+                }
+                decoded[key] = strings
+            } else if let map = value as? [String: Any] {
+                // `as? Bool` bridges any NSNumber so a JSON `1` would pass as
+                // `true`; require actual JSON booleans, matching real Docker.
+                guard map.values.allSatisfy({ DockerImageFilterUtility.isJSONBool($0) }) else {
+                    throw Abort(.badRequest, reason: "invalid filter '\(key)'")
+                }
+                decoded[key] = map.keys.sorted()
+            } else if let str = value as? String {
+                decoded[key] = [str]
+            } else {
+                throw Abort(.badRequest, reason: "invalid filter '\(key)'")
+            }
+        }
+        return decoded
+    }
+}
 // utility for parsing network filters from query string
 struct DockerNetworkFilterUtility {
     // parses network filters from a query string, optionally defaulting to dangling only
     // dangling networks are networks with no containers are attached to them
     static func parseNetworkFilters(filtersParam: String?, defaultDangling: Bool, logger: Logger) throws -> [String: [String]] {
-        var filters: [String: Any] = [:]
-        var parsedFilters: [String: [String]] = [:]
-        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
-            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                filters = decoded
+        let decoded = try DockerFilterDecoder.decode(filtersParam)
 
-                // Validate keys — the full set moby accepts for network list
-                // (docker network ls -f): dangling, driver, id, label, name,
-                // scope, type. Must stay in sync with the knownKeys handled by
-                // ClientNetworkService.applyFilters.
-                let allowedKeys: Set<String> = ["dangling", "driver", "id", "label", "name", "scope", "type"]
-                let filterKeys = Set(filters.keys)
-                if !filterKeys.isSubset(of: allowedKeys) {
-                    logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                    throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                }
+        // Validate keys — the full set moby accepts for network list
+        // (docker network ls -f): dangling, driver, id, label, name,
+        // scope, type. Must stay in sync with the knownKeys handled by
+        // ClientNetworkService.applyFilters.
+        let allowedKeys: Set<String> = ["dangling", "driver", "id", "label", "name", "scope", "type"]
+        let filterKeys = Set(decoded.keys)
+        if !filterKeys.isSubset(of: allowedKeys) {
+            logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
+            throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
+        }
 
-                for (key, value) in filters {
-                    if let dict = value as? [String: Any] {
-                        let keys = dict.compactMap { (key, value) in
-                            (value as? Bool == true) ? key : nil
-                        }
-                        if !keys.isEmpty {
-                            parsedFilters[key] = keys
-                        }
-                    } else if let arr = value as? [String] {
-                        parsedFilters[key] = arr
-                    }
-                }
-                logger.debug("Decoded filters: \(parsedFilters)")
-            } else {
-                logger.warning("Failed to decode filters")
-            }
-        } else if defaultDangling {
+        // An all-false bool map carries no values, so it filters nothing
+        var parsedFilters = decoded.filter { !$0.value.isEmpty }
+        logger.debug("Decoded filters: \(parsedFilters)")
+
+        if filtersParam == nil, defaultDangling {
             parsedFilters["dangling"] = ["true"]
             logger.debug("No filters provided, defaulting to prune only dangling networks.")
         }
@@ -51,36 +90,16 @@ struct DockerNetworkFilterUtility {
 struct DockerContainerFilterUtility {
     static func parseContainerPruneFilters(filtersParam: String?, logger: Logger) throws -> [String: [String]] {
         let allowedKeys: Set<String> = ["until", "label"]
-        var filters: [String: Any] = [:]
-        var parsedFilters: [String: [String]] = [:]
-        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
-            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                filters = decoded
-                // Validate keys
-                let filterKeys = Set(filters.keys)
-                if !filterKeys.isSubset(of: allowedKeys) {
-                    logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                    throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                }
-                for (key, value) in filters {
-                    if let dict = value as? [String: Any] {
-                        let keys = dict.compactMap { (k, v) in
-                            (v as? Bool == true) ? k : nil
-                        }
-                        if !keys.isEmpty {
-                            parsedFilters[key] = keys
-                        }
-                    } else if let arr = value as? [String] {
-                        parsedFilters[key] = arr
-                    } else if let str = value as? String {
-                        parsedFilters[key] = [str]
-                    }
-                }
-                logger.debug("Decoded container prune filters: \(parsedFilters)")
-            } else {
-                logger.warning("Failed to decode container prune filters")
-            }
+        let decoded = try DockerFilterDecoder.decode(filtersParam)
+        // Validate keys
+        let filterKeys = Set(decoded.keys)
+        if !filterKeys.isSubset(of: allowedKeys) {
+            logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
+            throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
         }
+        // An all-false bool map carries no values, so it filters nothing
+        let parsedFilters = decoded.filter { !$0.value.isEmpty }
+        logger.debug("Decoded container prune filters: \(parsedFilters)")
         return parsedFilters
     }
 
@@ -104,36 +123,16 @@ struct DockerContainerFilterUtility {
             "publish",
             "since",
         ]
-        var filters: [String: Any] = [:]
-        var parsedFilters: [String: [String]] = [:]
-        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
-            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                filters = decoded
-                // Validate keys
-                let filterKeys = Set(filters.keys)
-                if !filterKeys.isSubset(of: allowedKeys) {
-                    logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                    throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                }
-                for (key, value) in filters {
-                    if key == "label", let dict = value as? [String: Any] {
-                        let keys = dict.compactMap { (k, v) in
-                            (v as? Bool == true) ? k : nil
-                        }
-                        if !keys.isEmpty {
-                            parsedFilters[key] = keys
-                        }
-                    } else if let arr = value as? [String] {
-                        parsedFilters[key] = arr
-                    } else if let str = value as? String {
-                        parsedFilters[key] = [str]
-                    }
-                }
-                logger.debug("Decoded filters: \(parsedFilters)")
-            } else {
-                logger.warning("Failed to decode filters")
-            }
+        let decoded = try DockerFilterDecoder.decode(filtersParam)
+        // Validate keys
+        let filterKeys = Set(decoded.keys)
+        if !filterKeys.isSubset(of: allowedKeys) {
+            logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
+            throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
         }
+        // An all-false bool map carries no values, so it filters nothing
+        let parsedFilters = decoded.filter { !$0.value.isEmpty }
+        logger.debug("Decoded filters: \(parsedFilters)")
         return parsedFilters
     }
 }
@@ -143,167 +142,81 @@ struct DockerVolumeFilterUtility {
     static func parsePruneFilters(filtersParam: String?, logger: Logger) throws -> [String: [String]] {
         // "label!" is the key Docker CLI sends for --filter label!=key (negative match).
         let allowedKeys: Set<String> = ["label", "label!", "all"]
-        var filters: [String: Any] = [:]
-        var parsedFilters: [String: [String]] = [:]
-        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
-            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                filters = decoded
-                // Validate keys
-                let filterKeys = Set(filters.keys)
-                if !filterKeys.isSubset(of: allowedKeys) {
-                    logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                    throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                }
-                for (key, value) in filters {
-                    if let dict = value as? [String: Any] {
-                        let keys = dict.compactMap { (key, value) in
-                            (value as? Bool == true) ? key : nil
-                        }
-                        if !keys.isEmpty {
-                            parsedFilters[key] = keys
-                        }
-                    } else if let arr = value as? [String] {
-                        parsedFilters[key] = arr
-                    }
-                }
-                logger.debug("Decoded filters: \(parsedFilters)")
-            } else {
-                logger.warning("Failed to decode filters")
-            }
+        let decoded = try DockerFilterDecoder.decode(filtersParam)
+        // Validate keys
+        let filterKeys = Set(decoded.keys)
+        if !filterKeys.isSubset(of: allowedKeys) {
+            logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
+            throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
         }
+        // An all-false bool map carries no values, so it filters nothing
+        let parsedFilters = decoded.filter { !$0.value.isEmpty }
+        logger.debug("Decoded filters: \(parsedFilters)")
         return parsedFilters
     }
 
     static func parseVolumeFilters(filtersParam: String?, logger: Logger) throws -> [String: [String]] {
         let allowedKeys: Set<String> = ["name", "driver", "label", "dangling"]
-        var filters: [String: Any] = [:]
-        var parsedFilters: [String: [String]] = [:]
-        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
-            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                filters = decoded
-                // Validate keys
-                let filterKeys = Set(filters.keys)
-                if !filterKeys.isSubset(of: allowedKeys) {
-                    logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                    throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                }
-                for (key, value) in filters {
-                    if let dict = value as? [String: Any] {
-                        let keys = dict.compactMap { (key, value) in
-                            (value as? Bool == true) ? key : nil
-                        }
-                        if !keys.isEmpty {
-                            parsedFilters[key] = keys
-                        }
-                    } else if let arr = value as? [String] {
-                        parsedFilters[key] = arr
-                    }
-                }
-                logger.debug("Decoded filters: \(parsedFilters)")
-            } else {
-                logger.warning("Failed to decode filters")
-            }
+        let decoded = try DockerFilterDecoder.decode(filtersParam)
+        // Validate keys
+        let filterKeys = Set(decoded.keys)
+        if !filterKeys.isSubset(of: allowedKeys) {
+            logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
+            throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
         }
+        // An all-false bool map carries no values, so it filters nothing
+        let parsedFilters = decoded.filter { !$0.value.isEmpty }
+        logger.debug("Decoded filters: \(parsedFilters)")
         return parsedFilters
     }
 }
 
 struct DockerImageFilterUtility {
-    static func parseImagePruneFilters(filterParam: String?, logger: Logger) -> [String: [String]] {
-        var parsedFilters: [String: [String]] = [:]
-
-        if let filterParam = filterParam {
-            if let data = filterParam.data(using: .utf8) {
-                do {
-                    // First try to parse as generic JSON to see what we got
-                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                        for (key, value) in json {
-                            switch key {
-                            case "dangling", "label", "until":
-                                // Handle dictionary format: {"dangling": {"true": true}}
-                                if let dict = value as? [String: Any] {
-                                    let keys = dict.compactMap { (k, v) in
-                                        (v as? Bool == true) ? k : nil
-                                    }
-                                    if !keys.isEmpty {
-                                        parsedFilters[key] = keys
-                                    }
-                                }
-                                // Handle array format: {"dangling": ["true"]}
-                                else if let arr = value as? [String] {
-                                    parsedFilters[key] = arr
-                                }
-                                // Handle single string: {"dangling": "true"}
-                                else if let str = value as? String {
-                                    parsedFilters[key] = [str]
-                                }
-                            default:
-                                logger.warning("Unknown filter key '\(key)'")
-                            }
-                        }
-                    }
-                } catch {
-                    logger.warning("Failed to decode filters: \(error)")
-                }
-            } else {
-                logger.warning("Failed to convert filter param to data")
-            }
+    /// Parses the `filters` query for POST /images/prune. moby's image-prune accepts dangling, label
+    /// and until, and rejects anything else with a 400 before its backend runs
+    /// (api/server/router/image/image_routes.go). Decoding a malformed parameter to "no filters" is
+    /// the worst failure available here: a request meant to delete a narrow set becomes an
+    /// unrestricted prune that reports 200.
+    static func parseImagePruneFilters(filterParam: String?, logger: Logger) throws -> [String: [String]] {
+        let allowedKeys: Set<String> = ["dangling", "label", "until"]
+        let decoded = try DockerFilterDecoder.decode(filterParam)
+        for key in decoded.keys where !allowedKeys.contains(key) {
+            logger.warning("Invalid filter key '\(key)' for image prune")
+            throw Abort(.badRequest, reason: "invalid filter '\(key)'")
         }
-
-        return parsedFilters
+        // `dangling` with no values is a 400 in moby: image-prune reads it through
+        // `GetBoolOrDefault`, which errors on an empty value set rather than falling back to its
+        // default. An empty `label`/`until` is dropped instead, matching `MatchKVList` on an empty
+        // map, which narrows nothing — the same prune scope as an absent key.
+        if let dangling = decoded["dangling"], dangling.isEmpty {
+            logger.warning("Filter 'dangling' carries no value")
+            throw Abort(.badRequest, reason: "invalid filter 'dangling'")
+        }
+        logger.debug("Decoded filters: \(decoded)")
+        return decoded.filter { !$0.value.isEmpty }
     }
 
     /// Parses the `filters` query for GET /images/json. moby's image-ls accepts
     /// before, dangling, label, reference, since, and until, and rejects any
-    /// other key with a 400 (filters.Validate); this normalizes the three JSON
-    /// shapes docker clients send into `[key: [value]]`.
+    /// other key with a 400 (filters.Validate); decoding goes through
+    /// `DockerFilterDecoder`, which 400s malformed JSON, a non-object top
+    /// level, and unsupported value shapes.
     ///
     /// An absent or empty `filters` param means "no filter" (200, unfiltered).
-    /// A non-empty param that fails to decode — malformed JSON, a non-object
-    /// top level, or a value that is not one of the three accepted shapes
-    /// (map of string->bool, array of strings, or a single string) — is a 400
-    /// `invalid filter`, matching real Docker's `filters.FromJSON`. Verified
-    /// against a live daemon: malformed JSON, `[]`, `{"reference": 1}`,
-    /// `{"reference": {"alpine": "yes"}}`, and `{"reference": [1, 2]}` all 400.
+    /// Unlike the other parsers, a key whose bool map yields no values stays
+    /// registered with an empty list: real Docker treats a present-but-empty
+    /// filter as "match nothing" (verified live: `{"reference":{}}` and an
+    /// all-false map both return no images), not "no filter" the way an
+    /// absent key does.
     static func parseImageListFilters(filterParam: String?, logger: Logger) throws -> [String: [String]] {
-        var parsedFilters: [String: [String]] = [:]
         let allowedKeys: Set<String> = ["before", "dangling", "label", "reference", "since", "until"]
-
-        guard let filterParam, !filterParam.isEmpty, let data = filterParam.data(using: .utf8) else {
-            return parsedFilters
-        }
-        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            throw Abort(.badRequest, reason: "invalid filter")
-        }
-        for (key, value) in json {
+        let decoded = try DockerFilterDecoder.decode(filterParam)
+        for key in decoded.keys {
             guard allowedKeys.contains(key) else {
                 throw Abort(.badRequest, reason: "invalid filter '\(key)'")
             }
-            // {"reference": {"alpine:*": true}} / {"reference": ["alpine:*"]} / {"reference": "alpine:*"}
-            if let dict = value as? [String: Any] {
-                // `as? Bool` bridges any NSNumber (so a JSON `1` would pass as
-                // `true`); check the JSON node's real CF type instead so a
-                // numeric value here is rejected, matching real Docker.
-                guard dict.values.allSatisfy({ DockerImageFilterUtility.isJSONBool($0) }) else {
-                    throw Abort(.badRequest, reason: "invalid filter")
-                }
-                // Always register the key, even with zero true entries: real
-                // Docker treats a present-but-empty filter as "match nothing"
-                // (verified live: `{"reference":{}}` and an all-false map both
-                // return no images), not "no filter" the way an absent key does.
-                parsedFilters[key] = dict.compactMap { (k, v) in (v as? Bool == true) ? k : nil }
-            } else if let arr = value as? [Any] {
-                guard let strings = arr as? [String] else {
-                    throw Abort(.badRequest, reason: "invalid filter")
-                }
-                parsedFilters[key] = strings
-            } else if let str = value as? String {
-                parsedFilters[key] = [str]
-            } else {
-                throw Abort(.badRequest, reason: "invalid filter")
-            }
         }
-        return parsedFilters
+        return decoded
     }
 
     /// True only for an actual JSON boolean node. `JSONSerialization` bridges
@@ -320,41 +233,19 @@ struct DockerImageFilterUtility {
 struct DockerBuildFilterUtility {
     static func parseBuildPruneFilters(filtersParam: String?, logger: Logger) throws -> [String: [String]] {
         let supportedKeys: Set<String> = ["until", "id", "inuse", "parent", "type", "description", "shared", "private"]
-        var filters: [String: Any] = [:]
-        var parsedFilters: [String: [String]] = [:]
+        let decoded = try DockerFilterDecoder.decode(filtersParam)
 
-        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
-            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                filters = decoded
-
-                // Validate keys
-                let filterKeys = Set(filters.keys)
-                if !filterKeys.isSubset(of: supportedKeys) {
-                    let invalid = filterKeys.subtracting(supportedKeys)
-                    logger.warning("Invalid filter key(s) found: \(invalid)")
-                    throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(invalid)")
-                }
-
-                for (key, value) in filters {
-                    if let dict = value as? [String: Any] {
-                        let keys = dict.compactMap { (k, v) in
-                            (v as? Bool == true) ? k : nil
-                        }
-                        if !keys.isEmpty {
-                            parsedFilters[key] = keys
-                        }
-                    } else if let arr = value as? [String] {
-                        parsedFilters[key] = arr
-                    } else if let str = value as? String {
-                        parsedFilters[key] = [str]
-                    }
-                }
-                logger.info("Parsed build prune filters: \(parsedFilters)")
-            } else {
-                logger.warning("Failed to decode build prune filters")
-            }
+        // Validate keys
+        let filterKeys = Set(decoded.keys)
+        if !filterKeys.isSubset(of: supportedKeys) {
+            let invalid = filterKeys.subtracting(supportedKeys)
+            logger.warning("Invalid filter key(s) found: \(invalid)")
+            throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(invalid)")
         }
 
+        // An all-false bool map carries no values, so it filters nothing
+        let parsedFilters = decoded.filter { !$0.value.isEmpty }
+        logger.info("Parsed build prune filters: \(parsedFilters)")
         return parsedFilters
     }
 

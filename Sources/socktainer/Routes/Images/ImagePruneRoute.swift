@@ -27,7 +27,7 @@ extension ImagePruneRoute {
         let query = try req.query.decode(RESTImagePruneQuery.self)
         let logger = req.logger
 
-        let parsedFilters = DockerImageFilterUtility.parseImagePruneFilters(filterParam: query.filters, logger: logger)
+        let parsedFilters = try DockerImageFilterUtility.parseImagePruneFilters(filterParam: query.filters, logger: logger)
 
         do {
             let result = try await client.prune(filters: parsedFilters, logger: logger)
