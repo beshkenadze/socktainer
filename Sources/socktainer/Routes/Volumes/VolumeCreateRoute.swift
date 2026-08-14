@@ -22,8 +22,8 @@ struct VolumeCreateRoute: RouteCollection {
         // can apply the right Filesystem.SyncMode when mounting this volume.
         var driverOpts = createRequest.DriverOpts ?? [:]
         let originalLabels = createRequest.Labels ?? [:]
-        guard !LabelNormalization.containsReservedKey(originalLabels) else {
-            throw Abort(.badRequest, reason: "Label key '\(LabelNormalization.mappingKey)' is reserved for internal use")
+        if let reserved = LabelNormalization.reservedKey(in: originalLabels) {
+            throw Abort(.badRequest, reason: "Label key '\(reserved)' is reserved for internal use")
         }
         var labels = LabelNormalization.sanitize(originalLabels)
         if let mapping = LabelNormalization.buildMapping(originalLabels) {

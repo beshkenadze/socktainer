@@ -41,6 +41,13 @@ extension ContainerDeleteRoute {
                 // Prevents a container recreated under the same name from inheriting this one's restart-attempt count.
                 await ContainerRestartState.shared.reset(id: eventName)
                 await RestartPolicyOverrideStore.shared.remove(id: eventId)
+                // Releases this container's die-event bookkeeping and refuses later claims: an
+                // exit monitor still resolving the exit of a container that is now gone would
+                // otherwise find no record of the run and emit a `die` for it a second time.
+                await DieEventOwnership.shared.forget(id: eventName)
+                // A rename leaves the container reachable under the id it had before; once it is
+                // deleted that id must 404 like any other unknown reference.
+                await ContainerRenameMap.shared.forget(nativeId: eventName)
                 guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else { return }
                 await broadcaster.broadcast(
                     DockerEvent.simpleEvent(
@@ -78,6 +85,8 @@ extension ContainerDeleteRoute {
                     let containerIP = ContainerStartRoute.dnsAttachmentIP(in: container)
                     ContainerAliasCleanup.unregisterAllAliases(
                         nativeId: container.id,
+                        // Raw labels: the recorded DNS names are stripped from restored label sets.
+                        dnsNames: ContainerAliasCleanup.dnsNames(in: container.configuration.labels),
                         labels: cached?.labels ?? LabelNormalization.restore(container.configuration.labels),
                         cachedIP: cached?.ip ?? containerIP,
                         dnsServer: dnsServer

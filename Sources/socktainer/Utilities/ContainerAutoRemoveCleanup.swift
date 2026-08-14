@@ -11,6 +11,9 @@ enum ContainerAutoRemoveCleanup {
         nativeId: String,
         fallbackImage: String,
         fallbackLabels: [String: String],
+        /// Read from the container's raw configuration labels by the caller: `restore` strips the
+        /// recorded names, so neither the cache nor a restored fallback set still carries them.
+        dnsNames: [String] = [],
         dnsServer: SocktainerDNSServer?,
         broadcaster: EventBroadcaster?
     ) async {
@@ -20,6 +23,7 @@ enum ContainerAutoRemoveCleanup {
         if let dnsServer {
             ContainerAliasCleanup.unregisterAllAliases(
                 nativeId: nativeId,
+                dnsNames: dnsNames,
                 labels: labels,
                 cachedIP: cached?.ip,
                 dnsServer: dnsServer
@@ -36,5 +40,9 @@ enum ContainerAutoRemoveCleanup {
         }
         await ContainerInfoCache.shared.remove(id: hexId)
         await RestartPolicyOverrideStore.shared.remove(id: hexId)
+        // `--rm` containers are reaped here instead of through DELETE, so this is where their
+        // die-event bookkeeping is released. It also refuses later claims: a second observer
+        // still resolving the same exit would otherwise find no record and emit another `die`.
+        await DieEventOwnership.shared.forget(id: cached?.nativeId ?? nativeId)
     }
 }

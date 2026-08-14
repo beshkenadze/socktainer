@@ -419,13 +419,17 @@ extension ContainerCreateRoute {
                 ?? []
 
             let originalLabels = body.Labels ?? [:]
-            guard !LabelNormalization.containsReservedKey(originalLabels) else {
-                throw Abort(.badRequest, reason: "Label key '\(LabelNormalization.mappingKey)' is reserved for internal use")
+            if let reserved = LabelNormalization.reservedKey(in: originalLabels) {
+                throw Abort(.badRequest, reason: "Label key '\(reserved)' is reserved for internal use")
             }
             var containerLabels = LabelNormalization.sanitize(originalLabels)
             if let mapping = LabelNormalization.buildMapping(originalLabels) {
                 containerLabels[LabelNormalization.mappingKey] = mapping
             }
+            // The container's Docker ID, minted here and carried on the container itself. It rides
+            // along in the configuration a rename copies, so renaming preserves the ID as Docker
+            // does instead of deriving a new one from the new name.
+            containerLabels[DockerContainerID.idLabel] = DockerContainerID.mint()
 
             // Persist the requested healthcheck across create → start so the
             // start route can launch the probe loop and inspect can return it
@@ -449,7 +453,7 @@ extension ContainerCreateRoute {
             }
 
             if !dnsNames.isEmpty {
-                containerLabels["socktainer.dns.names"] = dnsNames.joined(separator: ",")
+                containerLabels[ContainerAliasCleanup.dnsNamesLabel] = dnsNames.joined(separator: ",")
             }
 
             // Ensure a DNS forwarder container for any named (non-default) network.
