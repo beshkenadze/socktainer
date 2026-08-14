@@ -23,6 +23,13 @@ extension EventsRoute {
             response.headers.add(name: .contentType, value: "application/json")
 
             response.body = .init(asyncStream: { writer in
+                // Flush the head before waiting on the first event. A body stream sends nothing until
+                // it produces, so on an idle daemon the client saw no status line at all: `docker
+                // events` printed nothing and a `curl` against /events hung with zero bytes. Docker
+                // answers immediately and only then streams, which is what `--until` and any client
+                // that reads headers before events depends on.
+                _ = try? await writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
+
                 for await event in stream {
                     if let json = try? JSONEncoder().encode(event) {
                         var buffer = req.application.allocator.buffer(capacity: json.count + 1)
