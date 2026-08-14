@@ -13,11 +13,13 @@ struct ImageListFilterTests {
 
     // MARK: - dangling
 
-    @Test("isDangling is true only for images with no repo tags")
+    @Test("isDangling is true only when nothing names the image")
     func danglingDetection() {
-        #expect(ImageListFilter.isDangling(repoTags: []))
-        #expect(ImageListFilter.isDangling(repoTags: ["<none>:<none>"]))
-        #expect(!ImageListFilter.isDangling(repoTags: ["docker.io/library/alpine:latest"]))
+        #expect(ImageListFilter.isDangling(repoTags: [], repoDigests: []))
+        #expect(!ImageListFilter.isDangling(repoTags: ["docker.io/library/alpine:latest"], repoDigests: []))
+        // A digest is a name: moby reserves dangling for an image nothing refers to, and prune keys
+        // on the same rule, so calling this dangling would delete an image a client can still pull.
+        #expect(!ImageListFilter.isDangling(repoTags: [], repoDigests: ["docker.io/library/alpine@sha256:abc"]))
     }
 
     // MARK: - reference familiar-form matching
@@ -141,16 +143,19 @@ struct ImageListFilterTests {
         #expect(kept.isEmpty)
     }
 
-    @Test("A boolean-map reference filter with false-only or mixed entries keeps only the true ones")
+    @Test("A boolean-map filter keeps every key, whatever bool it carries, as moby's Args.Get does")
     func parseBooleanMapFalseAndMixedEntries() throws {
         let logger = Logger(label: "test")
+        // `Args.Get` walks the inner map's keys and never reads their booleans (api/types/filters/
+        // parse.go), so a false-valued entry is still a filter value there. Dropping it silently
+        // widened the request: `{"reference":{"alpine":false}}` became no reference filter at all.
         let falseOnly = try DockerImageFilterUtility.parseImageListFilters(
             filterParam: #"{"reference": {"alpine": false}}"#, logger: logger)
-        #expect(falseOnly == ["reference": []], "an all-false map registers the key with zero values, not no filter")
+        #expect(falseOnly == ["reference": ["alpine"]], "the key survives its false bool")
 
         let mixed = try DockerImageFilterUtility.parseImageListFilters(
             filterParam: #"{"reference": {"alpine": true, "old": false}}"#, logger: logger)
-        #expect(mixed == ["reference": ["alpine"]], "only the true-valued key survives")
+        #expect(mixed == ["reference": ["alpine", "old"]], "both keys are values; order is sorted for determinism")
     }
 
     @Test("reference and dangling AND together")
@@ -171,9 +176,13 @@ struct ImageListFilterTests {
 
     // MARK: - filters query parsing
 
-    @Test("The three JSON filter shapes docker clients send all normalize to [key: [value]]")
+    @Test("Array, bool-map, and bare-string values all normalize to [key: [value]]")
     func parseFilterShapes() throws {
         let logger = Logger(label: "test")
+        // A bare string is a socktainer superset: moby's filters.FromJSON 400s
+        // {"reference": "alpine:*"} — it only accepts arrays and bool maps.
+        // We keep honouring it (the filter is unambiguous and applied), so do
+        // not "fix" this into a 400 believing it matches Docker.
         for shape in [#"{"reference": {"alpine:*": true}}"#, #"{"reference": ["alpine:*"]}"#, #"{"reference": "alpine:*"}"#] {
             let parsed = try DockerImageFilterUtility.parseImageListFilters(filterParam: shape, logger: logger)
             #expect(parsed == ["reference": ["alpine:*"]])

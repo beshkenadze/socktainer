@@ -37,11 +37,13 @@ struct OCIDescriptor: Content {
 
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
+            // architecture and os are required by the OCI image spec; the rest carry `omitempty`
+            // there and in moby, so an absent one is a missing key, not a null.
             try container.encodeNullable(architecture, forKey: .architecture)
             try container.encodeNullable(os, forKey: .os)
-            try container.encodeNullable(osVersion, forKey: .osVersion)
-            try container.encodeNullable(osFeatures, forKey: .osFeatures)
-            try container.encodeNullable(variant, forKey: .variant)
+            try container.encodeIfPresent(osVersion, forKey: .osVersion)
+            try container.encodeIfPresent(osFeatures, forKey: .osFeatures)
+            try container.encodeIfPresent(variant, forKey: .variant)
         }
     }
 
@@ -58,14 +60,16 @@ struct OCIDescriptor: Content {
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        // mediaType, digest and size are required by the OCI descriptor; urls, annotations, data,
+        // platform and artifactType are `omitempty` in the spec and in moby's vendored copy.
         try container.encodeNullable(mediaType, forKey: .mediaType)
         try container.encodeNullable(digest, forKey: .digest)
         try container.encodeNullable(size, forKey: .size)
-        try container.encodeNullable(urls, forKey: .urls)
-        try container.encodeNullable(annotations, forKey: .annotations)
-        try container.encodeNullable(data, forKey: .data)
-        try container.encodeNullable(platform, forKey: .platform)
-        try container.encodeNullable(artifactType, forKey: .artifactType)
+        try container.encodeIfPresent(urls, forKey: .urls)
+        try container.encodeIfPresent(annotations, forKey: .annotations)
+        try container.encodeIfPresent(data, forKey: .data)
+        try container.encodeIfPresent(platform, forKey: .platform)
+        try container.encodeIfPresent(artifactType, forKey: .artifactType)
     }
 }
 

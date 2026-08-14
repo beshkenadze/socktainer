@@ -173,8 +173,10 @@ extension SystemDFRoute {
                         totalSize += descriptor.size
                     }
 
-                    let repoTags = image.reference.isEmpty ? [] : [image.reference]
-                    let repoDigests = image.reference.contains("@sha256:") ? [image.reference] : []
+                    // Same name rules as GET /images/json: Apple Container's `untagged@…` marker is
+                    // internal, so a nameless image reports neither tag nor digest.
+                    let repoTags = ImageReferenceNames.repoTags(for: image.reference)
+                    let repoDigests = ImageReferenceNames.repoDigests(for: image.reference, includeDigests: true)
                     let containerCount = usageByImageReference[image.reference] ?? 0
 
                     return RESTImageSummary(

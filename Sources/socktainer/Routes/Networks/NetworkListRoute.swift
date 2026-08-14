@@ -1,16 +1,33 @@
+import Foundation
 import Vapor
 
 struct RESTNetworksListQuery: Content {
     let filters: String?
 }
 
+extension Response {
+    /// Docker serves JSON bodies with `Content-Type: application/json`; clients
+    /// and proxies that sniff the content type cannot treat a bare `Response`
+    /// as JSON. All routes returning a JSON payload build it through this.
+    static func json(_ data: Data, status: HTTPResponseStatus = .ok) -> Response {
+        var headers = HTTPHeaders()
+        headers.replaceOrAdd(name: .contentType, value: "application/json")
+        return Response(status: status, headers: headers, body: .init(data: data))
+    }
+}
+
 struct NetworkListRoute: RouteCollection {
-    func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.GET, pattern: "/networks", use: NetworkListRoute.handler)
+    let client: ClientNetworkProtocol
+
+    init(client: ClientNetworkProtocol = ClientNetworkService()) {
+        self.client = client
     }
 
-    static func handler(_ req: Request) async throws -> Response {
-        let networkClient = ClientNetworkService()
+    func boot(routes: RoutesBuilder) throws {
+        try routes.registerVersionedRoute(.GET, pattern: "/networks", use: handler)
+    }
+
+    func handler(_ req: Request) async throws -> Response {
         let query = try req.query.decode(RESTNetworksListQuery.self)
         let filtersParam = query.filters
 
@@ -20,10 +37,10 @@ struct NetworkListRoute: RouteCollection {
         let filtersJSONString = String(data: filtersJSON, encoding: .utf8)
 
         do {
-            let networks = try await networkClient.list(filters: filtersJSONString, logger: req.logger)
-            return Response(status: .ok, body: .init(data: try JSONEncoder().encode(networks)))
+            let networks = try await client.list(filters: filtersJSONString, logger: req.logger)
+            return .json(try JSONEncoder().encode(networks))
         } catch {
-            return Response(status: .internalServerError, body: .init(string: "Failed to list networks: \(error)"))
+            throw Abort(.internalServerError, reason: "Failed to list networks: \(error)")
         }
     }
 }

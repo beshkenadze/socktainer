@@ -21,7 +21,66 @@ struct CustomImageDetail: Decodable {
     public let name: String
 }
 
+/// The two fields grouping needs from a runtime image record, so the rules below can be exercised
+/// without an Apple Container store behind them.
+protocol ImageDigestNamed {
+    var digest: String { get }
+    var reference: String { get }
+}
+
+extension ClientImage: ImageDigestNamed {}
+
 extension ImageListRoute {
+    /// One image is one entry per digest, carrying every name that points at it. moby builds exactly
+    /// that: `uniqueImages[dgst]` keeps a single record per digest and `RepoTags: tagsByDigest[digest]`
+    /// fills it with all of them (daemon/containerd/image_list.go). Apple Container instead stores one
+    /// record per reference, so `docker tag alpine:3.20 myalpine:1` produced two rows sharing an ID,
+    /// and an image whose tag was removed kept an `untagged@sha256:…` record beside the tagged one —
+    /// which made `docker images` list the same ID twice and offered a tagged image to
+    /// `docker image prune` under `--filter dangling=true`.
+    ///
+    /// Grouping subsumes both: the untagged marker contributes no name, so it disappears into a named
+    /// group and only survives as its own dangling entry when nothing names that digest.
+    struct DigestGroup<Image: ImageDigestNamed> {
+        let representative: Image
+        let references: [String]
+
+        /// Sorted so a client sees a stable order; moby's own order comes from map iteration.
+        var repoTags: [String] {
+            references.flatMap { ImageReferenceNames.repoTags(for: $0) }.sorted()
+        }
+
+        func repoDigests(includeDigests: Bool) -> [String] {
+            references.flatMap { ImageReferenceNames.repoDigests(for: $0, includeDigests: includeDigests) }.sorted()
+        }
+    }
+
+    static func groupByDigest<Image: ImageDigestNamed>(_ images: [Image]) -> [DigestGroup<Image>] {
+        var order: [String] = []
+        var referencesByDigest: [String: [String]] = [:]
+        var representatives: [String: Image] = [:]
+
+        for image in images {
+            if referencesByDigest[image.digest] == nil {
+                order.append(image.digest)
+                representatives[image.digest] = image
+            }
+            referencesByDigest[image.digest, default: []].append(image.reference)
+            // A named record is the better representative: its index and config are the ones moby
+            // reports, and an untagged marker can outlive the content it pointed at.
+            if !ImageReferenceNames.isUnnamed(image.reference),
+                let current = representatives[image.digest],
+                ImageReferenceNames.isUnnamed(current.reference)
+            {
+                representatives[image.digest] = image
+            }
+        }
+
+        return order.compactMap { digest in
+            guard let representative = representatives[digest] else { return nil }
+            return DigestGroup(representative: representative, references: referencesByDigest[digest] ?? [])
+        }
+    }
     private static func makeOCIDescriptor(
         from descriptor: Descriptor,
         appSupportURL: URL? = nil,
@@ -80,7 +139,8 @@ extension ImageListRoute {
             let includeDigests = query.digests ?? false
             var imagesSummaries: [RESTImageSummary] = []
 
-            for image in images {
+            for group in Self.groupByDigest(images) {
+                let image = group.representative
                 let imageIndex = try await image.index()
                 let manifests = imageIndex.manifests
                 var manifestSummaries: [ImageManifestSummary] = []
@@ -162,9 +222,10 @@ extension ImageListRoute {
                     }
                 }
 
-                let repoTags = image.reference.isEmpty ? [] : [image.reference]
-                let repoDigests = includeDigests && image.reference.contains("@sha256:") ? [image.reference] : []
-                let containersUsingImage = containers.filter { $0.configuration.image.reference == image.reference }
+                let repoTags = group.repoTags
+                let repoDigests = group.repoDigests(includeDigests: includeDigests)
+                let groupReferences = Set(group.references)
+                let containersUsingImage = containers.filter { groupReferences.contains($0.configuration.image.reference) }
                 let summary = RESTImageSummary(
                     Id: image.digest,
                     ParentId: "",
@@ -185,8 +246,15 @@ extension ImageListRoute {
                 imagesSummaries.append(summary)
             }
 
-            return try ImageListRoute.applyFilters(imagesSummaries, filters: filters)
+            return try ImageListRoute.applyFilters(Self.newestFirst(imagesSummaries), filters: filters)
         }
+    }
+
+    /// moby sorts finished summaries newest first. Apple Container enumerates its reference store,
+    /// whose order can shuffle between calls, so `docker images` rows would reshuffle without this. The
+    /// digest breaks ties, keeping images created in the same second in a stable order.
+    static func newestFirst(_ summaries: [RESTImageSummary]) -> [RESTImageSummary] {
+        summaries.sorted { ($0.Created, $0.Id) > ($1.Created, $1.Id) }
     }
 
     /// Applies the `dangling` and `reference` image-ls filters. Different keys
@@ -210,7 +278,7 @@ extension ImageListRoute {
             guard isTrue != isFalse else {
                 throw Abort(.badRequest, reason: "invalid filter 'dangling=[\(dangling.joined(separator: " "))]'")
             }
-            result = result.filter { ImageListFilter.isDangling(repoTags: $0.RepoTags) == isTrue }
+            result = result.filter { ImageListFilter.isDangling(repoTags: $0.RepoTags, repoDigests: $0.RepoDigests) == isTrue }
         }
         // A present `reference` key with zero values (an empty array, or a
         // boolean map with no true entries) is a real Docker filter that
