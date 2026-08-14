@@ -167,7 +167,7 @@ struct ExecRoute: RouteCollection {
                 Pid: nil
             )
 
-            return Response(status: .ok, body: .init(data: try JSONEncoder().encode(response)))
+            return .json(try JSONEncoder().encode(response))
         }
     }
 
@@ -248,7 +248,7 @@ struct ExecRoute: RouteCollection {
                 )
                 await broadcaster.broadcast(event)
             }
-            return Response(status: .created, body: .init(data: try JSONEncoder().encode(CreateExecResponse(Id: id))))
+            return .json(try JSONEncoder().encode(CreateExecResponse(Id: id)), status: .created)
         }
     }
 
