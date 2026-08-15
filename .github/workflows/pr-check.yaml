@@ -261,9 +261,18 @@ jobs:
         run: |
           # expect specific content returned via `/version` endpoint
           sudo docker version | grep 'socktainer'
-          # expect specific Docker engine API versions
-          sudo docker version | grep 'v1.32'
-          sudo docker version | grep 'v1.51'
+          # The Engine API reports versions as bare "major.minor" (moby's
+          # SystemVersion examples: ApiVersion "1.47", MinAPIVersion "1.24"),
+          # and clients compare them numerically — a "v" prefix breaks that.
+          API_VERSION=$(sudo docker version --format '{{.Server.APIVersion}}')
+          MIN_API_VERSION=$(sudo docker version --format '{{.Server.MinAPIVersion}}')
+          [[ "${API_VERSION}" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "Error: API version '${API_VERSION}' is not bare major.minor"; exit 1; }
+          [[ "${MIN_API_VERSION}" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "Error: Min API version '${MIN_API_VERSION}' is not bare major.minor"; exit 1; }
+          # The daemon's own version must not be the API version (issue #9).
+          SERVER_VERSION=$(sudo docker version --format '{{.Server.Version}}')
+          [[ "${SERVER_VERSION}" != "${API_VERSION}" ]] || { echo "Error: daemon version '${SERVER_VERSION}' equals the API version"; exit 1; }
+          # Containers are Linux VMs on Apple Container; clients branch on Os.
+          [[ "$(sudo docker version --format '{{.Server.Os}}')" == "linux" ]] || { echo "Error: server Os is not 'linux'"; exit 1; }
 
       - name: check network with socktainer
         run: |
