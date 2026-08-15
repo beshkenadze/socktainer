@@ -93,8 +93,9 @@ protocol ClientArchiveProtocol: Sendable {
     /// Get the path to a container's rootfs
     func getRootfsPath(containerId: String) -> URL
 
-    /// Read a file or directory from a container's filesystem and return as tar data
-    func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat)
+    /// Read a file or directory from a container's filesystem and return as tar data.
+    /// Takes the snapshot, not the id: where the bytes live depends on whether the guest is running.
+    func getArchive(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat)
 
     /// Extract a tar archive into a container's filesystem at the specified path
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws
@@ -121,17 +122,41 @@ struct ClientArchiveService: ClientArchiveProtocol {
             .appendingPathComponent("rootfs.ext4")
     }
 
-    /// Read a file or directory from a container's filesystem and return as tar data
-    /// This implementation reads only the requested path directly, avoiding full filesystem export.
-    func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat) {
+    /// A running guest owns the filesystem. Its writes sit in the VM's page cache and do not reach
+    /// `rootfs.ext4` on the host — measured: a file written through `exec` was still missing from the
+    /// image 45 seconds later, and only a `sync` inside the guest ever brought it across. Reading the
+    /// image therefore answers with the container's past, which is how every runtime-written file came
+    /// back 404 while `docker exec cat` printed it (ContainerStack #10).
+    ///
+    /// So while the guest runs, it packs the path itself, over the channel `docker exec` already uses;
+    /// once it is gone the image is the whole truth and is read directly.
+    func getArchive(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat) {
+        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
+
+        if container.status == .running {
+            do {
+                return try await getArchiveViaGuestTar(container: container, path: normalizedPath)
+            } catch let error as ClientArchiveError {
+                // A running guest is the authority on its own filesystem: if it says the path is not
+                // there, it is not there, and falling back to the image would resurrect a deleted file.
+                if case .pathNotFound = error { throw error }
+                Self.log.warning("guest could not pack \(normalizedPath), reading the image instead: \(error)")
+            } catch {
+                Self.log.warning("guest could not pack \(normalizedPath), reading the image instead: \(error)")
+            }
+        }
+
+        return try getArchiveFromImage(containerId: container.id, normalizedPath: normalizedPath)
+    }
+
+    /// Reads the path out of the container's `rootfs.ext4` on the host. Correct for a container that
+    /// is not running, and the fallback for a running one whose image has no `tar`.
+    private func getArchiveFromImage(containerId: String, normalizedPath: String) throws -> (tarData: Data, stat: PathStat) {
         let rootfsPath = getRootfsPath(containerId: containerId)
 
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
             throw ClientArchiveError.rootfsNotFound(id: containerId)
         }
-
-        // Normalize the path
-        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
 
         // Open the ext4 filesystem
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
@@ -172,6 +197,138 @@ struct ClientArchiveService: ClientArchiveProtocol {
         let tarData = try Data(contentsOf: tarPath)
 
         return (tarData: tarData, stat: pathStat)
+    }
+
+    /// Has the guest pack the path with its own `tar`, and reads the archive off its stdout.
+    ///
+    /// `tar` is asked for rather than the runtime's `copyOut` because that call hangs forever on a
+    /// path the guest does not have: the guest reports `notFound` immediately in its log, but the
+    /// host side waits on metadata that never arrives while holding the container's state lock, so
+    /// one 404 — which clients ask for routinely — wedges the container and, with it, new container
+    /// creation. Filed as ContainerStack #49. `tar` also carries what `copyOut` drops: it writes a
+    /// single file with mode 0644 and no owner, while the archive keeps modes, ownership, symlinks
+    /// and mtimes exactly as the container has them.
+    ///
+    /// The cost is a dependency on `tar` inside the image. Every image with a shell has one; a
+    /// `scratch` or distroless one does not, and its read falls back to the host image, which is the
+    /// behaviour it had before this path existed.
+    private func getArchiveViaGuestTar(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat) {
+        let (parent, name) = Self.splitForTar(path)
+
+        var processConfig = container.configuration.initProcess
+        processConfig.executable = "tar"
+        // `-C parent name` makes the archive's top entry the requested path itself, the shape docker
+        // returns, rather than the absolute path with every parent directory along the way.
+        processConfig.arguments = ["-cf", "-", "-C", parent, name]
+        processConfig.terminal = false
+        // Read as root: the image's own user may not be able to see the path the client asked for.
+        processConfig.user = .id(uid: 0, gid: 0)
+
+        guard let pipes = StdioPipes.make([.stdout, .stderr]) else {
+            throw ClientArchiveError.operationFailed(message: "Failed to create pipes for reading \(path)")
+        }
+
+        let process: ClientProcess
+        do {
+            process = try await ContainerClient().createProcess(
+                containerId: container.id,
+                processId: UUID().uuidString.lowercased(),
+                configuration: processConfig,
+                stdio: pipes.stdioArray
+            )
+        } catch {
+            pipes.closeAll()
+            throw ClientArchiveError.operationFailed(message: "no tar in \(container.id): \(error.localizedDescription)")
+        }
+        do {
+            try await process.start()
+        } catch {
+            pipes.closeAfterHandoff()
+            throw ClientArchiveError.operationFailed(message: "no tar in \(container.id): \(error.localizedDescription)")
+        }
+
+        // Both pipes must be drained while the process runs: tar fills stdout with the archive and
+        // blocks once the pipe buffer is full, so waiting for the exit first would deadlock.
+        let stdoutReader = pipes.stdout!.read
+        let stdoutTask = Task.detached { () -> Data in
+            defer { try? stdoutReader.close() }
+            var collected = Data()
+            while let chunk = try? stdoutReader.read(upToCount: 256 * 1024), !chunk.isEmpty {
+                collected.append(chunk)
+            }
+            return collected
+        }
+        let stderrReader = pipes.stderr!.read
+        let stderrTask = Task.detached { () -> Data in
+            defer { try? stderrReader.close() }
+            var collected = Data()
+            while let chunk = try? stderrReader.read(upToCount: 4096), !chunk.isEmpty {
+                if collected.count < 16 * 1024 { collected.append(chunk) }
+            }
+            return collected
+        }
+
+        let exitCode: Int32
+        do {
+            exitCode = try await process.wait()
+        } catch {
+            throw ClientArchiveError.operationFailed(
+                message: "Failed waiting for tar in running container: \(error.localizedDescription)")
+        }
+
+        let tarData = await stdoutTask.value
+        let stderrText = String(data: await stderrTask.value, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        guard exitCode == 0 else {
+            // busybox and GNU tar both name a missing path this way and exit non-zero; anything else
+            // is a failure of the mechanism, and the caller falls back to reading the host image.
+            if stderrText.localizedCaseInsensitiveContains("No such file or directory") {
+                throw ClientArchiveError.pathNotFound(path: path)
+            }
+            throw ClientArchiveError.operationFailed(message: "tar exited \(exitCode) in \(container.id): \(stderrText)")
+        }
+
+        return (tarData: tarData, stat: try Self.pathStat(fromTar: tarData, path: path))
+    }
+
+    /// `/etc/hostname` packs as `-C /etc hostname`; the root itself has no name to pass, so it packs
+    /// as `-C / .` the way `tar` names a whole directory.
+    static func splitForTar(_ path: String) -> (parent: String, name: String) {
+        let trimmed = path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
+        guard trimmed != "/" else { return ("/", ".") }
+        let parent = (trimmed as NSString).deletingLastPathComponent
+        return (parent.isEmpty ? "/" : parent, (trimmed as NSString).lastPathComponent)
+    }
+
+    /// The stat header describes the path the client asked for, which is the archive's first entry —
+    /// so it is read back from what the guest packed rather than asked for a second time over a
+    /// second channel that could disagree.
+    static func pathStat(fromTar tarData: Data, path: String) throws -> PathStat {
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("guest-tar-\(UUID().uuidString).tar")
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        try tarData.write(to: scratch)
+
+        let reader = try ArchiveReader(format: .paxRestricted, filter: .none, file: scratch)
+        var iterator = reader.makeStreamingIterator()
+        guard let (entry, _) = iterator.next() else {
+            throw ClientArchiveError.pathNotFound(path: path)
+        }
+
+        let typeBits: UInt32 =
+            switch entry.fileType {
+            case .directory: UInt32(S_IFDIR)
+            case .symbolicLink: UInt32(S_IFLNK)
+            default: UInt32(S_IFREG)
+            }
+        return PathStat(
+            name: (path as NSString).lastPathComponent,
+            size: entry.size ?? 0,
+            // Raw Unix mode, matching what the image read reports for the same file, so a client
+            // cannot see the mode change under it when a container starts or stops.
+            mode: UInt32(entry.permissions) | typeBits,
+            mtime: ISO8601DateFormatter().string(from: entry.modificationDate ?? Date(timeIntervalSince1970: 0)),
+            linkTarget: typeBits == UInt32(S_IFLNK) ? entry.symlinkTarget : nil
+        )
     }
 
     /// Reading rootfs.ext4 while the guest VM writes to it is a volatile

@@ -1,5 +1,8 @@
+import ContainerAPIClient
+import ContainerResource
 import ContainerizationArchive
 import ContainerizationEXT4
+import ContainerizationOCI
 import Foundation
 import SystemPackage
 import Testing
@@ -24,7 +27,7 @@ struct ClientArchiveServiceDirectoryTests {
             symlinks: ["/etc/mtab": "/proc/mounts"]
         )
 
-        let (tarData, stat) = try await fixture.service.getArchive(containerId: "web", path: "/etc")
+        let (tarData, stat) = try await fixture.service.getArchive(container: DirectoryFixture.stopped("web"), path: "/etc")
 
         #expect(stat.name == "etc")
         let extracted = try fixture.extract(tarData)
@@ -44,14 +47,14 @@ struct ClientArchiveServiceDirectoryTests {
         defer { fixture.cleanUp() }
         try fixture.writeRootfs(containerId: "web", files: ["/etc/hostname": "web\n"], symlinks: [:])
 
-        let (tarData, stat) = try await fixture.service.getArchive(containerId: "web", path: "/etc/hostname")
+        let (tarData, stat) = try await fixture.service.getArchive(container: DirectoryFixture.stopped("web"), path: "/etc/hostname")
         #expect(stat.name == "hostname")
         let extracted = try fixture.extract(tarData)
         let contents = try String(contentsOf: extracted.appendingPathComponent("hostname"), encoding: .utf8)
         #expect(contents == "web\n")
 
         await #expect(throws: ClientArchiveError.self) {
-            _ = try await fixture.service.getArchive(containerId: "web", path: "/nonexistent")
+            _ = try await fixture.service.getArchive(container: DirectoryFixture.stopped("web"), path: "/nonexistent")
         }
     }
 
@@ -63,7 +66,7 @@ struct ClientArchiveServiceDirectoryTests {
 
         // moby lstats the path (daemon/archive_unix.go), so a symlink is described by the link, not by
         // whatever it points at — which here does not exist at all.
-        let (tarData, stat) = try await fixture.service.getArchive(containerId: "web", path: "/etc/mtab")
+        let (tarData, stat) = try await fixture.service.getArchive(container: DirectoryFixture.stopped("web"), path: "/etc/mtab")
         #expect(stat.name == "mtab")
         #expect(stat.linkTarget == "/proc/mounts")
 
@@ -86,7 +89,7 @@ struct ClientArchiveServiceDirectoryTests {
             symlinks: ["/etc/cert.pem": "certs/ca.crt", "/etc/upward": "../usr/lib/os-release"]
         )
 
-        let (tarData, _) = try await fixture.service.getArchive(containerId: "web", path: "/etc")
+        let (tarData, _) = try await fixture.service.getArchive(container: DirectoryFixture.stopped("web"), path: "/etc")
         let extracted = try fixture.extract(tarData)
 
         let inside = try FileManager.default.destinationOfSymbolicLink(
@@ -108,7 +111,7 @@ struct ClientArchiveServiceDirectoryTests {
         try fixture.writeRootfs(containerId: "web", files: [:], symlinks: ["/etc/long": longTarget])
 
         await #expect(throws: ClientArchiveError.self) {
-            _ = try await fixture.service.getArchive(containerId: "web", path: "/etc")
+            _ = try await fixture.service.getArchive(container: DirectoryFixture.stopped("web"), path: "/etc")
         }
     }
 
@@ -124,7 +127,7 @@ struct ClientArchiveServiceDirectoryTests {
             symlinks: ["/var/run": "/run"]
         )
 
-        let (tarData, stat) = try await fixture.service.getArchive(containerId: "web", path: "/var/run/app.sock")
+        let (tarData, stat) = try await fixture.service.getArchive(container: DirectoryFixture.stopped("web"), path: "/var/run/app.sock")
         #expect(stat.name == "app.sock")
         let extracted = try fixture.extract(tarData)
         let contents = try String(contentsOf: extracted.appendingPathComponent("app.sock"), encoding: .utf8)
@@ -140,6 +143,21 @@ private struct DirectoryFixture {
         appSupport = FileManager.default.temporaryDirectory.appendingPathComponent("archive-dir-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
         service = ClientArchiveService(appSupportPath: appSupport)
+    }
+
+    /// These tests own a rootfs.ext4 and no runtime, which is exactly a container that is not
+    /// running — the state whose archive is read from the image on the host.
+    static func stopped(_ id: String) -> ContainerSnapshot {
+        let proc = ProcessConfiguration(
+            executable: "/bin/sh", arguments: [], environment: [],
+            workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0))
+        let image = ImageDescription(
+            reference: "alpine:latest",
+            descriptor: Descriptor(
+                mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0))
+        return ContainerSnapshot(
+            configuration: ContainerConfiguration(id: id, image: image, process: proc),
+            status: .stopped, networks: [], startedDate: nil)
     }
 
     func cleanUp() {
