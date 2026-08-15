@@ -6,15 +6,29 @@ import Vapor
 
 struct RESTContainerStats: Content {
     let id: String
+    // The Linux daemon reports the name with a leading "/" (moby: v.Name = "/" + name);
+    // `docker stats` renders the row's NAME column from this field and prints "--" without it.
+    let name: String
+    // Container platform, not host platform — clients branch on it to pick platform-specific
+    // stat parsing. Containers are Linux VMs here, same as /version reports Os "linux".
+    let os_type: String
     let read: String  // ISO8601 timestamp of this sample
     let preread: String  // ISO8601 timestamp of previous sample
+
+    let pids_stats: PidsStats
+    let blkio_stats: BlkioStats
+    // Windows-only processor counter; the Linux daemon reports 0, and clients compare
+    // against os_type before using it.
+    let num_procs: UInt32
+    // Windows-only (Hyper-V) disk stats; the Linux daemon sends an empty object.
+    let storage_stats: StorageStats
 
     let cpu_stats: CPUStats
     let precpu_stats: CPUStats
     let memory_stats: MemoryStats
     let networks: [String: NetworkStats]?
-    let blkio_stats: BlkioStats
-    let pids_stats: PidsStats
+
+    struct StorageStats: Content {}
 
     struct CPUStats: Content {
         let cpu_usage: CPUUsage
@@ -81,9 +95,9 @@ extension RESTContainerStats {
     /// `prev` is the earlier sample (maps to precpu_stats), `curr` is the latest.
     /// CPU total_usage is derived from cpuUsageUsec × 1000 (µs → ns).
     /// system_cpu_usage is synthesised as numCPUs × elapsed nanoseconds so Docker
-    /// clients can compute the standard CPU% formula without dividing by zero.
     static func build(
         id: String,
+        name: String,
         prev: ContainerResource.ContainerStats,
         curr: ContainerResource.ContainerStats,
         prevRead: Date,
@@ -135,8 +149,14 @@ extension RESTContainerStats {
 
         return RESTContainerStats(
             id: id,
+            name: "/" + name,
+            os_type: "linux",
             read: iso8601.string(from: currRead),
             preread: iso8601.string(from: prevRead),
+            pids_stats: PidsStats(current: curr.numProcesses),
+            blkio_stats: BlkioStats(io_service_bytes_recursive: blkioEntries),
+            num_procs: 0,
+            storage_stats: StorageStats(),
             cpu_stats: cpuStats(from: curr, systemCPU: systemCPU),
             precpu_stats: cpuStats(from: prev, systemCPU: 0),
             memory_stats: MemoryStats(
@@ -144,9 +164,7 @@ extension RESTContainerStats {
                 limit: curr.memoryLimitBytes ?? hostPhysicalMemory(),
                 stats: nil
             ),
-            networks: networks,
-            blkio_stats: BlkioStats(io_service_bytes_recursive: blkioEntries),
-            pids_stats: PidsStats(current: curr.numProcesses)
+            networks: networks
         )
     }
 }
