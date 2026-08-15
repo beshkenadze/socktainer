@@ -37,7 +37,6 @@ extension ContainerStartRoute {
                 throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
             }
 
-
             // A start that already failed inside POST /attach reports here. docker's
             // CLI attaches before it starts (docker/cli cli/command/container/run.go)
             // and discards any attach answer that is not 101 unread (moby
@@ -80,6 +79,14 @@ extension ContainerStartRoute {
                     runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
                     req.logger.debug("Started container \(id)")
                 }
+
+            } catch {
+                // A start that lost the race to the attach path is not a failure: the container is
+                // executing, just not because of this request.
+                let errorMessage = error.localizedDescription
+                let isAlreadyRunning =
+                    errorMessage.contains("booted") || errorMessage.contains("expected to be in created state")
+                    || errorMessage.contains("invalidState") || errorMessage.contains("already running")
 
                 guard isAlreadyRunning else {
                     req.logger.error("Failed to start container \(id): \(error)")
@@ -561,5 +568,35 @@ extension ContainerStartRoute {
             }
         }
         logger.info("[dns] re-registered '\(container.id)' → \(ip) on resume")
+    }
+
+    /// Removes a `--rm` container whose start failed.
+    ///
+    /// Apple Container reaps `--rm` containers when their process exits, which is why nothing else
+    /// deletes them — but a container that never started never exits, so it would sit in `docker ps
+    /// -a` forever, and the next `docker run --rm --name x` would fail on the name. moby removes it
+    /// on this path for the same reason (daemon/start.go, containerStart's error branch).
+    ///
+    /// Silent for a container that is not marked `--rm`: `consumeAutoRemove` is the mark and the
+    /// dedup at once, so a second observer of the same failure removes nothing twice.
+    static func cleanupFailedAutoRemove(container: ContainerSnapshot, client: ClientContainerProtocol, req: Request) async {
+        let hexId = DockerContainerID.hexId(for: container)
+        guard await ContainerInfoCache.shared.consumeAutoRemove(id: hexId) else { return }
+
+        do {
+            try await client.delete(id: container.id)
+        } catch {
+            req.logger.warning("could not remove --rm container \(container.id) after a failed start: \(error)")
+        }
+
+        await ContainerAutoRemoveCleanup.perform(
+            hexId: hexId,
+            nativeId: container.id,
+            fallbackImage: container.configuration.image.reference,
+            fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+            dnsNames: ContainerAliasCleanup.dnsNames(in: container.configuration.labels),
+            dnsServer: req.application.storage[SocktainerDNSServerKey.self],
+            broadcaster: req.application.storage[EventBroadcasterKey.self]
+        )
     }
 }
