@@ -10,11 +10,12 @@ private struct MockHealthCheckClient: ClientHealthCheckProtocol {
 }
 
 /// Issue #10 — the bounded forms of GET /events must terminate like moby's getEvents
-/// (api/server/router/system/system_routes.go). The bridge keeps no event history, so
-/// a bounded query legitimately returns an empty body — what a client can never
-/// tolerate is a hang. The in-memory tester collects the whole response body, so a
-/// request that never closes would stall the suite; the bounded tests therefore race
-/// the request against a timeout and fail (rather than hang) on regression.
+/// (api/server/router/system/system_routes.go). A bounded query against an empty
+/// window legitimately returns an empty body — what a client can never tolerate is a
+/// hang. The in-memory tester collects the whole response body, so a request that
+/// never closes would stall the suite; the bounded tests therefore race the request
+/// against a timeout and fail (rather than hang) on regression. History replay for
+/// non-empty windows is covered by EventsHistoryRouteTests.
 @Suite("GET /events — bounded forms terminate")
 struct EventsRouteTests {
 
@@ -58,7 +59,7 @@ struct EventsRouteTests {
             #expect(res != nil, "response never completed — stream=false must not follow")
             #expect(res?.status == .ok)
             #expect(res?.headers.first(name: "Content-Type")?.hasPrefix("application/json") == true)
-            #expect(res?.body.string.isEmpty == true, "no history is retained, body must be empty")
+            #expect(res?.body.string.isEmpty == true, "nothing matched the window, body must be empty")
         }
     }
 
