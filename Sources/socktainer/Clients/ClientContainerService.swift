@@ -12,10 +12,15 @@ actor ContainerExitCodeStore {
     static let shared = ContainerExitCodeStore()
 
     private var codes: [String: Int32] = [:]
+    /// When each code was recorded. `docker ps` renders "Exited (7) 3 seconds ago" from the moment the
+    /// container *finished*; the snapshot only carries a start time, so reading that made a container
+    /// that ran for hours report its whole runtime as its age.
+    private var finishTimes: [String: Date] = [:]
     private var waiters: [String: [CheckedContinuation<Int32, Never>]] = [:]
 
     func set(id: String, code: Int32) {
         codes[id] = code
+        finishTimes[id] = Date()
         // Resume anyone awaiting this container's exit code (e.g. the die-event observer),
         // delivering the authoritative recorded value rather than a timed-poll fallback.
         if let pending = waiters.removeValue(forKey: id) {
@@ -29,6 +34,11 @@ actor ContainerExitCodeStore {
 
     func remove(id: String) {
         codes.removeValue(forKey: id)
+        finishTimes.removeValue(forKey: id)
+    }
+
+    func finishTime(id: String) -> Date? {
+        finishTimes[id]
     }
 
     /// Suspends until the exit code for `id` is recorded, returning the exact recorded value.
@@ -295,8 +305,12 @@ struct ClientContainerService: ClientContainerProtocol {
             let process = try await containerClient.withClient { try await $0.bootstrap(id: container.id, stdio: stdio) }
             // Clear any exit code recorded by a previous run of this container so
             // /wait blocks for the new init process rather than immediately
-            // returning the stale code (e.g. after a restart).
+            // returning the stale code (e.g. after a restart). Both keys: the monitor records under
+            // the native id and the Docker-shaped hex id, and readers fall back from one to the
+            // other — leaving the hex entry behind let a restarted container report its previous
+            // run's exit code until the new one finished.
             await ContainerExitCodeStore.shared.remove(id: container.id)
+            await ContainerExitCodeStore.shared.remove(id: DockerContainerID.hexId(for: container))
             try await process.start()
             // Wait for the init process in the background so we can capture its
             // real exit code without blocking the /start response.

@@ -73,7 +73,12 @@ struct ContainerListStatusTests {
 
             try await app.testing().test(.GET, "/v1.51/containers/json") { res async in
                 let summaries = (try? JSONDecoder().decode([RESTContainerSummary].self, from: res.body)) ?? []
-                #expect(summaries.first?.Status == "Exited (7) Less than a second ago")
+                let status = summaries.first?.Status ?? ""
+                // The age is wall-clock: asserting the exact "Less than a second" makes the test a
+                // race with the suite's own scheduling. The contract is the code and the shape;
+                // `humanReadableAge` is pinned separately against fixed intervals.
+                #expect(status.hasPrefix("Exited (7) "), "got: \(status)")
+                #expect(status.hasSuffix(" ago"), "got: \(status)")
             }
         }
     }
@@ -101,7 +106,12 @@ struct ContainerListStatusTests {
 
             try await app.testing().test(.GET, "/v1.51/containers/json") { res async in
                 let summaries = (try? JSONDecoder().decode([RESTContainerSummary].self, from: res.body)) ?? []
-                #expect(summaries.first?.Status == "Exited (13) Less than a second ago")
+                let status = summaries.first?.Status ?? ""
+                // The age is wall-clock: asserting the exact "Less than a second" makes the test a
+                // race with the suite's own scheduling. The contract is the code and the shape;
+                // `humanReadableAge` is pinned separately against fixed intervals.
+                #expect(status.hasPrefix("Exited (13) "), "got: \(status)")
+                #expect(status.hasSuffix(" ago"), "got: \(status)")
             }
         }
     }
@@ -216,5 +226,28 @@ struct ContainerListHealthStatusTests {
                 #expect(summaries.first?.Status.contains("(healthy)") == true)
             }
         }
+    }
+}
+
+/// The duration wording `docker ps` prints, pinned against fixed intervals so it cannot drift and
+/// cannot race the clock. moby renders these with `units.HumanDuration` (docker/go-units).
+@Suite("ContainerListRoute age formatting")
+struct ContainerListAgeTests {
+    @Test(
+        "durations read the way Docker prints them",
+        arguments: [
+            (0.2, "Less than a second"),
+            (1.0, "1 second"),
+            (5.0, "5 seconds"),
+            (60.0, "1 minute"),
+            (150.0, "2 minutes"),
+            (3_600.0, "1 hour"),
+            (7_200.0, "2 hours"),
+            (86_400.0, "1 day"),
+            (172_800.0, "2 days"),
+        ])
+    func humanReadableAge(interval: Double, expected: String) {
+        let past = Date(timeIntervalSinceNow: -interval)
+        #expect(ContainerListRoute.humanReadableAge(since: past) == expected)
     }
 }

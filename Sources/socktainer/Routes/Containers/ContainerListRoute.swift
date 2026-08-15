@@ -132,8 +132,14 @@ extension ContainerListRoute {
                     }
                 case .stopped:
                     let exitCode = await Self.exitCode(for: container)
-                    if let stopped = container.startedDate {
-                        baseStatus = "Exited (\(exitCode)) \(Self.humanReadableAge(since: stopped)) ago"
+                    // The age is measured from when the container *finished*, as moby's
+                    // `State.String` reads `FinishedAt`. The snapshot only carries a start time, so
+                    // using that reported a container's whole runtime: three hours of work exiting a
+                    // second ago printed "Exited (7) 3 hours ago". The exit monitor stamps the finish
+                    // time when it records the code; a container that exited before this daemon
+                    // started has neither, and then Docker's own format degrades to no age at all.
+                    if let finished = await Self.finishTime(for: container) {
+                        baseStatus = "Exited (\(exitCode)) \(Self.humanReadableAge(since: finished)) ago"
                     } else {
                         baseStatus = "Exited (\(exitCode))"
                     }
@@ -149,7 +155,6 @@ extension ContainerListRoute {
                 } else {
                     statusStr = baseStatus
                 }
-
 
                 let summary = RESTContainerSummary(
                     Id: DockerContainerID.hexId(for: container),
@@ -181,6 +186,15 @@ extension ContainerListRoute {
         let nativeCode = await ContainerExitCodeStore.shared.get(id: container.id)
         let hexCode = await ContainerExitCodeStore.shared.get(id: hexId)
         return nativeCode ?? hexCode ?? 0
+    }
+
+    /// When the container finished, if this daemon saw it happen. Probes both keys the exit monitor
+    /// writes under, the same way `exitCode(for:)` does.
+    static func finishTime(for container: ContainerSnapshot) async -> Date? {
+        if let native = await ContainerExitCodeStore.shared.finishTime(id: container.id) {
+            return native
+        }
+        return await ContainerExitCodeStore.shared.finishTime(id: DockerContainerID.hexId(for: container))
     }
 
     /// Returns a human-readable duration string matching Docker's "Up X seconds/minutes/hours" format.
