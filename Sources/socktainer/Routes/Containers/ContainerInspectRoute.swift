@@ -155,6 +155,15 @@ extension ContainerInspectRoute {
                 )
             }
 
+            // dockerd reports the same published bindings under both
+            // `HostConfig.PortBindings` and `NetworkSettings.Ports`.
+            let portBindings = Dictionary(
+                grouping: container.configuration.publishedPorts,
+                by: { "\($0.containerPort)/\($0.proto.rawValue)" }
+            ).mapValues { bindings in
+                bindings.map { PortBinding(HostIp: $0.hostAddress.description, HostPort: "\($0.hostPort)") }
+            }
+
             // Real values where the runtime knows them (issue #17); the
             // remaining HostConfig keys encode as moby's zero defaults.
             // `memoryInBytes`/`cpus` are the limits Apple Container actually

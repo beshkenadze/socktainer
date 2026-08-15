@@ -14,7 +14,7 @@ extension ContainerEndpointSettings {
             IPv6Gateway: nil,
             GlobalIPv6Address: attachment.ipv6Address?.address.description,
             GlobalIPv6PrefixLen: attachment.ipv6Address.map { Int($0.prefix.length) },
-            MacAddress: nil,
+            MacAddress: attachment.macAddress.map { String(describing: $0) },
             DriverOpts: nil
         )
     }
