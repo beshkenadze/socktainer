@@ -121,6 +121,22 @@ extension ContainerStartRoute {
                 logger: req.logger
             )
 
+            // Writes made while the container was only created were held: it had no filesystem to
+            // take them, and booting it then would have made it look like it had run (#9). It is up
+            // now, so they go in through the guest before this response returns — buildx copies its
+            // builder's configuration in that window and expects it there when BuildKit reads it.
+            if let started = startedSnapshot ?? preStartSnapshot,
+                await PendingArchiveStore.shared.hasPending(id: started.id),
+                let appSupport = req.application.storage[AppleContainerAppSupportUrlKey.self]
+            {
+                do {
+                    try await ClientArchiveService(appSupportPath: appSupport).applyPendingArchives(container: started)
+                } catch {
+                    req.logger.error("could not replay the archives held for \(started.id): \(error)")
+                    throw Abort(.internalServerError, reason: "Failed to write held archives into \(started.id): \(error)")
+                }
+            }
+
             let metadataSnapshot = startedSnapshot ?? preStartSnapshot
             // Derive the canonical 64-char Docker ID once here so the cache and all
             // lifecycle events use the same stable id the create event returned.

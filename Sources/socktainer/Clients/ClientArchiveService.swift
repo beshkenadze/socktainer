@@ -355,6 +355,29 @@ struct ClientArchiveService: ClientArchiveProtocol {
         return tarPath
     }
 
+    /// Replays the writes held for a container that has now started, through the running guest.
+    ///
+    /// Called by the start path once the container is up, so the boot that materialises its
+    /// filesystem is the start the client asked for and not a side effect of a copy. Failures are
+    /// reported to the caller: a builder whose certificates never arrived is worse than a start that
+    /// says why it failed.
+    func applyPendingArchives(container: ContainerSnapshot) async throws {
+        let pending = await PendingArchiveStore.shared.take(id: container.id)
+        guard !pending.isEmpty else { return }
+        defer {
+            for entry in pending { try? FileManager.default.removeItem(at: entry.tarPath) }
+        }
+
+        for entry in pending {
+            try await putArchiveViaCopyIn(
+                container: container,
+                destinationPath: entry.destination,
+                tarPath: entry.tarPath,
+                noOverwriteDirNonDir: entry.noOverwriteDirNonDir
+            )
+        }
+    }
+
     /// Extract a tar archive into a container's filesystem at the specified path
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws {
         // Normalize the destination path
@@ -376,8 +399,22 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
         let rootfsPath = getRootfsPath(containerId: container.id)
 
+        // A container that has only been created has no filesystem yet — the runtime materialises it
+        // when the guest first boots — so there is nothing to write into and nothing to boot without
+        // making the container look like it has run. The write is held and replayed by the start
+        // that is coming: buildx creates its builder, copies into it and then starts it, which is
+        // how the first `docker build` used to fail before BuildKit ran at all (#9).
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
-            throw ClientArchiveError.rootfsNotFound(id: container.id)
+            guard !ContainerRunHistory.hasRun(id: container.id) else {
+                throw ClientArchiveError.rootfsNotFound(id: container.id)
+            }
+            try await PendingArchiveStore.shared.stash(
+                id: container.id,
+                tarPath: tarPath,
+                destination: normalizedPath,
+                noOverwriteDirNonDir: noOverwriteDirNonDir
+            )
+            return
         }
 
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
