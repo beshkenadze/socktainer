@@ -86,7 +86,6 @@ private struct FoundContainerMock: ClientContainerProtocol {
     ) { ([], 0) }
 }
 
-
 // MARK: - Helpers
 
 private func withAttachRouteApp(
@@ -119,4 +118,27 @@ private struct NullContainerMock: ClientContainerProtocol {
     func prune(filters: [String: [String]]) async throws -> (
         deletedContainers: [String], spaceReclaimed: Int64
     ) { ([], 0) }
+}
+
+/// The order the two checks run in is the whole contract: Docker resolves the container first, so a
+/// client can tell "it is gone" (404, stop) from "your request is wrong" (400, fix and retry).
+@Suite("ContainerAttachRoute — resolution precedes validation")
+struct ContainerAttachOrderingTests {
+    @Test("an unparseable parameter on a missing container is still a 404")
+    func undecodableQueryOnMissingContainer() async throws {
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerAttachRoute(client: NullContainerMock()))
+
+            // `stream=no` is a value Docker's httputils.BoolValue reads happily and Vapor's decoder
+            // rejects. Decoding first turned a missing container into "your request was malformed".
+            try await app.testing().test(.POST, "/v1.51/containers/nosuch99/attach?stream=no") { res async in
+                #expect(res.status == .notFound)
+                #expect(res.body.string.contains("No such container"))
+            }
+        }
+    }
 }
