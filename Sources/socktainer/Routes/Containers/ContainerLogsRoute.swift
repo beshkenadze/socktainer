@@ -28,7 +28,7 @@ extension ContainerLogsRoute {
             }
 
             guard let container = try await client.getContainer(id: id) else {
-                throw Abort(.notFound, reason: "Container not found")
+                throw Abort(.notFound, reason: "No such container: \(id)")
             }
 
             // `tail=<N>` limits the backlog to the last N lines; "all" (the

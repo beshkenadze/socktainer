@@ -61,12 +61,16 @@ struct DockerErrorMiddleware: AsyncMiddleware {
             let text = response.body.string ?? "error"
             return makeDockerError(status: response.status, message: text, headers: response.headers)
         }
-        if json["message"] != nil {
-            return response  // already Docker-compatible
-        }
-        let message = (json["reason"] as? String) ?? "error"
         var merged = json
-        merged["message"] = message
+        // Vapor renders `reason` and `error`; neither is in Docker's schema. Drop them whether or not
+        // the body already carries `message`.
+        merged.removeValue(forKey: "reason")
+        merged.removeValue(forKey: "error")
+        let existing = (merged["message"] as? String) ?? (json["reason"] as? String) ?? "error"
+        merged["message"] = dockerMessage(status: response.status, message: existing)
+        if merged.count == json.count, (json["message"] as? String) == (merged["message"] as? String) {
+            return response  // already exactly Docker's shape
+        }
         let newResponse = Response(status: response.status)
         newResponse.headers = response.headers
         if let data = try? JSONSerialization.data(withJSONObject: merged) {
@@ -74,6 +78,15 @@ struct DockerErrorMiddleware: AsyncMiddleware {
             newResponse.body = .init(data: data)
         }
         return newResponse
+    }
+
+    /// Docker answers a request that matches no route with `page not found`, not with the HTTP
+    /// status text. Vapor's router raises a bare `Abort(.notFound)` whose reason is "Not Found", and
+    /// that is the only place the generic text reaches a client — every route that means "this object
+    /// does not exist" now names the object instead.
+    static func dockerMessage(status: HTTPResponseStatus, message: String) -> String {
+        guard status == .notFound, message == "Not Found" else { return message }
+        return "page not found"
     }
 
     static func makeDockerError(
@@ -84,7 +97,9 @@ struct DockerErrorMiddleware: AsyncMiddleware {
         let response = Response(status: status)
         response.headers = headers
         response.headers.replaceOrAdd(name: .contentType, value: "application/json")
-        let payload: [String: Any] = ["message": message, "error": true, "reason": message]
+        // Docker's ErrorResponse has exactly one property. `error` and `reason` were Vapor's, and a
+        // client round-tripping the body through a strict decoder rejects the unknown keys.
+        let payload: [String: Any] = ["message": dockerMessage(status: status, message: message)]
         if let data = try? JSONSerialization.data(withJSONObject: payload) {
             response.body = .init(data: data)
         } else {

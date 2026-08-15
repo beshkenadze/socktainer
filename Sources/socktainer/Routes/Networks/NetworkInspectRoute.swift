@@ -19,7 +19,9 @@ struct NetworkInspectRoute: RouteCollection {
             }
             let logger = req.logger
             guard let network = try await client.getNetwork(id: id, logger: logger) else {
-                throw Abort(.notFound, reason: "Network not found")
+                // Docker names the object it could not find; a bare "not found" leaves whoever reads
+                // the log or the tool's error with no idea which network.
+                throw Abort(.notFound, reason: "network \(id) not found")
             }
             return network
         }

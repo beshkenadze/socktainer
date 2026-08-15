@@ -36,7 +36,7 @@ struct NetworkDeleteRoute: RouteCollection {
             return Response(status: .noContent)
         } catch {
             if error.localizedDescription.contains("not found") {
-                throw Abort(.notFound, reason: "Network not found")
+                throw Abort(.notFound, reason: "network \(id) not found")
             }
             throw Abort(.internalServerError, reason: "Network deletion failed: \(error)")
         }

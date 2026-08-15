@@ -56,7 +56,7 @@ enum ClientArchiveError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .containerNotFound(let id):
-            return "Container not found: \(id)"
+            return "No such container: \(id)"
         case .pathNotFound(let path):
             return "Path not found in container: \(path)"
         case .rootfsNotFound(let id):
