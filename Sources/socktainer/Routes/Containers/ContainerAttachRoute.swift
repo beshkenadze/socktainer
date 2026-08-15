@@ -93,15 +93,18 @@ extension ContainerAttachRoute {
             throw Abort(.badRequest, reason: "Missing container ID")
         }
 
-        let query = try req.query.decode(ContainerAttachQuery.self)
-
+        // Moby resolves the target container before it reads any attach parameter (moby
+        // api/server/router/container/container_routes.go + daemon/attach.go @ v28.5.2), so an
+        // unknown container is a 404 whatever the query says. The decode has to come second too:
+        // Docker's `httputils.BoolValue` accepts anything (`no`, an empty string) while Vapor's
+        // decoder throws on a value it cannot read as Bool — which would answer 400 for a container
+        // that does not exist, the exact confusion this ordering removes.
         guard let container = try await client.getContainer(id: id) else {
             throw Abort(.notFound, reason: "No such container: \(id)")
         }
 
-        // Moby resolves the target container before attach stream validation (moby
-        // api/server/router/container/container_routes.go + daemon/attach.go @ v28.5.2),
-        // so unknown containers are reported as 404 even when stream/logs are false.
+        let query = try req.query.decode(ContainerAttachQuery.self)
+
         let logs = query.logs ?? false
         let stream = query.stream ?? false
         let stdin = query.stdin ?? false
@@ -787,7 +790,7 @@ extension ContainerAttachRoute {
                         nativeId: container.id,
                         fallbackImage: container.configuration.image.reference,
                         fallbackLabels: LabelNormalization.restore(container.configuration.labels),
-                            dnsNames: ContainerAliasCleanup.dnsNames(in: container.configuration.labels),
+                        dnsNames: ContainerAliasCleanup.dnsNames(in: container.configuration.labels),
                         dnsServer: req.application.storage[SocktainerDNSServerKey.self],
                         broadcaster: req.application.storage[EventBroadcasterKey.self],
                         runEpoch: runEpoch
