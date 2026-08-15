@@ -261,7 +261,15 @@ struct ContainerInspectRouteRestartPolicyTests {
         if let restartPolicyLabel {
             containerConfig.labels = [RestartPolicyManager.label: restartPolicyLabel]
         }
-        return ContainerSnapshot(configuration: containerConfig, status: .stopped, networks: [])
+        // These snapshots represent containers that ran and stopped; without a
+        // startedDate inspect classifies them as "created" (moby container/state.go:
+        // StartedAt zero ⇒ created), which is not what this suite exercises.
+        return ContainerSnapshot(
+            configuration: containerConfig,
+            status: .stopped,
+            networks: [],
+            startedDate: Date(timeIntervalSinceNow: -60)
+        )
     }
 
     private func encodedPolicy(name: String, maximumRetryCount: Int? = nil) -> String {

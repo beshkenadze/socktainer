@@ -152,17 +152,23 @@ extension ContainerInspectRoute {
                 )
             }
 
-            let hostConfig: HostConfig = HostConfig(restartPolicy: restartPolicy)
+            // dockerd reports the same published bindings under both
+            // `HostConfig.PortBindings` and `NetworkSettings.Ports`.
+            let portBindings = Dictionary(
+                grouping: container.configuration.publishedPorts,
+                by: { "\($0.containerPort)/\($0.proto.rawValue)" }
+            ).mapValues { bindings in
+                bindings.map { PortBinding(HostIp: $0.hostAddress.description, HostPort: "\($0.hostPort)") }
+            }
+
+            let hostConfig: HostConfig = HostConfig(restartPolicy: restartPolicy, portBindings: portBindings)
 
             // Enhanced network settings with proper port mapping
             let networkEndpoints = Self.networkEndpoints(for: container)
             let networkSettings = ContainerNetworkSettings(
                 Bridge: nil,
                 SandboxID: nil,
-                Ports: Dictionary(grouping: container.configuration.publishedPorts, by: { "\($0.containerPort)/\($0.proto.rawValue)" })
-                    .mapValues { bindings in
-                        bindings.map { PortBinding(HostIp: $0.hostAddress.description, HostPort: "\($0.hostPort)") }
-                    },
+                Ports: portBindings,
                 SandboxKey: nil,
                 Networks: networkEndpoints,
                 EndpointsConfig: networkEndpoints
@@ -178,18 +184,73 @@ extension ContainerInspectRoute {
             // True during the backoff window between a crash and its automatic restart.
             let isPendingRestart = await ContainerRestartState.shared.isPendingRestart(id: container.id)
 
+            // moby container/state.go: StateString() reports "created" when
+            // StartedAt is zero — a container that never ran is not "exited".
+            // Apple reports `.unknown` for those snapshots; keying off
+            // `startedDate` keeps inspect agreeing with the list route either way.
+            let status: String
+            if isPendingRestart {
+                status = "restarting"
+            } else if container.startedDate == nil && container.status != .running {
+                status = "created"
+            } else {
+                status = container.status.mobyState
+            }
+
+            // moby represents unknown timestamps as Go's zero time — dockerd
+            // emits `0001-01-01T00:00:00Z`, which parses as a timestamp, unlike
+            // the empty string previously sent here (issue #8).
+            let dockerZeroTime = "0001-01-01T00:00:00Z"
+            let startedAt =
+                container.startedDate
+                .map { AppleContainerTimestampResolver.iso8601Timestamp($0) }
+                ?? dockerZeroTime
+
+            // moby resets ExitCodeValue to 0 on every start (container/state.go
+            // setRunning), so a running or never-started container inspects as 0.
+            let exitCode: Int32
+            if container.status == .running || container.startedDate == nil {
+                exitCode = 0
+            } else {
+                // The exit monitor records the code under both the native and hex
+                // container IDs; probe both like ContainerWaitRoute does.
+                let hexId = DockerContainerID.hexId(for: container)
+                let nativeCode = await ContainerExitCodeStore.shared.get(id: container.id)
+                let hexCode = await ContainerExitCodeStore.shared.get(id: hexId)
+                exitCode =
+                    nativeCode ?? hexCode
+                    // No entry means the daemon restarted after the container
+                    // exited (the store is in-memory). Default to 0 — moby's own
+                    // zero value for State.ExitCodeValue — rather than inventing
+                    // a failure code: a fabricated non-zero would flip every
+                    // "did it succeed" check (CI, Testcontainers) to failure for
+                    // containers that really exited 0 before the restart. A code
+                    // that genuinely could not be obtained is recorded as the
+                    // store's -1 sentinel by the exit monitor and flows through.
+                    ?? 0
+            }
+
             let containerState: ContainerState = ContainerState(
-                Status: isPendingRestart ? "restarting" : container.status.mobyState,
-                Running: container.status == .running,
+                Status: status,
+                // moby keeps Running=true through the restart backoff
+                // (container/state.go SetRestarting), so a "restarting"
+                // container still inspects as running.
+                Running: container.status == .running || isPendingRestart,
                 Paused: false,  // Apple containers don't have a paused state like Docker
                 Restarting: isPendingRestart,
                 OOMKilled: false,
-                Dead: container.status == .stopped && !isPendingRestart,
+                // moby's Dead marks a container whose removal failed mid-way
+                // (container/state.go SetRemovalError / StateString); a cleanly
+                // exited container is Dead=false — never "it stopped".
+                Dead: false,
                 Pid: 0,  // we have no mechanism to derive PID in Apple container
-                ExitCode: container.status == .stopped ? 0 : 0,
+                ExitCode: Int(exitCode),
                 Error: "",
-                StartedAt: container.startedDate.map { AppleContainerTimestampResolver.iso8601Timestamp($0) } ?? "",
-                FinishedAt: container.status == .stopped ? "1970-01-01T00:00:00.000000000Z" : "",
+                StartedAt: startedAt,
+                // Apple exposes no finish time for a stopped container; moby's
+                // zero time is the closest non-misleading value (a wall-clock
+                // reading would fabricate an exit moment we never observed).
+                FinishedAt: dockerZeroTime,
                 Health: health
             )
 
@@ -199,14 +260,18 @@ extension ContainerInspectRoute {
                 Path: container.configuration.initProcess.executable,
                 Args: container.configuration.initProcess.arguments,
                 State: containerState,
-                Image: container.configuration.image.reference,
+                Image: container.configuration.image.digest.isEmpty
+                    ? container.configuration.image.reference
+                    : container.configuration.image.digest,
                 ResolvConfPath: "/etc/resolv.conf",
                 HostnamePath: "/etc/hostname",
                 HostsPath: "/etc/hosts",
                 LogPath: nil,  // Apple containers don't have a log path
                 Name: "/" + container.id,
                 RestartCount: await ContainerRestartState.shared.count(id: container.id),
-                Driver: "",
+                Driver: Self.storageDriverName,
+                // The Engine API swagger keeps `Platform` at this level (the OS
+                // the container was created for — "linux" here).
                 Platform: "linux",
                 ImageManifestDescriptor: nil,
                 MountLabel: "",
@@ -214,7 +279,7 @@ extension ContainerInspectRoute {
                 AppArmorProfile: "",
                 ExecIDs: nil,
                 HostConfig: hostConfig,
-                GraphDriver: ContainerDriverData(Name: "", Data: [:]),
+                GraphDriver: ContainerDriverData(Name: Self.storageDriverName, Data: [:]),
                 SizeRw: nil,
                 SizeRootFs: nil,
                 Mounts: mounts,
@@ -223,4 +288,13 @@ extension ContainerInspectRoute {
             )
         }
     }
+}
+
+extension ContainerInspectRoute {
+    // moby reports the storage driver name here (`Driver: ctr.Driver`,
+    // daemon/inspect.go). Apple Container has no graph driver; the Engine API
+    // swagger's example value for the snapshotter-based daemons is "overlayfs",
+    // so we report that constant rather than "" — which a client reads as
+    // "field unset" and dockerd never sends.
+    private static let storageDriverName = "overlayfs"
 }
