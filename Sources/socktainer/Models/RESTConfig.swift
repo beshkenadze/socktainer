@@ -98,8 +98,8 @@ struct HostConfig: Content {
     let ConsoleSize: [Int]?
     let CgroupnsMode: String?
 
-    public init(restartPolicy: RestartPolicy? = nil) {
-        self.Binds = nil
+    public init(restartPolicy: RestartPolicy? = nil, binds: [String]? = nil, portBindings: [String: [PortBinding]]? = nil) {
+        self.Binds = binds
         self.BlkioWeight = nil
         self.BlkioWeightDevice = nil
         self.BlkioDeviceReadBps = nil
@@ -141,7 +141,7 @@ struct HostConfig: Content {
         self.Init = nil
         self.AutoRemove = nil
         self.OomScoreAdj = nil
-        self.PortBindings = nil
+        self.PortBindings = portBindings
         self.Privileged = nil
         self.PublishAllPorts = nil
         self.ReadonlyRootfs = nil
@@ -168,6 +168,160 @@ struct HostConfig: Content {
         self.Sysctls = nil
         self.ConsoleSize = nil
         self.CgroupnsMode = nil
+    }
+    enum CodingKeys: String, CodingKey {
+        case Binds
+        case BlkioWeight
+        case BlkioWeightDevice
+        case BlkioDeviceReadBps
+        case BlkioDeviceWriteBps
+        case BlkioDeviceReadIOps
+        case BlkioDeviceWriteIOps
+        case MemorySwappiness
+        case NanoCpus
+        case CapAdd
+        case CapDrop
+        case ContainerIDFile
+        case CpuPeriod
+        case CpuRealtimePeriod
+        case CpuRealtimeRuntime
+        case CpuShares
+        case CpuQuota
+        case CpusetCpus
+        case CpusetMems
+        case Devices
+        case DeviceCgroupRules
+        case DeviceRequests
+        case DiskQuota
+        case Dns
+        case DnsOptions
+        case DnsSearch
+        case ExtraHosts
+        case GroupAdd
+        case IpcMode
+        case Cgroup
+        case Links
+        case LogConfig
+        case LxcConf
+        case Memory
+        case MemorySwap
+        case MemoryReservation
+        case KernelMemory
+        case NetworkMode
+        case OomKillDisable
+        case Init
+        case AutoRemove
+        case OomScoreAdj
+        case PortBindings
+        case Privileged
+        case PublishAllPorts
+        case ReadonlyRootfs
+        case RestartPolicy
+        case Ulimits
+        case CpuCount
+        case CpuPercent
+        case IOMaximumIOps
+        case IOMaximumBandwidth
+        case VolumesFrom
+        case Mounts
+        case PidMode
+        case Isolation
+        case SecurityOpt
+        case StorageOpt
+        case CgroupParent
+        case VolumeDriver
+        case ShmSize
+        case PidsLimit
+        case Runtime
+        case Tmpfs
+        case UTSMode
+        case UsernsMode
+        case Sysctls
+        case ConsoleSize
+        case CgroupnsMode
+    }
+
+    // moby's HostConfig has no `omitempty` on `Binds` or `PortBindings`
+    // (api/types/container/hostconfig.go), so dockerd always emits both keys:
+    // `null` for an unbound container and `{}` for one without published ports.
+    // Swift's synthesized encoder omits nil optionals entirely, which is a
+    // different wire shape than dockerd's — the reason for this hand-rolled encode.
+    // Everything else keeps the synthesized behaviour (omitted when nil).
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if let binds = Binds {
+            try container.encode(binds, forKey: .Binds)
+        } else {
+            try container.encodeNil(forKey: .Binds)
+        }
+        try container.encode(PortBindings ?? [:], forKey: .PortBindings)
+        try container.encodeIfPresent(BlkioWeight, forKey: .BlkioWeight)
+        try container.encodeIfPresent(BlkioWeightDevice, forKey: .BlkioWeightDevice)
+        try container.encodeIfPresent(BlkioDeviceReadBps, forKey: .BlkioDeviceReadBps)
+        try container.encodeIfPresent(BlkioDeviceWriteBps, forKey: .BlkioDeviceWriteBps)
+        try container.encodeIfPresent(BlkioDeviceReadIOps, forKey: .BlkioDeviceReadIOps)
+        try container.encodeIfPresent(BlkioDeviceWriteIOps, forKey: .BlkioDeviceWriteIOps)
+        try container.encodeIfPresent(MemorySwappiness, forKey: .MemorySwappiness)
+        try container.encodeIfPresent(NanoCpus, forKey: .NanoCpus)
+        try container.encodeIfPresent(CapAdd, forKey: .CapAdd)
+        try container.encodeIfPresent(CapDrop, forKey: .CapDrop)
+        try container.encodeIfPresent(ContainerIDFile, forKey: .ContainerIDFile)
+        try container.encodeIfPresent(CpuPeriod, forKey: .CpuPeriod)
+        try container.encodeIfPresent(CpuRealtimePeriod, forKey: .CpuRealtimePeriod)
+        try container.encodeIfPresent(CpuRealtimeRuntime, forKey: .CpuRealtimeRuntime)
+        try container.encodeIfPresent(CpuShares, forKey: .CpuShares)
+        try container.encodeIfPresent(CpuQuota, forKey: .CpuQuota)
+        try container.encodeIfPresent(CpusetCpus, forKey: .CpusetCpus)
+        try container.encodeIfPresent(CpusetMems, forKey: .CpusetMems)
+        try container.encodeIfPresent(Devices, forKey: .Devices)
+        try container.encodeIfPresent(DeviceCgroupRules, forKey: .DeviceCgroupRules)
+        try container.encodeIfPresent(DeviceRequests, forKey: .DeviceRequests)
+        try container.encodeIfPresent(DiskQuota, forKey: .DiskQuota)
+        try container.encodeIfPresent(Dns, forKey: .Dns)
+        try container.encodeIfPresent(DnsOptions, forKey: .DnsOptions)
+        try container.encodeIfPresent(DnsSearch, forKey: .DnsSearch)
+        try container.encodeIfPresent(ExtraHosts, forKey: .ExtraHosts)
+        try container.encodeIfPresent(GroupAdd, forKey: .GroupAdd)
+        try container.encodeIfPresent(IpcMode, forKey: .IpcMode)
+        try container.encodeIfPresent(Cgroup, forKey: .Cgroup)
+        try container.encodeIfPresent(Links, forKey: .Links)
+        try container.encodeIfPresent(LogConfig, forKey: .LogConfig)
+        try container.encodeIfPresent(LxcConf, forKey: .LxcConf)
+        try container.encodeIfPresent(Memory, forKey: .Memory)
+        try container.encodeIfPresent(MemorySwap, forKey: .MemorySwap)
+        try container.encodeIfPresent(MemoryReservation, forKey: .MemoryReservation)
+        try container.encodeIfPresent(KernelMemory, forKey: .KernelMemory)
+        try container.encodeIfPresent(NetworkMode, forKey: .NetworkMode)
+        try container.encodeIfPresent(OomKillDisable, forKey: .OomKillDisable)
+        try container.encodeIfPresent(Init, forKey: .Init)
+        try container.encodeIfPresent(AutoRemove, forKey: .AutoRemove)
+        try container.encodeIfPresent(OomScoreAdj, forKey: .OomScoreAdj)
+        try container.encodeIfPresent(Privileged, forKey: .Privileged)
+        try container.encodeIfPresent(PublishAllPorts, forKey: .PublishAllPorts)
+        try container.encodeIfPresent(ReadonlyRootfs, forKey: .ReadonlyRootfs)
+        try container.encodeIfPresent(RestartPolicy, forKey: .RestartPolicy)
+        try container.encodeIfPresent(Ulimits, forKey: .Ulimits)
+        try container.encodeIfPresent(CpuCount, forKey: .CpuCount)
+        try container.encodeIfPresent(CpuPercent, forKey: .CpuPercent)
+        try container.encodeIfPresent(IOMaximumIOps, forKey: .IOMaximumIOps)
+        try container.encodeIfPresent(IOMaximumBandwidth, forKey: .IOMaximumBandwidth)
+        try container.encodeIfPresent(VolumesFrom, forKey: .VolumesFrom)
+        try container.encodeIfPresent(Mounts, forKey: .Mounts)
+        try container.encodeIfPresent(PidMode, forKey: .PidMode)
+        try container.encodeIfPresent(Isolation, forKey: .Isolation)
+        try container.encodeIfPresent(SecurityOpt, forKey: .SecurityOpt)
+        try container.encodeIfPresent(StorageOpt, forKey: .StorageOpt)
+        try container.encodeIfPresent(CgroupParent, forKey: .CgroupParent)
+        try container.encodeIfPresent(VolumeDriver, forKey: .VolumeDriver)
+        try container.encodeIfPresent(ShmSize, forKey: .ShmSize)
+        try container.encodeIfPresent(PidsLimit, forKey: .PidsLimit)
+        try container.encodeIfPresent(Runtime, forKey: .Runtime)
+        try container.encodeIfPresent(Tmpfs, forKey: .Tmpfs)
+        try container.encodeIfPresent(UTSMode, forKey: .UTSMode)
+        try container.encodeIfPresent(UsernsMode, forKey: .UsernsMode)
+        try container.encodeIfPresent(Sysctls, forKey: .Sysctls)
+        try container.encodeIfPresent(ConsoleSize, forKey: .ConsoleSize)
+        try container.encodeIfPresent(CgroupnsMode, forKey: .CgroupnsMode)
     }
 }
 
@@ -208,6 +362,22 @@ struct PortBinding: Content {
 struct RestartPolicy: Content {
     let Name: String
     let MaximumRetryCount: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case Name
+        case MaximumRetryCount
+    }
+
+    // moby types RestartPolicy.MaximumRetryCount as a plain int with no `omitempty`
+    // (api/types/container/hostconfig.go), so dockerd always emits the key — 0 for
+    // policies without a retry limit. Omitting it (Swift's synthesized encodeIfPresent)
+    // made generated clients nil-deref where dockerd never would. Decoding keeps the
+    // optional: `docker run --restart on-failure` sends no MaximumRetryCount at all.
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(Name, forKey: .Name)
+        try container.encode(MaximumRetryCount ?? 0, forKey: .MaximumRetryCount)
+    }
 }
 
 struct Ulimit: Content {
@@ -321,6 +491,69 @@ struct ContainerConfig: Content {
     let StopSignal: String?
     let StopTimeout: Int?
     let Shell: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case Hostname
+        case Domainname
+        case User
+        case AttachStdin
+        case AttachStdout
+        case AttachStderr
+        case ExposedPorts
+        case Tty
+        case OpenStdin
+        case StdinOnce
+        case Env
+        case Cmd
+        case Healthcheck
+        case ArgsEscaped
+        case Image
+        case Volumes
+        case WorkingDir
+        case Entrypoint
+        case NetworkDisabled
+        case MacAddress
+        case OnBuild
+        case Labels
+        case StopSignal
+        case StopTimeout
+        case Shell
+    }
+
+    // moby's container Config has no `omitempty` on Labels
+    // (api/types/container/config.go) and the daemon always creates the map, so
+    // dockerd emits `{}` for an unlabeled container — never omits the key. The
+    // synthesized encoder omitted nil, so a client doing
+    // `.Config.Labels["com.docker.compose.project"]` nil-deref'd instead of
+    // missing. Everything else keeps the synthesized behaviour.
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(Hostname, forKey: .Hostname)
+        try container.encodeIfPresent(Domainname, forKey: .Domainname)
+        try container.encodeIfPresent(User, forKey: .User)
+        try container.encodeIfPresent(AttachStdin, forKey: .AttachStdin)
+        try container.encodeIfPresent(AttachStdout, forKey: .AttachStdout)
+        try container.encodeIfPresent(AttachStderr, forKey: .AttachStderr)
+        try container.encodeIfPresent(ExposedPorts, forKey: .ExposedPorts)
+        try container.encodeIfPresent(Tty, forKey: .Tty)
+        try container.encodeIfPresent(OpenStdin, forKey: .OpenStdin)
+        try container.encodeIfPresent(StdinOnce, forKey: .StdinOnce)
+        try container.encodeIfPresent(Env, forKey: .Env)
+        try container.encodeIfPresent(Cmd, forKey: .Cmd)
+        try container.encodeIfPresent(Healthcheck, forKey: .Healthcheck)
+        try container.encodeIfPresent(ArgsEscaped, forKey: .ArgsEscaped)
+        try container.encode(Image, forKey: .Image)
+        try container.encodeIfPresent(Volumes, forKey: .Volumes)
+        try container.encodeIfPresent(WorkingDir, forKey: .WorkingDir)
+        try container.encodeIfPresent(Entrypoint, forKey: .Entrypoint)
+        try container.encodeIfPresent(NetworkDisabled, forKey: .NetworkDisabled)
+        try container.encodeIfPresent(MacAddress, forKey: .MacAddress)
+        try container.encodeIfPresent(OnBuild, forKey: .OnBuild)
+        try container.encode(Labels ?? [:], forKey: .Labels)
+        try container.encodeIfPresent(StopSignal, forKey: .StopSignal)
+        try container.encodeIfPresent(StopTimeout, forKey: .StopTimeout)
+        try container.encodeIfPresent(Shell, forKey: .Shell)
+    }
 }
 
 // `/networks` related
