@@ -251,3 +251,52 @@ struct ContainerListAgeTests {
         #expect(ContainerListRoute.humanReadableAge(since: past) == expected)
     }
 }
+
+/// A container created and never started is `created`, not `exited` (issue #16). The runtime reports
+/// it as stopped with no start date, so the list has to make the same judgement inspect does —
+/// Compose reads this to decide what needs starting, and a service that never ran looked like one
+/// that had already finished.
+@Suite("ContainerListRoute — created containers")
+struct ContainerListCreatedStateTests {
+    @Test("a container that never ran lists as created, not exited")
+    func neverStartedListsAsCreated() async throws {
+        let snapshot = makeSnapshot(id: "never-started", status: .stopped, startedDate: nil)
+        // An exit code recorded under this id would still not make it exited: it never ran.
+        await ContainerExitCodeStore.shared.remove(id: snapshot.id)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerListRoute(client: MockContainerClient(containers: [snapshot])))
+
+            try await app.testing().test(.GET, "/v1.51/containers/json?all=true") { res async in
+                let summaries = (try? JSONDecoder().decode([RESTContainerSummary].self, from: res.body)) ?? []
+                #expect(summaries.first?.State == "created")
+                #expect(summaries.first?.Status == "Created", "got: \(summaries.first?.Status ?? "nil")")
+            }
+        }
+    }
+
+    @Test("a container that ran and stopped still lists as exited with its code")
+    func stoppedStillExited() async throws {
+        let snapshot = makeSnapshot(id: "ran-then-stopped", status: .stopped, startedDate: Date(timeIntervalSinceNow: -60))
+        await ContainerExitCodeStore.shared.set(id: snapshot.id, code: 3)
+        defer { Task { await ContainerExitCodeStore.shared.remove(id: snapshot.id) } }
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerListRoute(client: MockContainerClient(containers: [snapshot])))
+
+            try await app.testing().test(.GET, "/v1.51/containers/json?all=true") { res async in
+                let summaries = (try? JSONDecoder().decode([RESTContainerSummary].self, from: res.body)) ?? []
+                #expect(summaries.first?.State == "exited")
+                #expect(summaries.first?.Status.hasPrefix("Exited (3)") == true, "got: \(summaries.first?.Status ?? "nil")")
+            }
+        }
+    }
+}

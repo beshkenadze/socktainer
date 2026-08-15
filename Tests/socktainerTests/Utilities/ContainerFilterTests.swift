@@ -2,6 +2,7 @@ import ContainerAPIClient
 import ContainerResource
 import ContainerizationExtras
 import ContainerizationOCI
+import Foundation
 import Testing
 
 @testable import socktainer
@@ -21,7 +22,7 @@ struct ContainerFilterTests {
         #expect(result.map(\.id) == ["a"])
     }
 
-    @Test("status=exited keeps only stopped containers")
+    @Test("status=exited keeps only containers that ran and stopped")
     func statusExited() throws {
         let containers = [
             try makeSnapshot(id: "a", status: .running),
@@ -29,6 +30,20 @@ struct ContainerFilterTests {
         ]
         let result = ClientContainerService.applyFilters(containers, filters: ["status": ["exited"]])
         #expect(result.map(\.id) == ["b"])
+    }
+
+    /// Compose lists containers by state to decide what to start, so a service that has never run
+    /// must not answer `status=exited` (issue #16). Apple Container reports such a container as
+    /// stopped with no start date; only the date tells the two apart.
+    @Test("status=created finds a container that never ran, and exited does not")
+    func statusCreated() throws {
+        let containers = [
+            try makeSnapshot(id: "ran", status: .stopped, startedDate: Date(timeIntervalSinceNow: -60)),
+            try makeSnapshot(id: "never", status: .stopped, startedDate: nil),
+        ]
+
+        #expect(ClientContainerService.applyFilters(containers, filters: ["status": ["created"]]).map(\.id) == ["never"])
+        #expect(ClientContainerService.applyFilters(containers, filters: ["status": ["exited"]]).map(\.id) == ["ran"])
     }
 
     // MARK: - label
@@ -264,7 +279,8 @@ private func makeSnapshot(
     status: RuntimeStatus = .running,
     labels: [String: String] = [:],
     image: String = "alpine:latest",
-    networkNames: [String] = []
+    networkNames: [String] = [],
+    startedDate: Date? = Date(timeIntervalSinceNow: -60)
 ) throws -> ContainerSnapshot {
     let proc = ProcessConfiguration(
         executable: "/bin/sh", arguments: [], environment: [],
@@ -277,7 +293,12 @@ private func makeSnapshot(
     var config = ContainerConfiguration(id: id, image: img, process: proc)
     config.labels = labels
     let attachments = try networkNames.map { try makeAttachment(network: $0) }
-    return ContainerSnapshot(configuration: config, status: status, networks: attachments)
+    return ContainerSnapshot(
+        configuration: config,
+        status: status,
+        networks: attachments,
+        startedDate: status == .running ? (startedDate ?? Date()) : startedDate
+    )
 }
 
 private func makeAttachment(network: String) throws -> ContainerResource.Attachment {

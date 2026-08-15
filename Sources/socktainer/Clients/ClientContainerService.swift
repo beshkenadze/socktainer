@@ -136,7 +136,9 @@ struct ClientContainerService: ClientContainerProtocol {
         for (key, values) in filters {
             switch key {
             case "status":
-                result = result.filter { values.contains($0.status.mobyState) }
+                // `--filter status=created` has to find a container that never ran, and
+                // `status=exited` must not: Compose decides what to start from this.
+                result = result.filter { values.contains($0.mobyStateString) }
             case "exited":
                 result = result.filter { container in
                     guard container.status == .stopped else { return false }
