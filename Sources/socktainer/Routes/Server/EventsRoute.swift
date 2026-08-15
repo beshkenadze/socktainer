@@ -48,21 +48,36 @@ extension EventsRoute {
             let onlyPastEvents = !follow || (until.map { $0 <= now } ?? false)
 
             if onlyPastEvents {
-                // No event history is retained: the broadcaster is live-only, unlike
-                // moby's 256-entry ring buffer (daemon/events/events.go). The honest
-                // answer to a history-only query is an empty body and a closed
-                // connection — a client can proceed on `[]` + EOF, while one that
-                // hangs (the old behaviour) cannot.
+                // moby's getEvents writes the buffered events matching the window and
+                // returns without ever subscribing live (api/server/router/system/
+                // system_routes.go). The backlog now comes from the broadcaster's ring
+                // buffer — the piece this bridge lacked, which made a window with
+                // activity in it answer an empty body (issue #6). A window nothing
+                // matches still closes promptly with an empty body, which a client can
+                // proceed on.
+                let backlog = await broadcaster.backlog(since: since, until: until)
                 let response = Response(status: .ok)
                 response.headers.add(name: .contentType, value: "application/json")
+                var body = ByteBuffer()
+                for event in backlog {
+                    if let json = try? JSONEncoder().encode(event) {
+                        body.writeBytes(json)
+                        body.writeString("\n")
+                    }
+                }
+                response.body = .init(buffer: body)
                 return response
             }
 
-            // `since` alone (or no bounds at all): stream live events from now on.
-            // moby replays buffered events since `since`; with no buffer there is
-            // nothing to replay, so the stream simply starts at the current moment.
-            // `until` is in the future here: keep streaming, then close at the deadline.
-            let live = await broadcaster.stream()
+            // Following: one atomic subscribe returns the backlog matching the window
+            // and the live stream together — moby's SubscribeTopic takes both under one
+            // mutex so an event broadcast in between is delivered exactly once, never
+            // dropped or duplicated. The backlog is written first, then live events, in
+            // moby's order. `until` is in the future here and still bounds the backlog:
+            // measured against dockerd on the OrbStack socket (2026-08-15),
+            // `?until=<future>` with no `since` replays the whole buffer, exactly what
+            // loadBufferedEvents produces with a zero lower bound.
+            let (backlog, live) = await broadcaster.subscribe(since: since, until: until)
             let deadline = until
 
             let response = Response(status: .ok)
@@ -76,29 +91,51 @@ extension EventsRoute {
                 // that reads headers before events depends on.
                 _ = try? await writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
 
+                for event in backlog {
+                    let clientStillThere = await writeJSONL(event, to: writer, logger: req.logger)
+                    if !clientStillThere { break }
+                }
                 for await event in EventsRoute.deadlineBounded(live, until: deadline) {
-                    if let json = try? JSONEncoder().encode(event) {
-                        var buffer = req.application.allocator.buffer(capacity: json.count + 1)
-                        buffer.writeBytes(json)
-                        buffer.writeString("\n")
-                        do {
-                            try await writer.write(.buffer(buffer))
-                        } catch is IOError {
-                            req.logger.debug("Client disconnected (broken pipe)")
-                            break
-                        } catch let error as ChannelError where error == .ioOnClosedChannel {
-                            req.logger.debug("Client disconnected (closed channel)")
-                            break
-                        } catch {
-                            req.logger.warning("\(event) raised '\(error)'")
-                        }
-                    }
+                    let clientStillThere = await writeJSONL(event, to: writer, logger: req.logger)
+                    if !clientStillThere { break }
                 }
                 _ = try? await writer.write(.end)
             })
 
             return response
 
+        }
+    }
+
+    /// One event as one JSONL frame, shared by the backlog and live paths so replayed
+    /// history is byte-identical to what the live stream sends. False when the client
+    /// is gone (broken pipe, closed channel): the caller stops queueing frames nobody
+    /// will read. A bad encode or a transient write error is logged and skipped — the
+    /// tolerance the live path already had, now applied to the backlog too.
+    private static func writeJSONL(
+        _ event: DockerEvent,
+        to writer: AsyncBodyStreamWriter,
+        logger: Logger
+    ) async -> Bool {
+        guard let json = try? JSONEncoder().encode(event) else {
+            logger.warning("\(event) could not be encoded")
+            return true
+        }
+        var buffer = ByteBuffer()
+        buffer.writeBytes(json)
+        buffer.writeString("\n")
+        do {
+            try await writer.write(.buffer(buffer))
+            return true
+        } catch is IOError {
+            logger.debug("Client disconnected (broken pipe)")
+            return false
+        } catch let error as ChannelError where error == .ioOnClosedChannel {
+            logger.debug("Client disconnected (closed channel)")
+            return false
+        } catch {
+            logger.warning("\(event) raised '\(error)'")
+            return true
         }
     }
 
