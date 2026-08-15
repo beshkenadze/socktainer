@@ -106,6 +106,7 @@ protocol ClientArchiveProtocol: Sendable {
 
 /// Service for performing archive operations on container filesystems
 struct ClientArchiveService: ClientArchiveProtocol {
+    private static let log = Logger(label: "socktainer.archive")
     private let appSupportPath: URL
 
     init(appSupportPath: URL) {
@@ -135,12 +136,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
         // Open the ext4 filesystem
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
 
-        // Check if path exists and get stat
-        guard reader.exists(FilePath(normalizedPath)) else {
+        guard let (_, inode) = Self.lstat(reader: reader, path: normalizedPath) else {
             throw ClientArchiveError.pathNotFound(path: normalizedPath)
         }
-
-        let (_, inode) = try reader.stat(FilePath(normalizedPath))
 
         // Create PathStat for the response header
         let pathStat = PathStat(
@@ -581,12 +579,50 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
-    /// Read symlink target using the reader's public API
+    /// `lstat`: describe the entry itself, never what it points at — which is what tar stores and what
+    /// moby's archive path does (`os.Lstat`, daemon/archive_unix.go).
+    ///
+    /// `EXT4Reader` has no lstat. Its `followSymlinks` flag applies to *every* component of the path,
+    /// not just the last one, so asking it not to follow also refuses to walk *through* a symlinked
+    /// directory: `/var/run/app.sock` where `/var/run -> /run` stops dead at `run`. Hence two steps —
+    /// describe the entry without following, and if the walk could not get there, resolve normally.
+    ///
+    /// Residual divergence, deliberate: a path whose parent chain contains a symlink *and* whose final
+    /// component is one too is archived as its target rather than as a link. moby would store the
+    /// link. The alternative is re-implementing symlink resolution here, and returning the target's
+    /// bytes is the smaller lie than 404 for a path that plainly exists.
+    static func lstat(reader: EXT4.EXT4Reader, path: String) -> (EXT4.InodeNumber, EXT4.Inode)? {
+        if let entry = try? reader.stat(FilePath(path), followSymlinks: false) {
+            return entry
+        }
+        return try? reader.stat(FilePath(path), followSymlinks: true)
+    }
+
+    /// The target a symlink points at, read the way the reader's own exporter reads it.
+    ///
+    /// `readFile` cannot: it rejects any inode that is not a regular file, so every symlink came back
+    /// nil and was dropped from the archive entirely — `docker cp <ctr>:/etc .` silently lost `mtab`,
+    /// `os-release` and friends instead of copying them as links.
+    ///
+    /// ext4 stores a target shorter than 60 bytes inline in the inode's block array (a "fast
+    /// symlink"), which is what EXT4Reader+Export reads. A longer target lives in data blocks, and
+    /// reaching those needs block arithmetic the reader keeps private, so such an entry is logged and
+    /// skipped rather than guessed at.
     private func readSymlinkTarget(reader: EXT4.EXT4Reader, path: String) -> String? {
-        guard let data = try? reader.readFile(at: FilePath(path), followSymlinks: false) else {
+        guard let (_, inode) = try? reader.stat(FilePath(path), followSymlinks: false), inode.isSymlink else {
             return nil
         }
-        return String(data: data, encoding: .utf8)
+        let size = Int(inode.size)
+        guard size > 0 else { return nil }
+        guard size < 60 else {
+            // Not readable through the public API, and silence here means the entry vanishes from the
+            // archive — the exact failure this whole change is about. A copy that quietly returns
+            // fewer files than the container holds is worse than one that says it cannot.
+            Self.log.error("symlink target of \(path) is \(size) bytes; only inline targets are readable")
+            return nil
+        }
+        let inlineBytes = Mirror(reflecting: inode.block).children.compactMap { $0.value as? UInt8 }
+        return String(bytes: inlineBytes.prefix(size), encoding: .utf8)
     }
 
     private func validateArchiveEntries(
@@ -624,7 +660,12 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
     /// Extract a path from the ext4 filesystem to a local directory
     private func extractPathToDirectory(reader: EXT4.EXT4Reader, sourcePath: String, destDir: URL) throws {
-        let (_, inode) = try reader.stat(FilePath(sourcePath))
+        // lstat, not stat: a symlink is archived as itself. Following it also breaks the walk
+        // outright when the target is outside the filesystem — `/etc/mtab -> /proc/mounts` threw
+        // and took the whole directory's archive with it.
+        guard let (_, inode) = Self.lstat(reader: reader, path: sourcePath) else {
+            throw ClientArchiveError.pathNotFound(path: sourcePath)
+        }
         let baseName = sourcePath == "/" ? nil : (sourcePath as NSString).lastPathComponent
 
         if inode.isDirectory {
@@ -667,14 +708,19 @@ struct ClientArchiveService: ClientArchiveProtocol {
                 ofItemAtPath: fileDest.path
             )
         } else if inode.isSymlink {
-            // Read symlink target
-            if let target = readSymlinkTarget(reader: reader, path: sourcePath) {
-                guard let baseName else {
-                    throw ClientArchiveError.invalidPath(path: sourcePath)
-                }
-                let linkDest = destDir.appendingPathComponent(baseName)
-                try FileManager.default.createSymbolicLink(atPath: linkDest.path, withDestinationPath: target)
+            guard let baseName else {
+                throw ClientArchiveError.invalidPath(path: sourcePath)
             }
+            // Dropping the entry when the target cannot be read is silent data loss: the client gets a
+            // tar that is missing a file and no indication of it. ext4 stores targets under 60 bytes
+            // inline; anything longer needs block arithmetic the reader keeps private, so say so.
+            guard let target = readSymlinkTarget(reader: reader, path: sourcePath) else {
+                throw ClientArchiveError.operationFailed(
+                    message: "cannot read the symlink target of \(sourcePath); refusing to omit it from the archive"
+                )
+            }
+            let linkDest = destDir.appendingPathComponent(baseName)
+            try FileManager.default.createSymbolicLink(atPath: linkDest.path, withDestinationPath: target)
         }
         // Skip other file types (devices, fifos, sockets)
     }

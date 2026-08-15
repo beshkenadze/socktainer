@@ -31,7 +31,7 @@ private struct MockContainerClient: ClientContainerProtocol {
 
 // MARK: - Helpers
 
-private func makeSnapshot(id: String) -> ContainerSnapshot {
+private func makeSnapshot(id: String, status: RuntimeStatus = .running, startedDate: Date? = Date(timeIntervalSinceNow: -30)) -> ContainerSnapshot {
     let processConfig = ProcessConfiguration(
         executable: "/bin/sh",
         arguments: [],
@@ -47,10 +47,64 @@ private func makeSnapshot(id: String) -> ContainerSnapshot {
     let config = ContainerConfiguration(id: id, image: imageDesc, process: processConfig)
     return ContainerSnapshot(
         configuration: config,
-        status: .running,
+        status: status,
         networks: [],
-        startedDate: Date(timeIntervalSinceNow: -30)  // started 30 seconds ago
+        startedDate: startedDate
     )
+}
+
+@Suite("ContainerListRoute status")
+struct ContainerListStatusTests {
+
+    @Test("Exited container list status includes exit code and age")
+    func listIncludesExitCodeForStoppedContainers() async throws {
+        let snapshot = makeSnapshot(id: "c-exited-code", status: .stopped, startedDate: Date(timeIntervalSinceNow: -0.2))
+        await ContainerExitCodeStore.shared.set(id: snapshot.id, code: 7)
+        defer { Task { await ContainerExitCodeStore.shared.remove(id: snapshot.id) } }
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+
+            let client = MockContainerClient(containers: [snapshot])
+            try app.register(collection: ContainerListRoute(client: client))
+
+            try await app.testing().test(.GET, "/v1.51/containers/json") { res async in
+                let summaries = (try? JSONDecoder().decode([RESTContainerSummary].self, from: res.body)) ?? []
+                #expect(summaries.first?.Status == "Exited (7) Less than a second ago")
+            }
+        }
+    }
+
+    @Test("Stopped container falls back to hexId exit code when native id has no code")
+    func listFallsBackToHexIdExitCode() async throws {
+        let snapshot = makeSnapshot(id: "c-exited-hex", status: .stopped, startedDate: Date(timeIntervalSinceNow: -0.2))
+        let hexId = DockerContainerID.hexId(for: snapshot)
+        await ContainerExitCodeStore.shared.set(id: hexId, code: 13)
+        defer {
+            Task {
+                await ContainerExitCodeStore.shared.remove(id: snapshot.id)
+                await ContainerExitCodeStore.shared.remove(id: hexId)
+            }
+        }
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+
+            let client = MockContainerClient(containers: [snapshot])
+            try app.register(collection: ContainerListRoute(client: client))
+
+            try await app.testing().test(.GET, "/v1.51/containers/json") { res async in
+                let summaries = (try? JSONDecoder().decode([RESTContainerSummary].self, from: res.body)) ?? []
+                #expect(summaries.first?.Status == "Exited (13) Less than a second ago")
+            }
+        }
+    }
 }
 
 // MARK: - Tests
