@@ -129,6 +129,14 @@ extension ImageInspectRoute {
             guard let refOrId = req.parameters.get("name") else {
                 throw Abort(.badRequest, reason: "Missing image name parameter")
             }
+            // Same split moby makes before the store lookup (daemon/images/image.go GetImage →
+            // reference.ParseAnyReference → errdefs.InvalidParameter): a name that cannot be a
+            // reference is a 400, not a 404 that tells the client the image merely happens to be
+            // absent under a name it could retry.
+            if let reason = DockerReference.invalidReason(for: refOrId) {
+                throw Abort(.badRequest, reason: reason)
+            }
+
             let query = try req.query.decode(RESTImageInspectQuery.self)
             let requestedPlatform = try inspectPlatformOrThrow(query.platform)
             let includeManifests = (query.manifests ?? false) && requestedPlatform == nil

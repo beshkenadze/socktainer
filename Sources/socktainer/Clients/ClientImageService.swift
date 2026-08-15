@@ -683,7 +683,9 @@ struct ClientImageService: ClientImageProtocol {
                 resolvedRefs.append(image.reference)
             } catch {
                 logger.error("Image not found: \(reference)")
-                throw ClientImageError.notFound(id: reference)
+                // Rendered verbatim by the /images/{name}/get route; moby
+                // phrases this ErrImageDoesNotExist.Error().
+                throw ClientImageError.notFound(id: "No such image: \(reference)")
             }
         }
 

@@ -36,6 +36,14 @@ struct ImagesGetRoute: RouteCollection {
     }
 
     private static func saveImages(references: [String], req: Request, client: ClientImageProtocol) async throws -> Response {
+        // moby resolves each name through GetImage's reference parse
+        // (daemon/images/image.go): unparseable → 400, well-formed but absent
+        for reference in references {
+            if let reason = DockerReference.invalidReason(for: reference) {
+                throw Abort(.badRequest, reason: reason)
+            }
+        }
+
         let platformString = try? req.query.get(String.self, at: "platform")
         let platform = try platformString.map(platformOrThrow)
 
@@ -48,8 +56,12 @@ struct ImagesGetRoute: RouteCollection {
             tarballPath = try await client.save(references: references, platform: platform, appleContainerAppSupportUrl: appleContainerAppSupportUrl, logger: req.logger)
         } catch let error as ClientImageError {
             switch error {
-            case .notFound(let id):
-                throw Abort(.notFound, reason: id)
+            case .notFound(let message):
+                // The payload is already client-facing: the reference-shaped
+                // one is finalized as moby's "No such image: …"
+                // (ErrImageDoesNotExist.Error()), the store-corruption one is
+                // a full sentence about missing blobs.
+                throw Abort(.notFound, reason: message)
             case .digestReferenceNotAllowed(let repo):
                 throw Abort(.badRequest, reason: "cannot reference \(repo) by digest")
             }

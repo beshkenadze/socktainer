@@ -23,18 +23,34 @@ extension ImageTagRoute {
             throw Abort(.badRequest, reason: "Missing image name parameter")
         }
 
+        // moby validates both sides before touching the store
+        // (api/server/httputils/form.go RepoTagReference and
+        // daemon/images/image.go GetImage → errdefs.InvalidParameter): a
+        // malformed source or target is a 400, not a 404/500.
+        if let reason = DockerReference.invalidReason(for: sourceImageName) {
+            throw Abort(.badRequest, reason: reason)
+        }
+
         let query = try req.query.decode(RESTImageTagQuery.self)
 
         guard let repo = query.repo, !repo.isEmpty else {
             throw Abort(.badRequest, reason: "repo parameter is required")
         }
 
-        let targetReference = try {
-            if let tag = query.tag, !tag.isEmpty {
-                return try ClientImage.normalizeReference("\(repo):\(tag)", containerSystemConfig: systemConfig)
-            }
-            return try ClientImage.normalizeReference(repo, containerSystemConfig: systemConfig)
-        }()
+        let rawTarget =
+            query.tag.flatMap { $0.isEmpty ? nil : $0 }.map { "\(repo):\($0)" } ?? repo
+        if let reason = DockerReference.invalidReason(for: rawTarget) {
+            throw Abort(.badRequest, reason: reason)
+        }
+
+        let targetReference: String
+        do {
+            targetReference = try ClientImage.normalizeReference(rawTarget, containerSystemConfig: systemConfig)
+        } catch {
+            // Grammar-valid input should normalize; any residual parse
+            // failure is still the client's, never a 500.
+            throw Abort(.badRequest, reason: "invalid reference format")
+        }
 
         let sourceImage: ClientImage
         do {

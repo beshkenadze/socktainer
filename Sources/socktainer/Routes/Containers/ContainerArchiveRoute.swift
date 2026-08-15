@@ -50,7 +50,14 @@ struct ContainerArchiveRoute: RouteCollection {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
 
-            let query = try req.query.decode(ContainerArchiveGetQuery.self)
+            // moby validates the form before the container lookup
+            // (api/server/httputils/form.go ArchiveFormValues) and answers
+            // 400 for a missing or empty path rather than leaking Vapor's
+            // decoder wording — a client can't act on "No value found at
+            // path 'path'".
+            guard let query = try? req.query.decode(ContainerArchiveGetQuery.self), !query.path.isEmpty else {
+                throw Abort(.badRequest, reason: "bad parameter: path cannot be empty")
+            }
 
             // Verify container exists
             guard let container = try await containerClient.getContainer(id: id) else {
@@ -101,8 +108,9 @@ struct ContainerArchiveRoute: RouteCollection {
             guard let id = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
-
-            let query = try req.query.decode(ContainerArchivePutQuery.self)
+            guard let query = try? req.query.decode(ContainerArchivePutQuery.self), !query.path.isEmpty else {
+                throw Abort(.badRequest, reason: "bad parameter: path cannot be empty")
+            }
 
             // Verify container exists
             guard let container = try await containerClient.getContainer(id: id) else {
@@ -190,7 +198,9 @@ struct ContainerArchiveRoute: RouteCollection {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
 
-            let query = try req.query.decode(ContainerArchiveGetQuery.self)
+            guard let query = try? req.query.decode(ContainerArchiveGetQuery.self), !query.path.isEmpty else {
+                throw Abort(.badRequest, reason: "bad parameter: path cannot be empty")
+            }
 
             // Verify container exists
             guard let container = try await containerClient.getContainer(id: id) else {
