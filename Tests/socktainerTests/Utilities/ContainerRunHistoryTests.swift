@@ -10,35 +10,33 @@ import Testing
 /// guest and then fails never records one. Both leave `startedDate == nil` on a container that
 /// certainly ran, which the clock alone cannot tell from one that never started (issue #16's rule,
 /// inverted). The runtime's boot artifacts on disk are the durable answer.
-@Suite("ContainerRunHistory", .serialized)
+///
+/// Identity comes from the container id, not from a private root: `ContainerRunHistory` holds one
+/// root process-wide, so a suite that repoints it steals it from everything running beside it.
+@Suite("ContainerRunHistory")
 struct ContainerRunHistoryTests {
     @Test("a container the runtime booted is exited, not created, once its start time is gone")
     func bootedContainerSurvivesRestart() throws {
-        let root = try makeRoot(bootedIds: ["ran"])
-        defer { try? FileManager.default.removeItem(at: root) }
-        ContainerRunHistory.configure(storageDirectory: root)
+        let id = "ran-\(UUID().uuidString)"
+        try RunHistoryFixture.markRan(id)
 
-        let ran = try makeSnapshot(id: "ran", status: .stopped, startedDate: nil)
+        let ran = try makeSnapshot(id: id, status: .stopped, startedDate: nil)
         #expect(MobyContainerStatus.state(for: ran) == "exited")
     }
 
     @Test("a container that never started is created")
     func neverStartedIsCreated() throws {
-        let root = try makeRoot(bootedIds: [])
-        defer { try? FileManager.default.removeItem(at: root) }
-        ContainerRunHistory.configure(storageDirectory: root)
-
-        let fresh = try makeSnapshot(id: "fresh", status: .stopped, startedDate: nil)
+        RunHistoryFixture.configure()
+        let fresh = try makeSnapshot(id: RunHistoryFixture.unmarkedId(), status: .stopped, startedDate: nil)
         #expect(MobyContainerStatus.state(for: fresh) == "created")
     }
 
     @Test("a running container is running whatever the disk says")
     func runningIsUnaffected() throws {
-        let root = try makeRoot(bootedIds: ["up"])
-        defer { try? FileManager.default.removeItem(at: root) }
-        ContainerRunHistory.configure(storageDirectory: root)
+        let id = "up-\(UUID().uuidString)"
+        try RunHistoryFixture.markRan(id)
 
-        let live = try makeSnapshot(id: "up", status: .running, startedDate: Date())
+        let live = try makeSnapshot(id: id, status: .running, startedDate: Date())
         #expect(MobyContainerStatus.state(for: live) == "running")
     }
 
@@ -46,47 +44,33 @@ struct ContainerRunHistoryTests {
     /// must not empty it.
     @Test("filters place a restarted container with the exited, not the created")
     func filtersFollowTheBootRecord() throws {
-        let root = try makeRoot(bootedIds: ["ran"])
-        defer { try? FileManager.default.removeItem(at: root) }
-        ContainerRunHistory.configure(storageDirectory: root)
+        let ranId = "ran-\(UUID().uuidString)"
+        try RunHistoryFixture.markRan(ranId)
+        let freshId = RunHistoryFixture.unmarkedId()
 
         let containers = [
-            try makeSnapshot(id: "ran", status: .stopped, startedDate: nil),
-            try makeSnapshot(id: "fresh", status: .stopped, startedDate: nil),
+            try makeSnapshot(id: ranId, status: .stopped, startedDate: nil),
+            try makeSnapshot(id: freshId, status: .stopped, startedDate: nil),
         ]
 
         let exited = ClientContainerService.applyFilters(containers, filters: ["status": ["exited"]])
         let created = ClientContainerService.applyFilters(containers, filters: ["status": ["created"]])
-        #expect(exited.map(\.id) == ["ran"])
-        #expect(created.map(\.id) == ["fresh"])
+        #expect(exited.map(\.id) == [ranId])
+        #expect(created.map(\.id) == [freshId])
     }
 
-    @Test("an unconfigured store leaves the snapshot's own account standing")
-    func unconfiguredFallsBackToTheClock() throws {
-        let root = try makeRoot(bootedIds: ["ran"])
-        defer { try? FileManager.default.removeItem(at: root) }
-        // Point at a directory holding no containers at all: the same shape as never having been
-        // configured, and the answer must be the clock's.
-        ContainerRunHistory.configure(storageDirectory: root.appending(path: "elsewhere"))
+    /// The runtime can keep its state somewhere this build cannot read. Then the boot record is not
+    /// evidence of anything, and the snapshot's own account is all there is.
+    @Test("a container with no boot record on disk keeps the clock's answer")
+    func noRecordFallsBackToTheClock() throws {
+        RunHistoryFixture.configure()
+        let id = RunHistoryFixture.unmarkedId()
+        #expect(ContainerRunHistory.hasRun(id: id) == false)
 
-        let ran = try makeSnapshot(id: "ran", status: .stopped, startedDate: nil)
-        #expect(MobyContainerStatus.state(for: ran) == "created")
+        let ran = try makeSnapshot(id: id, status: .stopped, startedDate: Date(timeIntervalSinceNow: -60))
+        // A start time still stands on its own: this one ran within this daemon's lifetime.
+        #expect(MobyContainerStatus.state(for: ran) == "exited")
     }
-}
-
-/// Mirrors the runtime's layout: a container that has booted owns a `vminitd.log` under its own
-/// directory, one that has only been created owns nothing.
-private func makeRoot(bootedIds: [String]) throws -> URL {
-    let root = URL(fileURLWithPath: NSTemporaryDirectory())
-        .appending(path: "run-history-\(UUID().uuidString)")
-    for id in bootedIds {
-        let dir = root.appending(path: "containers").appending(path: id)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try Data().write(to: dir.appending(path: "vminitd.log"))
-    }
-    try FileManager.default.createDirectory(
-        at: root.appending(path: "containers"), withIntermediateDirectories: true)
-    return root
 }
 
 private func makeSnapshot(id: String, status: RuntimeStatus, startedDate: Date?) throws -> ContainerSnapshot {

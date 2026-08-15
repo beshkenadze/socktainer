@@ -309,17 +309,6 @@ struct ContainerListCreatedStateTests {
 @Suite("ContainerListRoute — exit code durability", .serialized)
 struct ContainerListExitCodeDurabilityTests {
 
-    /// A run-history root mirroring the runtime's layout: a booted container owns a
-    /// `vminitd.log` under its own directory (see ContainerRunHistory).
-    private func makeRunHistoryRoot(bootedId: String) throws -> URL {
-        let root = FileManager.default.temporaryDirectory
-            .appending(path: "list-exit-root-\(UUID().uuidString)")
-        let dir = root.appending(path: "containers").appending(path: bootedId)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try Data().write(to: dir.appending(path: "vminitd.log"))
-        return root
-    }
-
     private func withListRoute(
         containers: [ContainerSnapshot],
         test: @escaping (Application) async throws -> Void
@@ -337,10 +326,10 @@ struct ContainerListExitCodeDurabilityTests {
     @Test("an exit recorded before a restart renders after it")
     func persistedExitSurvivesRestart() async throws {
         // The runtime restart shape: booted once (boot artifacts on disk), start time gone.
-        let id = "durable-exit"
-        let root = try makeRunHistoryRoot(bootedId: id)
-        ContainerRunHistory.configure(storageDirectory: root)
-        defer { try? FileManager.default.removeItem(at: root) }
+        // A container with a recorded exit necessarily booted, so it owns the runtime's boot
+        // artifacts too — the shared fixture keeps both views of that one fact in agreement.
+        let id = "durable-exit-\(UUID().uuidString)"
+        try RunHistoryFixture.markRan(id)
 
         let snapshot = makeSnapshot(id: id, status: .stopped, startedDate: nil)
         let hexId = DockerContainerID.hexId(for: snapshot)
@@ -372,10 +361,8 @@ struct ContainerListExitCodeDurabilityTests {
 
     @Test("a container that ran with no record renders the unknown code, not a clean 0")
     func ranWithoutRecordIsUnknown() async throws {
-        let id = "ran-unknown"
-        let root = try makeRunHistoryRoot(bootedId: id)
-        ContainerRunHistory.configure(storageDirectory: root)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let id = "ran-unknown-\(UUID().uuidString)"
+        try RunHistoryFixture.markRan(id)
 
         let snapshot = makeSnapshot(id: id, status: .stopped, startedDate: nil)
         await ContainerExitCodeStore.shared.remove(id: id)

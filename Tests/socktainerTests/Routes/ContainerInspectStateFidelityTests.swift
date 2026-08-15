@@ -84,12 +84,16 @@ struct ContainerInspectStateFidelityTests {
         }
     }
 
-    @Test("An exited container with no recorded code (daemon restarted) inspects as ExitCode 0")
-    func exitedContainerWithoutRecordedCodeDefaultsToZero() async throws {
+    /// This used to assert 0, which is the bug in issue #20 written down as a contract: a container
+    /// whose code nobody recorded was claiming the exit status of a clean run. Zero is an answer,
+    /// and it is the wrong one to invent — the sentinel is outside the 0-255 a real exit can carry.
+    @Test("An exited container with no recorded code (daemon restarted) does not claim a clean 0")
+    func exitedContainerWithoutRecordedCodeReportsUnknown() async throws {
         try await withRoute(id: "state-exited-unknown", status: .stopped, startedDate: Date(timeIntervalSinceNow: -60)) { app in
             try await app.testing().test(.GET, "/v1.51/containers/state-exited-unknown/json") { res async throws in
                 let inspect = try res.content.decode(RESTContainerInspect.self)
-                #expect(inspect.State.ExitCode == 0)
+                #expect(inspect.State.ExitCode == ContainerExitCodeStore.unknownExitCode)
+                #expect(inspect.State.ExitCode != 0)
                 #expect(inspect.State.Dead == false)
                 #expect(inspect.State.Status == "exited")
             }
