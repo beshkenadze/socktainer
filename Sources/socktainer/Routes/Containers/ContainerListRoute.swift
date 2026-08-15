@@ -121,16 +121,22 @@ extension ContainerListRoute {
                 // Docker reports exited containers as "Exited (<code>) <age> ago",
                 // preserving the exit code and age for quick triage without inspect.
                 // Reference: https://raw.githubusercontent.com/moby/moby/v28.5.2/container/state.go
-                let mobyState = container.status.mobyState
+                // Switch on the state Docker reports, not on the runtime's own status: a container
+                // created and never started is `.stopped` to the runtime, and reading that directly
+                // printed "Exited (0)" for something that has never run (issue #16).
+                let mobyState = container.mobyStateString
                 let baseStatus: String
-                switch container.status {
-                case .running:
+                switch mobyState {
+                case "running":
                     if let started = container.startedDate {
                         baseStatus = "Up \(Self.humanReadableAge(since: started))"
                     } else {
                         baseStatus = "Up"
                     }
-                case .stopped:
+                case "created":
+                    // moby's State.String() for a container that never ran is the bare word.
+                    baseStatus = "Created"
+                case "exited":
                     let exitCode = await Self.exitCode(for: container)
                     // The age is measured from when the container *finished*, as moby's
                     // `State.String` reads `FinishedAt`. The snapshot only carries a start time, so
@@ -144,7 +150,7 @@ extension ContainerListRoute {
                         baseStatus = "Exited (\(exitCode))"
                     }
                 default:
-                    baseStatus = mobyState
+                    baseStatus = mobyState.prefix(1).uppercased() + mobyState.dropFirst()
                 }
                 let statusStr: String
                 if let health = await req.application.storage[HealthCheckManagerKey.self]?.currentHealth(

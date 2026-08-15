@@ -177,18 +177,9 @@ extension ContainerInspectRoute {
             // True during the backoff window between a crash and its automatic restart.
             let isPendingRestart = await ContainerRestartState.shared.isPendingRestart(id: container.id)
 
-            // moby container/state.go: StateString() reports "created" when
-            // StartedAt is zero — a container that never ran is not "exited".
-            // Apple reports `.unknown` for those snapshots; keying off
-            // `startedDate` keeps inspect agreeing with the list route either way.
-            let status: String
-            if isPendingRestart {
-                status = "restarting"
-            } else if container.startedDate == nil && container.status != .running {
-                status = "created"
-            } else {
-                status = container.status.mobyState
-            }
+            // Restarting is inspect's own knowledge — the runtime does not carry it. Everything else
+            // comes from the shared rule, so this route and the list cannot drift apart again.
+            let status = isPendingRestart ? "restarting" : container.mobyStateString
 
             // moby represents unknown timestamps as Go's zero time — dockerd
             // emits `0001-01-01T00:00:00Z`, which parses as a timestamp, unlike
