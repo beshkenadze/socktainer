@@ -240,27 +240,19 @@ extension ContainerInspectRoute {
                 ?? dockerZeroTime
 
             // moby resets ExitCodeValue to 0 on every start (container/state.go
-            // setRunning), so a running or never-started container inspects as 0.
+            // setRunning) and its zero value covers a container that never ran.
+            // "Never ran" is not `startedDate == nil` — a runtime restart nils the
+            // start time of everything that had been running — so confirm against
+            // the runtime's on-disk boot record the same way
+            // MobyContainerStatus.state(for:) does; otherwise every container that
+            // outlived a restart took the zero here (issue #20).
             let exitCode: Int32
-            if container.status == .running || container.startedDate == nil {
+            if container.status == .running || (container.startedDate == nil && !ContainerRunHistory.hasRun(id: container.id)) {
                 exitCode = 0
             } else {
-                // The exit monitor records the code under both the native and hex
-                // container IDs; probe both like ContainerWaitRoute does.
-                let hexId = DockerContainerID.hexId(for: container)
-                let nativeCode = await ContainerExitCodeStore.shared.get(id: container.id)
-                let hexCode = await ContainerExitCodeStore.shared.get(id: hexId)
-                exitCode =
-                    nativeCode ?? hexCode
-                    // No entry means the daemon restarted after the container
-                    // exited (the store is in-memory). Default to 0 — moby's own
-                    // zero value for State.ExitCodeValue — rather than inventing
-                    // a failure code: a fabricated non-zero would flip every
-                    // "did it succeed" check (CI, Testcontainers) to failure for
-                    // containers that really exited 0 before the restart. A code
-                    // that genuinely could not be obtained is recorded as the
-                    // store's -1 sentinel by the exit monitor and flows through.
-                    ?? 0
+                // The recorded code, or the unknown sentinel when no daemon lifetime
+                // observed the exit — never a fabricated 0.
+                exitCode = await MobyContainerStatus.exitCode(for: container)
             }
 
             let containerState: ContainerState = ContainerState(
@@ -280,10 +272,14 @@ extension ContainerInspectRoute {
                 ExitCode: Int(exitCode),
                 Error: "",
                 StartedAt: startedAt,
-                // Apple exposes no finish time for a stopped container; moby's
-                // zero time is the closest non-misleading value (a wall-clock
-                // reading would fabricate an exit moment we never observed).
-                FinishedAt: dockerZeroTime,
+                // moby keeps FinishedAt at zero time until the container stops, then
+                // checkpoints the moment into containers/<id>/<id>.json — which is how
+                // dockerd keeps it across daemon restarts. The persisted exit store is
+                // our equivalent; a finish no daemon lifetime observed degrades to the
+                // zero time rather than fabricating a moment (issue #20).
+                FinishedAt: await MobyContainerStatus.finishTime(for: container).map {
+                    AppleContainerTimestampResolver.iso8601Timestamp($0)
+                } ?? dockerZeroTime,
                 Health: health
             )
 

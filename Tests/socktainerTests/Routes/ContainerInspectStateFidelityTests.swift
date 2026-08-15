@@ -72,11 +72,14 @@ struct ContainerInspectStateFidelityTests {
                 #expect(inspect.State.Status == "exited")
                 #expect(inspect.State.Running == false)
                 #expect(inspect.State.Restarting == false)
-                // StartedAt keeps the real start time; the unknown FinishedAt is
-                // moby's zero time, both parseable timestamps.
+                // StartedAt keeps the real start time; FinishedAt is the recorded finish
+                // moment, the fact dockerd checkpoints and reloads across restarts.
                 #expect(inspect.State.StartedAt != "")
                 #expect(inspect.State.StartedAt != "0001-01-01T00:00:00Z")
-                #expect(inspect.State.FinishedAt == "0001-01-01T00:00:00Z")
+                #expect(
+                    inspect.State.FinishedAt
+                        == AppleContainerTimestampResolver.iso8601Timestamp(
+                            await ContainerExitCodeStore.shared.finishTime(id: id)))
             }
         }
     }

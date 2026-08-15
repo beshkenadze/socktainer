@@ -8,19 +8,57 @@ import Logging
 // Both ClientContainerService.start() and the stdin-attach bootstrap path
 // call process.wait() concurrently; whichever path runs will record the code
 // here so ContainerWaitRoute can return the real exit status.
+//
+// Records are also persisted as JSON under Apple Container's application-support
+// root (see `configure(storageDirectory:)`) because the runtime keeps no durable
+// exit state of its own: after a runtime restart every snapshot is rebuilt
+// stopped with no start date, and without the file each container that had
+// exited reported a clean 0 it never earned (issue #20). moby checkpoints the
+// same facts per container into containers/<id>/<id>.json and reloads them at
+// boot (daemon/container.go); this store is the equivalent for a runtime that
+// cannot supply them.
 actor ContainerExitCodeStore {
     static let shared = ContainerExitCodeStore()
 
-    private var codes: [String: Int32] = [:]
-    /// When each code was recorded. `docker ps` renders "Exited (7) 3 seconds ago" from the moment the
-    /// container *finished*; the snapshot only carries a start time, so reading that made a container
+    /// One recorded exit. `docker ps` renders "Exited (7) 3 seconds ago" from the
+    /// pair: the snapshot only carries a start time, so reading that made a container
     /// that ran for hours report its whole runtime as its age.
-    private var finishTimes: [String: Date] = [:]
+    private struct ExitRecord: Codable {
+        var code: Int32
+        var finishedAt: Date
+    }
+
+    private var records: [String: ExitRecord] = [:]
     private var waiters: [String: [CheckedContinuation<Int32, Never>]] = [:]
+    private var fileURL: URL?
+    private let log = Logger(label: "socktainer.container-exit-codes")
+
+    /// Loads exits recorded by earlier daemon lifetimes from `storageDirectory`
+    /// (Apple Container's application-support root), the arrangement
+    /// `RestartPolicyOverrideStore` uses. A missing file or undecodable contents
+    /// degrade to whatever is already held — a daemon that cannot remember an
+    /// exit must still boot, and those containers then read as `unknownExitCode`.
+    ///
+    /// Entries already held win over the file's: in production this runs once at
+    /// boot over an empty store, and the direction only matters so a repeated
+    /// call cannot discard live state.
+    func configure(storageDirectory: URL) {
+        let url = storageDirectory.appendingPathComponent("socktainer-container-exit-codes.json")
+        fileURL = url
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        do {
+            let loaded = try JSONDecoder().decode([String: ExitRecord].self, from: Data(contentsOf: url))
+            for (id, record) in loaded where records[id] == nil {
+                records[id] = record
+            }
+        } catch {
+            log.error("could not load container exit codes from \(url.path) — exits recorded by earlier runs read as unknown: \(error)")
+        }
+    }
 
     func set(id: String, code: Int32) {
-        codes[id] = code
-        finishTimes[id] = Date()
+        records[id] = ExitRecord(code: code, finishedAt: Date())
+        persist()
         // Resume anyone awaiting this container's exit code (e.g. the die-event observer),
         // delivering the authoritative recorded value rather than a timed-poll fallback.
         if let pending = waiters.removeValue(forKey: id) {
@@ -29,24 +67,50 @@ actor ContainerExitCodeStore {
     }
 
     func get(id: String) -> Int32? {
-        codes[id]
+        records[id]?.code
     }
 
     func remove(id: String) {
-        codes.removeValue(forKey: id)
-        finishTimes.removeValue(forKey: id)
+        guard records.removeValue(forKey: id) != nil else { return }
+        persist()
+    }
+
+    /// Re-keys a recorded exit, preserving the code and finish time exactly. A
+    /// rename here recreates the container under a new native name (and, without
+    /// a stored Docker id, a new derived one), but it is the same container to
+    /// the client — moby keeps `State` through a rename because the id does not
+    /// change — so the record must follow it rather than be dropped.
+    func moveRecord(from oldId: String, to newId: String) {
+        guard oldId != newId, let record = records.removeValue(forKey: oldId) else { return }
+        records[newId] = record
+        persist()
     }
 
     func finishTime(id: String) -> Date? {
-        finishTimes[id]
+        records[id]?.finishedAt
     }
+
+    /// The exit code to report for a container that finished running with no code on
+    /// record — it exited while this daemon was down, or before exits were persisted.
+    /// Docker's schema has no null `State.ExitCode` (moby marshals an int, zero-valued
+    /// at 0 — container/state.go), so "unknown" has to borrow a number:
+    ///
+    ///   - -1 lies outside the 0-255 a process exit status can carry, so it can never
+    ///     be read back as a code the container actually exited with;
+    ///   - it is non-zero, so a "did it succeed" check reads it as the failure the exit
+    ///     may well have been — reporting 0 here is what made a crashed service inspect
+    ///     as cleanly exited (issue #20).
+    ///
+    /// Same value as `waitFailureSentinel`, the in-lifetime variant of "could not
+    /// determine the code".
+    static let unknownExitCode: Int32 = -1
 
     /// Suspends until the exit code for `id` is recorded, returning the exact recorded value.
     /// If a code is already present it returns immediately. This avoids the grace-poll/`?? 0`
     /// race that `wait(condition:)` is subject to under load — the recorder calls `set(id:)`
     /// with the real code once the init process exits, which resumes the waiter deterministically.
     func waitForCode(id: String) async -> Int32 {
-        if let code = codes[id] { return code }
+        if let code = records[id]?.code { return code }
         return await withCheckedContinuation { continuation in
             waiters[id, default: []].append(continuation)
         }
@@ -81,6 +145,15 @@ actor ContainerExitCodeStore {
                 if attempt >= maxAttempts { return waitFailureSentinel }
                 if retryDelayNs > 0 { try? await Task.sleep(nanoseconds: retryDelayNs) }
             }
+        }
+    }
+
+    private func persist() {
+        guard let fileURL else { return }
+        do {
+            try JSONEncoder().encode(records).write(to: fileURL, options: .atomic)
+        } catch {
+            log.error("could not persist container exit codes to \(fileURL.path) — codes are in effect but will not survive a daemon restart: \(error)")
         }
     }
 }

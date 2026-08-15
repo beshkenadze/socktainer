@@ -41,6 +41,11 @@ extension ContainerDeleteRoute {
                 // Prevents a container recreated under the same name from inheriting this one's restart-attempt count.
                 await ContainerRestartState.shared.reset(id: eventName)
                 await RestartPolicyOverrideStore.shared.remove(id: eventId)
+                // The exit record is persisted and would otherwise outlive the container
+                // it belongs to — and the native-id key could then be inherited by a
+                // container later recreated under the same name.
+                await ContainerExitCodeStore.shared.remove(id: eventName)
+                await ContainerExitCodeStore.shared.remove(id: eventId)
                 // Releases this container's die-event bookkeeping and refuses later claims: an
                 // exit monitor still resolving the exit of a container that is now gone would
                 // otherwise find no record of the run and emit a `die` for it a second time.

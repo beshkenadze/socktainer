@@ -248,7 +248,7 @@ struct ContainerListAgeTests {
         ])
     func humanReadableAge(interval: Double, expected: String) {
         let past = Date(timeIntervalSinceNow: -interval)
-        #expect(ContainerListRoute.humanReadableAge(since: past) == expected)
+        #expect(MobyContainerStatus.humanReadableAge(since: past) == expected)
     }
 }
 
@@ -296,6 +296,97 @@ struct ContainerListCreatedStateTests {
                 let summaries = (try? JSONDecoder().decode([RESTContainerSummary].self, from: res.body)) ?? []
                 #expect(summaries.first?.State == "exited")
                 #expect(summaries.first?.Status.hasPrefix("Exited (3)") == true, "got: \(summaries.first?.Status ?? "nil")")
+            }
+        }
+    }
+}
+
+/// Issue #20 at the level it was visible: after a bridge restart, `docker ps -a` showed
+/// "Exited (0)" for every container that had exited under the previous lifetime — a failed
+/// service reading as a clean one. The exit store persists under Apple Container's
+/// application-support root and reloads at boot; a container that ran with no record at all
+/// reads as the unknown sentinel, never a fabricated 0.
+@Suite("ContainerListRoute — exit code durability", .serialized)
+struct ContainerListExitCodeDurabilityTests {
+
+    /// A run-history root mirroring the runtime's layout: a booted container owns a
+    /// `vminitd.log` under its own directory (see ContainerRunHistory).
+    private func makeRunHistoryRoot(bootedId: String) throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "list-exit-root-\(UUID().uuidString)")
+        let dir = root.appending(path: "containers").appending(path: bootedId)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data().write(to: dir.appending(path: "vminitd.log"))
+        return root
+    }
+
+    private func withListRoute(
+        containers: [ContainerSnapshot],
+        test: @escaping (Application) async throws -> Void
+    ) async throws {
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerListRoute(client: MockContainerClient(containers: containers)))
+            try await test(app)
+        }
+    }
+
+    @Test("an exit recorded before a restart renders after it")
+    func persistedExitSurvivesRestart() async throws {
+        // The runtime restart shape: booted once (boot artifacts on disk), start time gone.
+        let id = "durable-exit"
+        let root = try makeRunHistoryRoot(bootedId: id)
+        ContainerRunHistory.configure(storageDirectory: root)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let snapshot = makeSnapshot(id: id, status: .stopped, startedDate: nil)
+        let hexId = DockerContainerID.hexId(for: snapshot)
+
+        // The previous daemon lifetime records the exit, which persists it.
+        let storage = FileManager.default.temporaryDirectory
+            .appending(path: "list-exit-store-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let previousLifetime = ContainerExitCodeStore()
+        await previousLifetime.configure(storageDirectory: storage)
+        await previousLifetime.set(id: hexId, code: 42)
+
+        // This daemon boots from the file the previous one left.
+        await ContainerExitCodeStore.shared.configure(storageDirectory: storage)
+        defer { Task { await ContainerExitCodeStore.shared.remove(id: hexId) } }
+
+        try await withListRoute(containers: [snapshot]) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/json?all=true") { res async in
+                let summaries = (try? JSONDecoder().decode([RESTContainerSummary].self, from: res.body)) ?? []
+                let status = summaries.first?.Status ?? ""
+                #expect(summaries.first?.State == "exited")
+                // The age is wall-clock; the contract is the code and the shape.
+                #expect(status.hasPrefix("Exited (42) "), "got: \(status)")
+                #expect(status.hasSuffix(" ago"), "got: \(status)")
+            }
+        }
+    }
+
+    @Test("a container that ran with no record renders the unknown code, not a clean 0")
+    func ranWithoutRecordIsUnknown() async throws {
+        let id = "ran-unknown"
+        let root = try makeRunHistoryRoot(bootedId: id)
+        ContainerRunHistory.configure(storageDirectory: root)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let snapshot = makeSnapshot(id: id, status: .stopped, startedDate: nil)
+        await ContainerExitCodeStore.shared.remove(id: id)
+
+        try await withListRoute(containers: [snapshot]) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/json?all=true") { res async in
+                let summaries = (try? JSONDecoder().decode([RESTContainerSummary].self, from: res.body)) ?? []
+                #expect(summaries.first?.State == "exited")
+                // No record means unknown, not zero — and no finish was observed either,
+                // so there is no age to print.
+                #expect(summaries.first?.Status == "Exited (-1)", "got: \(summaries.first?.Status ?? "nil")")
             }
         }
     }

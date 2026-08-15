@@ -36,6 +36,7 @@ func configure(_ app: Application) async throws {
 
     let containerClient = ClientContainerService()
     await RestartPolicyOverrideStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
+    await ContainerExitCodeStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
     ContainerRunHistory.configure(storageDirectory: appleContainerAppSupportUrl)
     let imageClient = ClientImageService(containerSystemConfig: systemConfig)
     let healthCheckClient = ClientHealthCheckService()

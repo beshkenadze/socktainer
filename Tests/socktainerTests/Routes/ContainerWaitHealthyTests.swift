@@ -10,34 +10,34 @@ import VaporTesting
 
 // MARK: - humanReadableAge
 
-@Suite("ContainerListRoute.humanReadableAge")
+@Suite("MobyContainerStatus.humanReadableAge")
 struct HumanReadableAgeTests {
 
     @Test("Seconds: singular and plural")
     func seconds() {
-        #expect(ContainerListRoute.humanReadableAge(since: Date(timeIntervalSinceNow: -1)) == "1 second")
-        #expect(ContainerListRoute.humanReadableAge(since: Date(timeIntervalSinceNow: -30)) == "30 seconds")
-        #expect(ContainerListRoute.humanReadableAge(since: Date(timeIntervalSinceNow: -59)) == "59 seconds")
+        #expect(MobyContainerStatus.humanReadableAge(since: Date(timeIntervalSinceNow: -1)) == "1 second")
+        #expect(MobyContainerStatus.humanReadableAge(since: Date(timeIntervalSinceNow: -30)) == "30 seconds")
+        #expect(MobyContainerStatus.humanReadableAge(since: Date(timeIntervalSinceNow: -59)) == "59 seconds")
     }
 
     @Test("Minutes: singular and plural")
     func minutes() {
-        #expect(ContainerListRoute.humanReadableAge(since: Date(timeIntervalSinceNow: -60)) == "1 minute")
-        #expect(ContainerListRoute.humanReadableAge(since: Date(timeIntervalSinceNow: -120)) == "2 minutes")
-        #expect(ContainerListRoute.humanReadableAge(since: Date(timeIntervalSinceNow: -3599)) == "59 minutes")
+        #expect(MobyContainerStatus.humanReadableAge(since: Date(timeIntervalSinceNow: -60)) == "1 minute")
+        #expect(MobyContainerStatus.humanReadableAge(since: Date(timeIntervalSinceNow: -120)) == "2 minutes")
+        #expect(MobyContainerStatus.humanReadableAge(since: Date(timeIntervalSinceNow: -3599)) == "59 minutes")
     }
 
     @Test("Hours: singular and plural")
     func hours() {
-        #expect(ContainerListRoute.humanReadableAge(since: Date(timeIntervalSinceNow: -3600)) == "1 hour")
-        #expect(ContainerListRoute.humanReadableAge(since: Date(timeIntervalSinceNow: -7200)) == "2 hours")
-        #expect(ContainerListRoute.humanReadableAge(since: Date(timeIntervalSinceNow: -86399)) == "23 hours")
+        #expect(MobyContainerStatus.humanReadableAge(since: Date(timeIntervalSinceNow: -3600)) == "1 hour")
+        #expect(MobyContainerStatus.humanReadableAge(since: Date(timeIntervalSinceNow: -7200)) == "2 hours")
+        #expect(MobyContainerStatus.humanReadableAge(since: Date(timeIntervalSinceNow: -86399)) == "23 hours")
     }
 
     @Test("Days: singular and plural")
     func days() {
-        #expect(ContainerListRoute.humanReadableAge(since: Date(timeIntervalSinceNow: -86400)) == "1 day")
-        #expect(ContainerListRoute.humanReadableAge(since: Date(timeIntervalSinceNow: -172800)) == "2 days")
+        #expect(MobyContainerStatus.humanReadableAge(since: Date(timeIntervalSinceNow: -86400)) == "1 day")
+        #expect(MobyContainerStatus.humanReadableAge(since: Date(timeIntervalSinceNow: -172800)) == "2 days")
     }
 }
 

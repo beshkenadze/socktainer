@@ -228,7 +228,7 @@ extension SystemDFRoute {
             for container in containers {
                 group.addTask {
                     let size = try await diskUsageProvider.diskUsage(id: container.id)
-                    return containerSummary(from: container, size: Int64(clamping: size))
+                    return await containerSummary(from: container, size: Int64(clamping: size))
                 }
             }
 
@@ -284,7 +284,7 @@ extension SystemDFRoute {
         }
     }
 
-    fileprivate static func containerSummary(from container: ContainerSnapshot, size: Int64) -> RESTContainerSummary {
+    fileprivate static func containerSummary(from container: ContainerSnapshot, size: Int64) async -> RESTContainerSummary {
         let ports = container.configuration.publishedPorts.map { port in
             ContainerPort(
                 IP: port.hostAddress.description,
@@ -356,7 +356,12 @@ extension SystemDFRoute {
             SizeRootFs: size,
             Labels: LabelNormalization.restore(container.configuration.labels),
             State: container.mobyStateString,
-            Status: container.mobyStateString,
+            // dockerd renders the same status string the list shows — measured on
+            // Docker 29.4.0: /system/df's Containers[].Status is "Exited (42) 2
+            // seconds ago", not the bare state — because both surfaces share
+            // daemon/list.go's getContainerSummary. Ours shares
+            // MobyContainerStatus.statusString(for:) for the same reason.
+            Status: await MobyContainerStatus.statusString(for: container),
             HostConfig: ContainerHostConfig(NetworkMode: networkMode, Annotations: nil),
             NetworkSettings: ContainerNetworkSummary(Networks: networkSettings.isEmpty ? nil : networkSettings),
             Mounts: mounts,

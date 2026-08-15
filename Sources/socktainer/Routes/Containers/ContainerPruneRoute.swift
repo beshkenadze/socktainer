@@ -38,6 +38,15 @@ extension ContainerPruneRoute {
             }
 
             let result = try await client.prune(filters: parsedFilters)
+            // Pruned containers are gone for good; their persisted exit records must
+            // not linger in the file — the native-id key could otherwise be inherited
+            // by a container later created under the same name.
+            for containerID in result.deletedContainers {
+                await ContainerExitCodeStore.shared.remove(id: containerID)
+                if let snapshot = snapshotByID[containerID] {
+                    await ContainerExitCodeStore.shared.remove(id: DockerContainerID.hexId(for: snapshot))
+                }
+            }
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
                 // moby fires a `destroy` per removed container before the aggregate prune.
                 for containerID in result.deletedContainers {

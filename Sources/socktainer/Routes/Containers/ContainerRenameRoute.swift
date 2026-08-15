@@ -203,10 +203,12 @@ struct ContainerRenameRoute: RouteCollection {
         // reuse; leaving it running makes the new container inherit the retired one's probe.
         await req.application.storage[HealthCheckManagerKey.self]?.stop(containerId: previous.id)
 
-        // The exit code is filed under both ids. The name-keyed entry is scrubbed by every start
-        // path, but the id-keyed one is only cleaned by the delete *route*, which a rename bypasses
-        // by deleting through the client — so it would linger for the life of the daemon.
-        await ContainerExitCodeStore.shared.remove(id: retiredHexId)
+        // The exit code follows the container across the rename like the override below: a rename
+        // only applies to a stopped container, so the record is final, real knowledge `docker ps`
+        // renders for the recreated container moments later — dropping it made the renamed
+        // container read as a clean exit it never had. The native entry must move because the
+        // name changed; the id-keyed one moves below when a derived id changed with the recreate.
+        await ContainerExitCodeStore.shared.moveRecord(from: previous.id, to: newName)
 
         // `previous.id` is the name being freed, and in Compose's recreate that is the *canonical*
         // service name — Compose renames the old container aside and gives the replacement the name
@@ -236,6 +238,11 @@ struct ContainerRenameRoute: RouteCollection {
                 await RestartPolicyOverrideStore.shared.set(id: renamedHexId, policy: override)
                 await RestartPolicyOverrideStore.shared.remove(id: retiredHexId)
             }
+            // The exit record is filed under the Docker id the same way, and moves for the
+            // same reason. The delete this route performed bypassed the delete route's
+            // cleanup, so an unmoved record would live on in the persisted file under an
+            // id nothing answers to again.
+            await ContainerExitCodeStore.shared.moveRecord(from: retiredHexId, to: renamedHexId)
         }
         await ContainerInfoCache.shared.set(
             hexId: renamedHexId,
