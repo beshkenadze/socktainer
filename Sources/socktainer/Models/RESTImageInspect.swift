@@ -1,7 +1,7 @@
 import Vapor
 
 extension KeyedEncodingContainer {
-    fileprivate mutating func encodeNullable<T: Encodable>(_ value: T?, forKey key: Key) throws {
+    mutating func encodeNullable<T: Encodable>(_ value: T?, forKey key: Key) throws {
         if let value {
             try encode(value, forKey: key)
         } else {
