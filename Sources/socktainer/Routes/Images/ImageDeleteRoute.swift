@@ -21,6 +21,13 @@ extension ImageDeleteRoute {
                 throw Abort(.badRequest, reason: "Missing image name parameter")
             }
 
+            // A name that cannot be a reference is a client error, not a missing image: moby parses
+            // before it looks anything up (daemon/images/image.go GetImage), so `docker rmi 'Ü·x'`
+            // is told the name is malformed instead of being sent away to retry a lookup.
+            if let reason = DockerReference.invalidReason(for: imageRef) {
+                throw Abort(.badRequest, reason: reason)
+            }
+
             let result: ImageDeletionResult
             do {
                 result = try await client.delete(id: imageRef)

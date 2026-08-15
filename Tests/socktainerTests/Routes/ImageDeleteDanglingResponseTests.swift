@@ -39,14 +39,18 @@ struct ImageDeleteDanglingResponseTests {
 
     @Test("Deleting a pull-by-digest image keeps its Untagged record (not dangling)")
     func digestRefKeepsUntagged() async throws {
+        // A real sha256 digest, 64 hex characters: the route now parses the reference before the
+        // lookup, and a short digest is malformed to moby too (`digest.Parse` checks the algorithm's
+        // length), so a truncated fixture would exercise the 400 path instead of this one.
+        let digest = "sha256:ddd4440000000000000000000000000000000000000000000000000000000000"
         let result = ImageDeletionResult(
-            untagged: "docker.io/library/alpine@sha256:ddd444",
-            digest: "sha256:ddd444",
-            deletedDigest: "sha256:ddd444"
+            untagged: "docker.io/library/alpine@\(digest)",
+            digest: digest,
+            deletedDigest: digest
         )
 
-        let items = try await Self.deleteImage(result: result, ref: "alpine@sha256:ddd444")
-        #expect(items.compactMap(\.Untagged) == ["docker.io/library/alpine@sha256:ddd444"])
+        let items = try await Self.deleteImage(result: result, ref: "alpine@\(digest)")
+        #expect(items.compactMap(\.Untagged) == ["docker.io/library/alpine@\(digest)"])
     }
 
     @Test("Deleting a tagged image still returns Untagged (and Deleted when layers are freed)")

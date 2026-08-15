@@ -36,6 +36,15 @@ extension ImagePushRoute {
                 throw Abort(.badRequest, reason: "Missing image name parameter")
             }
 
+            // moby parses the reference before pushing
+            // (api/server/router/image/image_routes.go postImagesPush →
+            // reference.ParseNormalizedNamed → errdefs.InvalidParameter). Without
+            // this, Apple's unanchored parser accepts garbage and the runtime
+            // rejects it much later as a 500.
+            if let reason = DockerReference.invalidReason(for: imageName) {
+                throw Abort(.badRequest, reason: reason)
+            }
+
             let query = try req.query.decode(RESTImagePushQuery.self)
 
             let reference = try resolvedReference(imageName: imageName, tag: query.tag)

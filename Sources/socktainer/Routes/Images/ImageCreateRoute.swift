@@ -29,6 +29,14 @@ extension ImageCreateRoute {
                 return try await handleImport(req, query: query, client: client)
             }
 
+            // `docker pull 'Ü·x'` reached the puller and surfaced as 500 "Something went wrong.",
+            // telling the client the daemon broke rather than that the name is not a reference.
+            // moby validates first (api/server/router/image/image_routes.go postImagesCreate →
+            // reference.ParseNormalizedNamed) and answers 400.
+            if let reason = DockerReference.invalidReason(for: image) {
+                throw Abort(.badRequest, reason: reason)
+            }
+
             let tag = query.tag ?? ""
             let decodedTag = tag.removingPercentEncoding ?? tag
             let platformString = query.platform

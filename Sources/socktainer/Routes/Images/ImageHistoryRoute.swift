@@ -125,6 +125,14 @@ extension ImageHistoryRoute {
                 throw Abort(.badRequest, reason: "Missing image name parameter")
             }
 
+            // moby parses the reference before the store lookup
+            // (daemon/images/image.go GetImage → reference.ParseAnyReference →
+            // errdefs.InvalidParameter), so an unparseable name is a 400, not a
+            // "not found" that tells the client an absent image exists.
+            if let reason = DockerReference.invalidReason(for: refOrId) {
+                throw Abort(.badRequest, reason: reason)
+            }
+
             let query = try req.query.decode(RESTImageHistoryQuery.self)
             let preferredPlatform: Platform?
             if let platformString = query.platform, !platformString.isEmpty {
