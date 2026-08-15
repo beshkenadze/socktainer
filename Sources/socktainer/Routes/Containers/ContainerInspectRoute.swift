@@ -45,6 +45,16 @@ extension ContainerInspectRoute {
         )
     }
 
+    /// dockerd's NetworkMode names the network the container runs on. Live
+    /// attachments are the running truth; a stopped container falls back to
+    /// its persisted configuration; a container with no network at all is
+    /// "none" — moby's string for `--network none`.
+    private static func networkMode(for container: ContainerSnapshot) -> String {
+        container.networks.first?.network
+            ?? container.configuration.networks.first?.network
+            ?? "none"
+    }
+
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> RESTContainerInspect {
         { req in
             guard let id = req.parameters.get("id") else {
@@ -152,24 +162,47 @@ extension ContainerInspectRoute {
                 )
             }
 
-            // dockerd reports the same published bindings under both
-            // `HostConfig.PortBindings` and `NetworkSettings.Ports`.
-            let portBindings = Dictionary(
-                grouping: container.configuration.publishedPorts,
-                by: { "\($0.containerPort)/\($0.proto.rawValue)" }
-            ).mapValues { bindings in
-                bindings.map { PortBinding(HostIp: $0.hostAddress.description, HostPort: "\($0.hostPort)") }
-            }
+            // Real values where the runtime knows them (issue #17); the
+            // remaining HostConfig keys encode as moby's zero defaults.
+            // `memoryInBytes`/`cpus` are the limits Apple Container actually
+            // enforces (its defaults apply when the request omitted them);
+            // `shmSize` was defaulted at create time to Docker's 64 MiB.
+            let hostConfig = HostConfig(
+                restartPolicy: restartPolicy,
+                portBindings: portBindings,
+                memory: Int(clamping: container.configuration.resources.memoryInBytes),
+                nanoCpus: container.configuration.resources.cpus * 1_000_000_000,
+                shmSize: container.configuration.shmSize.map { Int(clamping: $0) },
+                capAdd: container.configuration.capAdd.isEmpty ? nil : container.configuration.capAdd,
+                capDrop: container.configuration.capDrop.isEmpty ? nil : container.configuration.capDrop,
+                readonlyRootfs: container.configuration.readOnly,
+                networkMode: Self.networkMode(for: container),
+                runtime: container.configuration.runtimeHandler,
+                dnsSearch: container.configuration.dns.flatMap { $0.searchDomains.isEmpty ? nil : $0.searchDomains },
+                dnsOptions: container.configuration.dns.flatMap { $0.options.isEmpty ? nil : $0.options },
+                maskedPaths: container.configuration.maskedPaths,
+                readonlyPaths: container.configuration.readonlyPaths
+            )
 
-            let hostConfig: HostConfig = HostConfig(restartPolicy: restartPolicy, portBindings: portBindings)
-
-            // Enhanced network settings with proper port mapping
+            // Enhanced network settings with proper port mapping. The
+            // deprecated DefaultNetworkSettings block mirrors the endpoint of
+            // the container's first live network, like dockerd does; a stopped
+            // container has no live attachment and the encoder emits "" / 0.
             let networkEndpoints = Self.networkEndpoints(for: container)
+            let primaryEndpoint = container.networks.first.map(ContainerEndpointSettings.live)
             let networkSettings = ContainerNetworkSettings(
                 Bridge: nil,
                 SandboxID: nil,
                 Ports: portBindings,
                 SandboxKey: nil,
+                EndpointID: primaryEndpoint?.EndpointID,
+                Gateway: primaryEndpoint?.Gateway,
+                GlobalIPv6Address: primaryEndpoint?.GlobalIPv6Address,
+                GlobalIPv6PrefixLen: primaryEndpoint?.GlobalIPv6PrefixLen,
+                IPAddress: primaryEndpoint?.IPAddress,
+                IPPrefixLen: primaryEndpoint?.IPPrefixLen,
+                IPv6Gateway: primaryEndpoint?.IPv6Gateway,
+                MacAddress: primaryEndpoint?.MacAddress,
                 Networks: networkEndpoints,
                 EndpointsConfig: networkEndpoints
             )

@@ -16,7 +16,7 @@ struct VolumeInspectRoute: RouteCollection {
             return try await volume.encodeResponse(for: req)
         } catch {
             if VolumeNotFound.matches(error) {
-                throw Abort(.notFound, reason: "Volume not found: \(name)")
+                throw Abort(.notFound, reason: "get \(name): no such volume")
             }
             throw Abort(.internalServerError, reason: "Failed to inspect volume: \(error)")
         }
