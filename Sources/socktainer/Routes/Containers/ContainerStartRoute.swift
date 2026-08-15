@@ -37,6 +37,24 @@ extension ContainerStartRoute {
                 throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
             }
 
+
+            // A start that already failed inside POST /attach reports here. docker's
+            // CLI attaches before it starts (docker/cli cli/command/container/run.go)
+            // and discards any attach answer that is not 101 unread (moby
+            // client/hijack.go), so /start is the only request whose error body an
+            // attached `docker run` can still render. Replaying the recorded failure
+            // also avoids re-bootstrapping a container whose first bootstrap already
+            // failed (issue #19).
+            if let failedContainer = preStartSnapshot,
+                let failure = await StartFailureLedger.shared.take(id: failedContainer.id)
+            {
+                await ContainerStartRoute.cleanupFailedAutoRemove(
+                    container: failedContainer,
+                    client: client,
+                    req: req
+                )
+                throw Abort(failure.status, reason: failure.message)
+            }
             let runEpoch: Int
             do {
                 guard let container = preStartSnapshot else {
@@ -63,16 +81,25 @@ extension ContainerStartRoute {
                     req.logger.debug("Started container \(id)")
                 }
 
-            } catch {
-                // Check if error indicates container is already running/bootstrapped
-                let errorMessage = error.localizedDescription
-                let isAlreadyRunning =
-                    errorMessage.contains("booted") || errorMessage.contains("expected to be in created state") || errorMessage.contains("invalidState")
-                    || errorMessage.contains("already running")
-
                 guard isAlreadyRunning else {
                     req.logger.error("Failed to start container \(id): \(error)")
-                    throw Abort(.internalServerError, reason: "Failed to start container: \(error)")
+                    // moby classifies the runtime's start error into both the /start
+                    // response status and the exit code recorded in the container's
+                    // State (daemon/errors.go setExitCodeFromError): 400/127 for a
+                    // command the container cannot run, 400/126 for a permission
+                    // failure, 500/128 otherwise. The message keeps the runtime's
+                    // reason verbatim so it names the executable, and carries the
+                    // errno phrase docker/cli's toStatusError greps for.
+                    let failure = ContainerStartFailure.classify("Failed to start container: \(errorMessage)")
+                    if let failedContainer = preStartSnapshot {
+                        await ContainerExitCodeStore.shared.set(id: failedContainer.id, code: failure.exitCode)
+                        await ContainerStartRoute.cleanupFailedAutoRemove(
+                            container: failedContainer,
+                            client: client,
+                            req: req
+                        )
+                    }
+                    throw Abort(failure.status, reason: failure.message)
                 }
                 req.logger.debug("Container \(id) was already running or bootstrapped")
                 // Started by whoever won the race — the attach path — so join its run.

@@ -16,13 +16,33 @@ private struct ContainerAttachQuery: Content {
 }
 
 struct ContainerAttachRoute: RouteCollection {
+    /// How the stopped-container attach path starts the container: the runtime call
+    /// to bootstrap it, and how long to wait before declaring the start failed.
+    /// Injectable as a test seam — the start-failure contract (issue #19) has to be
+    /// exercisable without the Apple Container runtime.
+    struct StartAttempt: Sendable {
+        var bootstrap: @Sendable (_ id: String, _ stdio: [FileHandle?]) async throws -> ClientProcess =
+            { id, stdio in try await ContainerClient().bootstrap(id: id, stdio: stdio) }
+
+        /// Normal starts take ~1s. The bound exists for the pathological wedge
+        /// (issue #19: a client sat attached for 29 minutes on a container that had
+        /// long exited) and stays inside the usual `timeout 90` acceptance probe, so
+        /// a wedged runtime surfaces as an error rather than a hang.
+        var deadlineNs: UInt64 = 60_000_000_000
+    }
+
     let client: ClientContainerProtocol
+    let start: StartAttempt
+
+    init(client: ClientContainerProtocol, start: StartAttempt = StartAttempt()) {
+        self.client = client
+        self.start = start
+    }
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/attach", use: ContainerAttachRoute.handler(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/attach", use: ContainerAttachRoute.handler(client: client, start: start))
     }
 }
-
 extension ContainerAttachRoute {
     /// Builds the container event emitted when `docker run --rm` triggers Apple Container's
     /// auto-removal: no DELETE arrives, so ContainerDeleteRoute never fires and this path
@@ -60,7 +80,7 @@ extension ContainerAttachRoute {
         await broadcaster.broadcast(DockerEvent.containerEvent("detach", container: container))
     }
 
-    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
+    static func handler(client: ClientContainerProtocol, start: StartAttempt) -> @Sendable (Request) async throws -> Response {
         { req in
             // TODO: This should be refactored to some generic implementation that is shared
             //       with /containers/{id}/exec route.
@@ -68,7 +88,7 @@ extension ContainerAttachRoute {
             let upgradeHeader = req.headers.first(name: "Upgrade")?.lowercased()
             let shouldUpgradeToTCP = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp"
 
-            let response = try await handleAttachRequest(req: req, client: client)
+            let response = try await handleAttachRequest(req: req, client: client, start: start)
 
             // If client requested upgrade and handler returned OK,
             // convert to 101 Switching Protocols
@@ -88,7 +108,7 @@ extension ContainerAttachRoute {
         }
     }
 
-    private static func handleAttachRequest(req: Request, client: ClientContainerProtocol) async throws -> Response {
+    private static func handleAttachRequest(req: Request, client: ClientContainerProtocol, start: StartAttempt) async throws -> Response {
         guard let id = req.parameters.get("id") else {
             throw Abort(.badRequest, reason: "Missing container ID")
         }
@@ -148,7 +168,8 @@ extension ContainerAttachRoute {
                     query: query,
                     isTTY: isTTY,
                     isUpgrade: isUpgrade,
-                    hasConnectionUpgrade: hasConnectionUpgrade
+                    hasConnectionUpgrade: hasConnectionUpgrade,
+                    start: start
                 )
             }
             // stdin=true (docker run -it): full bidirectional pipe approach via TCP upgrade.
@@ -162,7 +183,8 @@ extension ContainerAttachRoute {
                 query: query,
                 isUpgrade: isUpgrade,
                 hasConnectionUpgrade: hasConnectionUpgrade,
-                isTTY: isTTY
+                isTTY: isTTY,
+                start: start
             )
         }
 
@@ -282,6 +304,68 @@ extension ContainerAttachRoute {
         )
     }
 
+    /// Turns a failed container start inside the attach route into moby's outcome
+    /// (issue #19). docker's client can never render an attach answer that is not
+    /// 101 — moby closes the body unread and reports "unable to upgrade to tcp,
+    /// received 500" (client/hijack.go) — and it attaches *before* POST /start
+    /// (docker/cli cli/command/container/run.go), so the failure must be delivered
+    /// by /start. Records the classified failure for /start to replay and the mapped
+    /// exit code so a parallel /wait resolves, then answers 101 with an immediately
+    /// terminated stream for upgrade clients. Non-upgrade clients get the plain,
+    /// renderable HTTP error — their attach is an ordinary request.
+    ///
+    /// A benign start race (someone else is starting this container) records
+    /// nothing: the container's real outcome is reported by whoever is starting it,
+    /// and this attach still terminates instead of streaming pipes that will never
+    /// carry data.
+    private static func respondToFailedStart(
+        container: ContainerSnapshot,
+        reason: String,
+        isUpgrade: Bool,
+        hasConnectionUpgrade: Bool,
+        isTTY: Bool,
+        benignRace: Bool
+    ) async throws -> Response {
+        if benignRace {
+            guard isUpgrade && hasConnectionUpgrade else {
+                throw Abort(.conflict, reason: "Container is already starting")
+            }
+            return immediateEndUpgradeResponse(isTTY: isTTY)
+        }
+
+        let failure = ContainerStartFailure.classify(reason)
+        await ContainerExitCodeStore.shared.set(id: container.id, code: failure.exitCode)
+        await StartFailureLedger.shared.record(id: container.id, failure: failure)
+
+        guard isUpgrade && hasConnectionUpgrade else {
+            throw Abort(failure.status, reason: failure.message)
+        }
+        return immediateEndUpgradeResponse(isTTY: isTTY)
+    }
+
+    /// The attach answer for a start that will never produce output: the 101 a
+    /// hijacked client requires, followed by an immediate stream end, so the client
+    /// moves on to POST /start instead of waiting on an open stream — issue #19's
+    /// client sat attached for 29 minutes on a container that had long exited.
+    private static func immediateEndUpgradeResponse(isTTY: Bool) -> Response {
+        var headers = HTTPHeaders()
+        headers.add(
+            name: "Content-Type",
+            value: isTTY ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream"
+        )
+        headers.add(name: "Connection", value: "Upgrade")
+        headers.add(name: "Upgrade", value: "tcp")
+
+        let body = Response.Body { writer in
+            Task.detached {
+                // An empty buffer flushes the 101 head before .end closes the stream.
+                _ = writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
+                _ = writer.write(.end)
+            }
+        }
+        return Response(status: .switchingProtocols, headers: headers, body: body)
+    }
+
     // Output-only attach for stopped containers (docker run without -i, issue #220).
     // Uses pipes instead of log-file polling to eliminate the race for fast-exiting containers.
     private static func attachStoppedOutputOnly(
@@ -291,7 +375,8 @@ extension ContainerAttachRoute {
         query: ContainerAttachQuery,
         isTTY: Bool,
         isUpgrade: Bool,
-        hasConnectionUpgrade: Bool
+        hasConnectionUpgrade: Bool,
+        start: StartAttempt
     ) async throws -> Response {
         let attachStdout = query.stdout ?? true
         let stderrOnly = (query.stderr ?? false) && !(query.stdout ?? false)
@@ -316,23 +401,42 @@ extension ContainerAttachRoute {
 
         await ContainerExitCodeStore.shared.remove(id: container.id)
 
+        // One budget for bootstrap and start: the client must always end up with
+        // either a streaming attach or a terminated one, never an open connection
+        // waiting on a runtime that stopped answering (issue #19's 29-minute hang).
+        let startDeadline = ContinuousClock().now + .nanoseconds(Int(start.deadlineNs))
+
         let process: ClientProcess
         do {
-            process = try await ContainerClient().bootstrap(id: container.id, stdio: pipes.stdioArray)
+            process = try await withDeadline(until: startDeadline) {
+                try await start.bootstrap(container.id, pipes.stdioArray)
+            }
         } catch {
             pipes.closeAll()
-            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
-            throw Abort(.internalServerError, reason: "Failed to bootstrap container: \(error.localizedDescription)")
+            return try await respondToFailedStart(
+                container: container,
+                reason: "Failed to start container: \(error.localizedDescription)",
+                isUpgrade: isUpgrade,
+                hasConnectionUpgrade: hasConnectionUpgrade,
+                isTTY: isTTY,
+                benignRace: isBenignStartRace(error)
+            )
         }
 
         do {
-            try await process.start()
-        } catch {
-            if !isBenignStartRace(error) {
-                pipes.closeAfterHandoff()
-                await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
-                throw Abort(.internalServerError, reason: "Failed to start container: \(error.localizedDescription)")
+            try await withDeadline(until: startDeadline) {
+                try await process.start()
             }
+        } catch {
+            pipes.closeAfterHandoff()
+            return try await respondToFailedStart(
+                container: container,
+                reason: "Failed to start container: \(error.localizedDescription)",
+                isUpgrade: isUpgrade,
+                hasConnectionUpgrade: hasConnectionUpgrade,
+                isTTY: isTTY,
+                benignRace: isBenignStartRace(error)
+            )
         }
 
         // The container is executing now: open a run so this exit's `die` is claimable.
@@ -421,7 +525,8 @@ extension ContainerAttachRoute {
         query: ContainerAttachQuery,
         isUpgrade: Bool,
         hasConnectionUpgrade: Bool,
-        isTTY: Bool
+        isTTY: Bool,
+        start: StartAttempt
     ) async throws -> Response {
 
         let connectionHeader = req.headers.first(name: "Connection")?.lowercased()
@@ -447,7 +552,8 @@ extension ContainerAttachRoute {
             container: currentContainer,
             query: query,
             shouldUpgrade: shouldUpgrade,
-            isTTY: isTTY
+            isTTY: isTTY,
+            start: start
         )
     }
 
@@ -459,7 +565,8 @@ extension ContainerAttachRoute {
         container: ContainerSnapshot,
         query: ContainerAttachQuery,
         shouldUpgrade: Bool,
-        isTTY: Bool
+        isTTY: Bool,
+        start: StartAttempt
     ) async throws -> Response {
 
         let attachStdout = query.stdout ?? true
@@ -478,31 +585,44 @@ extension ContainerAttachRoute {
 
         // Mirror ClientContainerService.start()'s exit-code contract: /wait returns
         // as soon as ContainerExitCodeStore is non-nil, so clear any stale code
-        // before starting and record a synthetic one if bootstrap/start fails (so
-        // /wait can't return a stale status or poll forever).
+        // before starting and record the classified code if bootstrap/start fails
+        // (so /wait can't return a stale status or poll forever).
         await ContainerExitCodeStore.shared.remove(id: container.id)
+
+        // One budget for bootstrap and start — see attachStoppedOutputOnly.
+        let startDeadline = ContinuousClock().now + .nanoseconds(Int(start.deadlineNs))
 
         let process: ClientProcess
         do {
-            process = try await ContainerClient().bootstrap(id: container.id, stdio: pipes.stdioArray)
+            process = try await withDeadline(until: startDeadline) {
+                try await start.bootstrap(container.id, pipes.stdioArray)
+            }
         } catch {
             pipes.closeAll()
-            if isBenignStartRace(error) {
-                throw Abort(.conflict, reason: "Container is already starting")
-            }
-            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
-            throw Abort(.internalServerError, reason: "Failed to bootstrap container: \(error.localizedDescription)")
+            return try await respondToFailedStart(
+                container: container,
+                reason: "Failed to start container: \(error.localizedDescription)",
+                isUpgrade: shouldUpgrade,
+                hasConnectionUpgrade: shouldUpgrade,
+                isTTY: isTTY,
+                benignRace: isBenignStartRace(error)
+            )
         }
 
         do {
-            try await process.start()
+            try await withDeadline(until: startDeadline) {
+                try await process.start()
+            }
         } catch {
             pipes.closeAfterHandoff()
-            if isBenignStartRace(error) {
-                throw Abort(.conflict, reason: "Container is already starting")
-            }
-            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
-            throw Abort(.internalServerError, reason: "Failed to start main process: \(error.localizedDescription)")
+            return try await respondToFailedStart(
+                container: container,
+                reason: "Failed to start container: \(error.localizedDescription)",
+                isUpgrade: shouldUpgrade,
+                hasConnectionUpgrade: shouldUpgrade,
+                isTTY: isTTY,
+                benignRace: isBenignStartRace(error)
+            )
         }
 
         // Executing now: open a run so this exit's `die` is claimable exactly once.
