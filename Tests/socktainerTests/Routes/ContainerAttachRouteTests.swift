@@ -17,32 +17,75 @@ import VaporTesting
 /// These tests cover the parameter validation paths that ARE unit-testable.
 @Suite("ContainerAttachRoute — parameter validation")
 struct ContainerAttachRouteTests {
-
     @Test("Container not found returns 404")
     func unknownContainerReturns404() async throws {
         try await withAttachRouteApp(client: NullContainerMock()) { app in
             try await app.testing().test(
                 .POST,
-                "/v1.51/containers/nonexistent/attach?stream=1&stdout=1"
+                "/v1.51/containers/nonexistent/attach"
             ) { res async in
                 #expect(res.status == .notFound)
+                #expect(res.body.string.contains("No such container: nonexistent"))
             }
         }
     }
-
     @Test("Attach without stream=1 or logs=1 returns 400")
     func noStreamOrLogsReturns400() async throws {
-        try await withAttachRouteApp(client: NullContainerMock()) { app in
-            // No stream or logs param → should be rejected before even looking up container
+        // A known container must be resolved first so clients receive 404 only after
+        // resolution (or 400 only when container exists and request is otherwise invalid).
+        try await withAttachRouteApp(client: FoundContainerMock(status: .running)) { app in
             try await app.testing().test(
                 .POST,
                 "/v1.51/containers/test-ctr/attach"
             ) { res async in
                 #expect(res.status == .badRequest)
+                #expect(res.body.string.contains("Either the stream or logs parameter must be true"))
             }
         }
     }
 }
+private struct FoundContainerMock: ClientContainerProtocol {
+    let status: RuntimeStatus
+
+    func getContainer(id: String) async throws -> ContainerSnapshot? {
+        let processConfig = ProcessConfiguration(
+            executable: "/bin/sh", arguments: [], environment: [],
+            terminal: false, user: .id(uid: 0, gid: 0)
+        )
+        let imageDesc = ImageDescription(
+            reference: "alpine:latest",
+            descriptor: Descriptor(
+                mediaType: "application/vnd.oci.image.index.v1+json",
+                digest: "sha256:abc",
+                size: 0)
+        )
+        let config = ContainerConfiguration(
+            id: id,
+            image: imageDesc,
+            process: processConfig
+        )
+        return ContainerSnapshot(
+            configuration: config,
+            status: status,
+            networks: [],
+            startedDate: Date(timeIntervalSinceNow: -10))
+    }
+
+    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { [] }
+    func enforceContainerRunning(container: ContainerSnapshot) throws {}
+    func start(id: String, detachKeys: String?) async throws {}
+    func stop(id: String, signal: String?, timeout: Int?) async throws {}
+    func restart(id: String, signal: String?, timeout: Int?) async throws {}
+    func kill(id: String, signal: String?) async throws {}
+    func delete(id: String) async throws {}
+    func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait {
+        RESTContainerWait(statusCode: 0)
+    }
+    func prune(filters: [String: [String]]) async throws -> (
+        deletedContainers: [String], spaceReclaimed: Int64
+    ) { ([], 0) }
+}
+
 
 // MARK: - Helpers
 

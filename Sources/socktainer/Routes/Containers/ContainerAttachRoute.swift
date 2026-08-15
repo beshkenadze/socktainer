@@ -95,6 +95,13 @@ extension ContainerAttachRoute {
 
         let query = try req.query.decode(ContainerAttachQuery.self)
 
+        guard let container = try await client.getContainer(id: id) else {
+            throw Abort(.notFound, reason: "No such container: \(id)")
+        }
+
+        // Moby resolves the target container before attach stream validation (moby
+        // api/server/router/container/container_routes.go + daemon/attach.go @ v28.5.2),
+        // so unknown containers are reported as 404 even when stream/logs are false.
         let logs = query.logs ?? false
         let stream = query.stream ?? false
         let stdin = query.stdin ?? false
@@ -113,12 +120,6 @@ extension ContainerAttachRoute {
         guard stdout || stderr || (!stdout && !stderr) else {
             throw Abort(.badRequest, reason: "At least one of stdout or stderr must be true")
         }
-
-        guard let container = try await client.getContainer(id: id) else {
-            throw Abort(.notFound, reason: "No such container: \(id)")
-        }
-
-        // hijack connection
         let isUpgrade = req.headers.contains(where: { $0.name.lowercased() == "upgrade" && $0.value.lowercased() == "tcp" })
         let hasConnectionUpgrade = req.headers.contains(where: { $0.name.lowercased() == "connection" && $0.value.lowercased().contains("upgrade") })
 

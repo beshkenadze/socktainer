@@ -117,8 +117,11 @@ extension ContainerListRoute {
 
                 let createdTimestamp = AppleContainerTimestampResolver.unixTimestampSeconds(createdDate)
 
+                // Build human-readable status matching Docker's "Up X seconds/minutes/hours" format.
+                // Docker reports exited containers as "Exited (<code>) <age> ago",
+                // preserving the exit code and age for quick triage without inspect.
+                // Reference: https://raw.githubusercontent.com/moby/moby/v28.5.2/container/state.go
                 let mobyState = container.status.mobyState
-                // Build human-readable status matching Docker's "Up X seconds/minutes/hours" format
                 let baseStatus: String
                 switch container.status {
                 case .running:
@@ -128,7 +131,12 @@ extension ContainerListRoute {
                         baseStatus = "Up"
                     }
                 case .stopped:
-                    baseStatus = "Exited"
+                    let exitCode = await Self.exitCode(for: container)
+                    if let stopped = container.startedDate {
+                        baseStatus = "Exited (\(exitCode)) \(Self.humanReadableAge(since: stopped)) ago"
+                    } else {
+                        baseStatus = "Exited (\(exitCode))"
+                    }
                 default:
                     baseStatus = mobyState
                 }
@@ -141,6 +149,7 @@ extension ContainerListRoute {
                 } else {
                     statusStr = baseStatus
                 }
+
 
                 let summary = RESTContainerSummary(
                     Id: DockerContainerID.hexId(for: container),
@@ -167,11 +176,19 @@ extension ContainerListRoute {
         }
     }
 
-    /// Returns a human-readable duration string matching Docker's "Up X seconds/minutes/hours/days" format.
+    static func exitCode(for container: ContainerSnapshot) async -> Int32 {
+        let hexId = DockerContainerID.hexId(for: container)
+        let nativeCode = await ContainerExitCodeStore.shared.get(id: container.id)
+        let hexCode = await ContainerExitCodeStore.shared.get(id: hexId)
+        return nativeCode ?? hexCode ?? 0
+    }
+
+    /// Returns a human-readable duration string matching Docker's "Up X seconds/minutes/hours" format.
     static func humanReadableAge(since date: Date) -> String {
-        let seconds = max(0, Int(-date.timeIntervalSinceNow))
-        if seconds < 60 { return "\(seconds) second\(seconds == 1 ? "" : "s")" }
-        let minutes = seconds / 60
+        let elapsedSeconds = max(0, Int(-date.timeIntervalSinceNow))
+        if elapsedSeconds < 1 { return "Less than a second" }
+        if elapsedSeconds < 60 { return "\(elapsedSeconds) second\(elapsedSeconds == 1 ? "" : "s")" }
+        let minutes = elapsedSeconds / 60
         if minutes < 60 { return "\(minutes) minute\(minutes == 1 ? "" : "s")" }
         let hours = minutes / 60
         if hours < 24 { return "\(hours) hour\(hours == 1 ? "" : "s")" }
