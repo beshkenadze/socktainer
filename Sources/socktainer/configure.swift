@@ -7,7 +7,9 @@ struct AppleContainerAppSupportUrlKey: StorageKey {
     typealias Value = URL
 }
 
-func configure(_ app: Application) async throws {
+/// `location` says where this instance serves and which runtime data root it reads; the default is
+/// the machine's usual one, so a plain `configure(app)` behaves as it always did.
+func configure(_ app: Application, location: RuntimeLocation? = nil) async throws {
 
     // Docker container-create payloads (large env / config — e.g. Supabase's
     // edge-runtime + storage-api) exceed Vapor's 16 KB default collected-body
@@ -19,9 +21,9 @@ func configure(_ app: Application) async throws {
     // outermost so it wraps all routing/error handling. See DockerErrorMiddleware.
     app.middleware.use(DockerErrorMiddleware(), at: .beginning)
 
-    // Define app support path early since it's needed by multiple services
-    let folderPath = ("\(NSHomeDirectory())/Library/Application Support/com.apple.container")
-    let appleContainerAppSupportUrl = URL(fileURLWithPath: folderPath)
+    // Every service that reads the runtime's data hangs off this root. It is Apple Container's own
+    // default unless the caller pointed this instance at another one.
+    let appleContainerAppSupportUrl = location?.appRoot ?? RuntimeLocation.defaultAppRoot()
 
     let systemConfig: ContainerSystemConfig
     do {
@@ -246,10 +248,16 @@ func configure(_ app: Application) async throws {
     // as orphaned networks accumulate and eventually breaks container-to-container
     // routing (EHOSTUNREACH).
     let housekeepingLogger = app.logger
-    let housekeepingFinished = await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
-        await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
-        await OrphanedNetworkReaper.reap(networkClient: ClientNetworkService(), logger: housekeepingLogger)
-    }
+    // Only the instance serving the machine's usual socket sweeps: the reaper deletes every network
+    // with no containers on it, and a second bridge started beside the first would take away the
+    // networks it is holding open for a compose project mid-`up`.
+    let housekeepingFinished =
+        (location?.hasCustomSocket ?? false)
+        ? true
+        : await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
+            await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
+            await OrphanedNetworkReaper.reap(networkClient: ClientNetworkService(), logger: housekeepingLogger)
+        }
     if !housekeepingFinished {
         app.logger.warning(
             "[startup] DNS-sidecar adoption / orphaned-network reaping did not finish within 30s — continuing startup without it. The container runtime may be unhealthy (see apple/container#1884)."

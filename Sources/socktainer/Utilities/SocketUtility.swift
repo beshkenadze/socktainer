@@ -13,13 +13,10 @@ func containerSocketPath(homeDirectory: String) -> String {
     "\(socketDirectory(homeDirectory: homeDirectory))/container.sock"
 }
 
-public func prepareUnixSocket(for app: Application, homeDirectory: String? = nil) throws {
-    guard let homeDir = homeDirectory else {
-        throw UnixSocketError.missingHomeDirectory
-    }
-
-    let socketDirectory = socketDirectory(homeDirectory: homeDir)
-    let socketPath = containerSocketPath(homeDirectory: homeDir)
+/// Serves on exactly this path. The directory around it is locked to its owner: the socket itself is
+/// world-writable so guest processes can reach it through the docker.sock relay.
+public func prepareUnixSocket(for app: Application, at socketPath: String) throws {
+    let socketDirectory = (socketPath as NSString).deletingLastPathComponent
 
     try restrictDirectoryToOwner(at: socketDirectory)
 
@@ -30,6 +27,13 @@ public func prepareUnixSocket(for app: Application, homeDirectory: String? = nil
     app.http.server.configuration.hostname = ""
     app.http.server.configuration.port = 0
     app.http.server.configuration.address = .unixDomainSocket(path: socketPath)
+}
+
+public func prepareUnixSocket(for app: Application, homeDirectory: String? = nil) throws {
+    guard let homeDir = homeDirectory else {
+        throw UnixSocketError.missingHomeDirectory
+    }
+    try prepareUnixSocket(for: app, at: containerSocketPath(homeDirectory: homeDir))
 }
 
 /// The docker.sock relay mirrors this socket's mode onto the root-owned guest-side socket
