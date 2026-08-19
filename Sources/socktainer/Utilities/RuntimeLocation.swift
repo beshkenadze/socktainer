@@ -5,7 +5,7 @@ import Foundation
 /// Both used to be derived from the home directory with no way to say otherwise, which made two
 /// things impossible. A runtime started on a throwaway root (`container system start --app-root`)
 /// could not be paired with a bridge, because `NSHomeDirectory()` ignores `$HOME` — measured: with
-/// `HOME=/tmp/fake-home` it still answers `/Users/akira` — so the bridge kept reading the real root
+/// `HOME=/tmp/fake-home` it still answers the login home — so the bridge kept reading the real root
 /// while the daemon wrote elsewhere. And two bridges could not coexist on one machine, which is why
 /// work on this project could not be verified live while someone else was using the runtime.
 struct RuntimeLocation: Sendable {

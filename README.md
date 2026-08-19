@@ -42,6 +42,12 @@ Socktainer is a CLI/daemon that exposes a **Docker-compatible REST API** on top 
 
 It allows common Docker clients (like the Docker CLI) to interact with local containers on macOS using the Docker API surface 🐳💻.
 
+This tree is a fork of [socktainer/socktainer](https://github.com/socktainer/socktainer)
+used by [ContainerStack](https://github.com/beshkenadze/ContainerStack). Homebrew and
+GitHub Releases below still point at upstream; build this checkout for the extra
+Docker-API work (`--app-root`, `--socket`, and the rest of `git log upstream/main..HEAD`).
+
+
 [**Podman Desktop Apple Container extension**](https://github.com/podman-desktop/extension-apple-container) uses socktainer to visualize Apple containers/images in [Podman Desktop](https://podman-desktop.io/).
 
 ---
@@ -167,7 +173,16 @@ Download from socktainer [releases](https://github.com/socktainer/socktainer/rel
 
 ## Usage 🚀
 
-Refer to **Quick Start** above for immediate usage examples.
+```bash
+./socktainer
+./socktainer --app-root /path/to/runtime --socket /tmp/scratch.sock
+```
+
+`--app-root` must match `container system start --app-root`. `NSHomeDirectory()`
+ignores `$HOME`, so a throwaway runtime is invisible unless this flag is set.
+`--socket` starts a second instance and leaves the shared `socktainer` Docker
+context pointing at the machine's usual socket.
+
 
 ### Volume sync mode
 
@@ -362,7 +377,7 @@ Ownership rules:
 - Running third-party container workloads carries inherent risks. Review sandboxing and container configurations 🔒
 - Docker API compatibility is **partial**, focused on commonly used endpoints. See `Sources/socktainer/Routes/` for implemented routes
 - Private registry auth currently depends on Apple `container` behavior. If login succeeds but private pulls/builds still fail, a manual workaround may be required. See [apple/container#816 comment 3534438608](https://github.com/apple/container/issues/816#issuecomment-3534438608) and [comment 3503618765](https://github.com/apple/container/issues/816#issuecomment-3503618765).
-- `docker run --privileged` is **not supported** — Apple Container has no privileged mode. Use granular `--cap-add` / `--cap-drop` (and `--read-only`, `--sysctl`) instead; `--privileged` is currently ignored rather than granting all capabilities.
+- `docker run --privileged` has no Apple Container equivalent (no device passthrough, no unconfined seccomp). The flag grants the runtime's full capability set (`ALL`) — what BuildKit needs for its bind mount — and is not ignored.
 - `docker run --cpus` is honored, but Apple Container allocates a **whole vCPU count** to each container's VM rather than throttling a shared kernel's CFS quota. A fractional value is floored to the nearest whole core (minimum 1) — e.g. `--cpus=1.5` gets 1 vCPU, `--cpus=0.5` still gets 1. `--cpu-shares` (relative weighting) and `--cpu-period`/`--cpu-quota` have no equivalent and are not applied.
 - Bind-mounting `/var/run/docker.sock` (e.g. `-v /var/run/docker.sock:/var/run/docker.sock`, used by tools like Supabase's `vector` log collector) is **transparently relayed** to socktainer's own Docker-compatible API, rather than dropped. This matches Docker's own behavior for the same bind mount, and carries the same well-known risk: **any container that requests this mount gets full control of every other container socktainer manages**, not just itself — the same exposure Docker itself has always had with this idiom, not something new to socktainer. This scales with the number of containers that request the mount, since each gets its own fully-privileged, independent connection.
 - `docker export` streams the container's root filesystem; exporting a running container yields a volatile snapshot, same as Docker. One visible difference: the tar contains **no `/.dockerenv`** — Docker's daemon fabricates that file inside every container at start, Apple Container does not. Tools that probe `/.dockerenv` to detect "am I inside a container" won't find it in filesystems exported from socktainer.
