@@ -43,4 +43,37 @@ struct StartupHousekeepingTests {
         }
         #expect(finished == true)
     }
+
+    @Test("enabled housekeeping runs work and preserves bounded result")
+    func enabledRunsWorkAndPreservesResult() async throws {
+        let finished = await StartupHousekeeping.run(enabled: true, timeout: Duration.milliseconds(20)) {
+            try? await Task.sleep(for: Duration.milliseconds(60))
+        }
+
+        #expect(finished == false)
+    }
+
+    @Test("disabled housekeeping does not run work and succeeds")
+    func disabledSkipsWorkAndSucceeds() async throws {
+        actor InvocationCounter {
+            private var count = 0
+
+            func increment() {
+                count += 1
+            }
+
+            func value() -> Int {
+                count
+            }
+        }
+
+        let counter = InvocationCounter()
+        let finished = await StartupHousekeeping.run(enabled: false, timeout: Duration.milliseconds(20)) {
+            await counter.increment()
+            try? await Task.sleep(for: Duration.milliseconds(60))
+        }
+
+        #expect(finished == true)
+        #expect(await counter.value() == 0)
+    }
 }

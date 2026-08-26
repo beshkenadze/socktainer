@@ -14,6 +14,11 @@ import Foundation
 /// resources the daemon needs) so startup can proceed and bind the API socket;
 /// the alternative is a daemon that never comes up at all.
 enum StartupHousekeeping {
+    static func run(enabled: Bool, timeout: Duration, _ work: @escaping @Sendable () async -> Void) async -> Bool {
+        guard enabled else { return true }
+        return await runBounded(timeout: timeout, work)
+    }
+
     /// Runs `work`, returning `true` if it finished within `timeout` and
     /// `false` if it was abandoned at the deadline.
     static func runBounded(timeout: Duration, _ work: @escaping @Sendable () async -> Void) async -> Bool {
