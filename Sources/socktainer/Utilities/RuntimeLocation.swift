@@ -22,6 +22,10 @@ struct RuntimeLocation: Sendable {
         URL(fileURLWithPath: "\(NSHomeDirectory())/Library/Application Support/com.apple.container")
     }
 
+    static func defaultSocketPath() -> String {
+        containerSocketPath(homeDirectory: NSHomeDirectory())
+    }
+
     init(appRootOption: String?, socketOption: String?, homeDirectory: String?) throws {
         if let appRootOption, !appRootOption.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             appRoot = URL(fileURLWithPath: (appRootOption as NSString).expandingTildeInPath).standardizedFileURL

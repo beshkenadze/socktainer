@@ -12,9 +12,24 @@ import Vapor
 struct ContainerCreateRoute: RouteCollection {
     let client: ClientContainerProtocol
     let systemConfig: ContainerSystemConfig
+    let controlSocketPath: String
+
+    init(client: ClientContainerProtocol, systemConfig: ContainerSystemConfig, controlSocketPath: String) {
+        self.client = client
+        self.systemConfig = systemConfig
+        self.controlSocketPath = controlSocketPath
+    }
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/containers/create", use: ContainerCreateRoute.handler(client: client, systemConfig: systemConfig))
+        try routes.registerVersionedRoute(
+            .POST,
+            pattern: "/containers/create",
+            use: ContainerCreateRoute.handler(
+                client: client,
+                systemConfig: systemConfig,
+                controlSocketPath: controlSocketPath
+            )
+        )
     }
 
 }
@@ -55,7 +70,7 @@ struct CreateContainerRequest: Content {
 }
 
 extension ContainerCreateRoute {
-    static func handler(client: ClientContainerProtocol, systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> Response {
+    static func handler(client: ClientContainerProtocol, systemConfig: ContainerSystemConfig, controlSocketPath: String) -> @Sendable (Request) async throws -> Response {
         { req in
             let query = try req.query.decode(ContainerCreateQuery.self)
 
@@ -118,7 +133,7 @@ extension ContainerCreateRoute {
             for mount in body.HostConfig?.Mounts ?? [] where mount.MountType.lowercased() == "bind" {
                 dockerSockCandidates.append((source: mount.Source, target: mount.Target))
             }
-            let dockerSockRelay = DockerSocketRelay.detect(candidates: dockerSockCandidates)
+            let dockerSockRelay = DockerSocketRelay.detect(candidates: dockerSockCandidates, controlSocketPath: controlSocketPath)
             let hostBinds =
                 dockerSockRelay == nil
                 ? body.HostConfig?.Binds
@@ -649,11 +664,7 @@ extension ContainerCreateRoute {
             }
 
             if let dockerSockRelay {
-                if let controlSocketPath = DockerSocketRelay.controlSocketPath(homeDirectory: ProcessInfo.processInfo.environment["HOME"]) {
-                    resolvedMounts.append(.virtiofs(source: controlSocketPath, destination: dockerSockRelay.guestPath, options: []))
-                } else {
-                    req.logger.warning("[docker-sock] relay requested for \(dockerSockRelay.guestPath) but $HOME is unavailable — mount skipped")
-                }
+                resolvedMounts.append(.virtiofs(source: dockerSockRelay.sourcePath, destination: dockerSockRelay.guestPath, options: []))
             }
 
             containerConfiguration.mounts = resolvedMounts

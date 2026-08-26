@@ -19,6 +19,7 @@ enum DockerSocketRelay {
 
     struct Match: Equatable {
         let guestPath: String
+        let sourcePath: String
     }
 
     /// Exact match: this always checks the *guest* destination, and the guest is a Linux
@@ -30,8 +31,10 @@ enum DockerSocketRelay {
         path == hostDockerSocketPath
     }
 
-    static func detect(candidates: [(source: String, target: String)]) -> Match? {
-        candidates.first { isDockerSocketPath($0.target) }.map { Match(guestPath: $0.target) }
+    static func detect(candidates: [(source: String, target: String)], controlSocketPath: String) -> Match? {
+        candidates.first { isDockerSocketPath($0.target) }.map { candidate in
+            Match(guestPath: candidate.target, sourcePath: controlSocketPath)
+        }
     }
 
     /// Splits a Docker `Binds` entry (`source:target[:mode]`) into its source and target.
@@ -39,11 +42,5 @@ enum DockerSocketRelay {
         let parts = bind.split(separator: ":").map(String.init)
         guard parts.count >= 2 else { return nil }
         return (source: parts[0], target: parts[1])
-    }
-
-    /// Mirrors the path `SocketUtility.prepareUnixSocket` binds the server to.
-    static func controlSocketPath(homeDirectory: String?) -> String? {
-        guard let homeDirectory else { return nil }
-        return "\(homeDirectory)/.socktainer/container.sock"
     }
 }

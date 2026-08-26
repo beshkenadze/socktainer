@@ -10,6 +10,8 @@ import VaporTesting
 
 @testable import socktainer
 
+private let testControlSocketPath = "/Users/test/.containerstack/docker.sock"
+
 /// Asserts a create request got past input validation to the pre-flight image stage.
 ///
 /// The create handler checks image existence right after validation. The test
@@ -56,7 +58,7 @@ struct ContainerCreateRouteTests {
         let payload = #"{"Image":"socktainer-nonexistent-test-image:missing","Labels":{"pad":"\#(padding)"}}"#
         #expect(payload.utf8.count > 16_384)
 
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing(method: .running(hostname: "127.0.0.1", port: 0)).test(
                 .POST, "/v1.51/containers/create?name=body-size-probe",
                 headers: ["Content-Type": "application/json"],
@@ -77,7 +79,7 @@ struct ContainerCreateRouteTests {
         // it does not make collection unbounded. A 413 here can only come from
         // honoring the 1 KB cap.
         let payload = String(repeating: "A", count: 4_096)
-        try await withCreateRouteApp(maxBodySize: "1kb") { app in
+        try await withCreateRouteApp(maxBodySize: "1kb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing(method: .running(hostname: "127.0.0.1", port: 0)).test(
                 .POST, "/v1.51/containers/create?name=over-cap",
                 headers: ["Content-Type": "application/json"],
@@ -90,7 +92,7 @@ struct ContainerCreateRouteTests {
 
     @Test("an empty POST body returns 400, not a crash")
     func emptyBodyIsBadRequest() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(.POST, "/v1.51/containers/create?name=empty") { res async in
                 #expect(res.status == .badRequest)
             }
@@ -99,7 +101,7 @@ struct ContainerCreateRouteTests {
 
     @Test("a malformed JSON body returns 400, not 500")
     func malformedBodyIsBadRequest() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=bad",
                 headers: ["Content-Type": "application/json"],
@@ -196,6 +198,7 @@ struct PeerHostnameRewriteTests {
 
 private func withCreateRouteApp(
     maxBodySize: ByteCount,
+    controlSocketPath: String,
     test: @escaping (Application) async throws -> Void
 ) async throws {
     try await withApp(configure: { app in
@@ -208,7 +211,13 @@ private func withCreateRouteApp(
         let regexRouter = app.regexRouter(with: app.logger)
         app.setRegexRouter(regexRouter)
         regexRouter.installMiddleware(on: app)
-        try app.register(collection: ContainerCreateRoute(client: NoopContainerClient(), systemConfig: ContainerSystemConfig()))
+        try app.register(
+            collection: ContainerCreateRoute(
+                client: NoopContainerClient(),
+                systemConfig: ContainerSystemConfig(),
+                controlSocketPath: controlSocketPath
+            )
+        )
         try await test(app)
     }
 }
@@ -263,7 +272,7 @@ struct StopSignalValidationTests {
 
     @Test("An invalid StopSignal is rejected with 400 before any image work")
     func invalidStopSignalReturns400() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=bad-signal",
                 headers: ["Content-Type": "application/json"],
@@ -276,7 +285,7 @@ struct StopSignalValidationTests {
 
     @Test("A valid StopSignal passes validation, failing later only at the image check")
     func validStopSignalPassesValidation() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=good-signal",
                 headers: ["Content-Type": "application/json"],
@@ -344,7 +353,7 @@ struct ShmSizeValidationTests {
 
     @Test("A negative ShmSize is rejected with 400 before any image work")
     func negativeShmSizeReturns400() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=bad-shm",
                 headers: ["Content-Type": "application/json"],
@@ -361,7 +370,7 @@ struct CapabilityValidationTests {
 
     @Test("An unknown capability is rejected with 400 before any image work")
     func unknownCapReturns400() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=bad-cap",
                 headers: ["Content-Type": "application/json"],
@@ -374,7 +383,7 @@ struct CapabilityValidationTests {
 
     @Test("Known capabilities pass validation, failing later only at the image check")
     func knownCapsPassValidation() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=good-cap",
                 headers: ["Content-Type": "application/json"],
@@ -388,7 +397,7 @@ struct CapabilityValidationTests {
 
     @Test("The special ALL capability is accepted, matching moby's --cap-add=ALL")
     func allCapabilityPassesValidation() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=all-cap",
                 headers: ["Content-Type": "application/json"],
@@ -443,7 +452,7 @@ struct PrivilegedCapAddTests {
 
     @Test("A privileged create request reaches the image stage instead of being rejected")
     func privilegedCreateRequestReachesImageStage() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=privileged",
                 headers: ["Content-Type": "application/json"],
@@ -532,7 +541,7 @@ struct CpuLimitRouteValidationTests {
 
     @Test("Conflicting NanoCpus and CpuPeriod are rejected with 400 before any image work")
     func conflictingCpuOptionsReturn400() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=bad-cpu",
                 headers: ["Content-Type": "application/json"],
@@ -545,7 +554,7 @@ struct CpuLimitRouteValidationTests {
 
     @Test("A negative CpuShares is rejected with 400 before any image work")
     func negativeCpuSharesReturns400() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=bad-shares",
                 headers: ["Content-Type": "application/json"],
@@ -558,7 +567,7 @@ struct CpuLimitRouteValidationTests {
 
     @Test("A valid NanoCpus passes validation, failing later only at the image check")
     func validNanoCpusPassesValidation() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=good-cpu",
                 headers: ["Content-Type": "application/json"],
@@ -573,9 +582,24 @@ struct CpuLimitRouteValidationTests {
 @Suite("ContainerCreateRoute — docker.sock relay")
 struct DockerSocketRelayRouteTests {
 
+    @Test("Route construction accepts an explicit control socket path")
+    func routeConstructionAcceptsExplicitControlSocket() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=vector-explicit-socket",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(
+                    string: #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"Binds":["/Users/test/.containerstack/docker.sock:/var/run/docker.sock:ro"]}}"#
+                )
+            ) { res async in
+                expectReachedImageStage(res)
+            }
+        }
+    }
+
     @Test("A docker.sock bind via Binds doesn't break request handling, failing later only at the image check")
     func dockerSockBindViaBindsPassesThrough() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=vector",
                 headers: ["Content-Type": "application/json"],
@@ -590,7 +614,7 @@ struct DockerSocketRelayRouteTests {
 
     @Test("A docker.sock bind via Mounts doesn't break request handling, failing later only at the image check")
     func dockerSockBindViaMountsPassesThrough() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=vector-mounts",
                 headers: ["Content-Type": "application/json"],
@@ -607,7 +631,7 @@ struct DockerSocketRelayRouteTests {
     @Test("A docker-context-aware client's bind (arbitrary source, canonical destination) doesn't break request handling")
     func dockerContextAwareBindPassesThrough() async throws {
         // Mirrors supabase-cli's actual bind (internal/start/start.go): active context's socket as source.
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=vector-context-aware",
                 headers: ["Content-Type": "application/json"],
@@ -651,7 +675,7 @@ struct RestartPolicyValidationTests {
 
     @Test("An unknown restart policy name is rejected with 400 before any image work")
     func unknownPolicyNameReturns400() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=bad-restart",
                 headers: ["Content-Type": "application/json"],
@@ -664,7 +688,7 @@ struct RestartPolicyValidationTests {
 
     @Test("Combining AutoRemove with a restart policy is rejected with 400, matching moby")
     func autoRemoveWithRestartPolicyReturns400() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=bad-rm-restart",
                 headers: ["Content-Type": "application/json"],
@@ -677,7 +701,7 @@ struct RestartPolicyValidationTests {
 
     @Test("A valid restart policy passes validation, failing later only at the image check")
     func validPolicyPassesValidation() async throws {
-        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+        try await withCreateRouteApp(maxBodySize: "64mb", controlSocketPath: testControlSocketPath) { app in
             try await app.testing().test(
                 .POST, "/v1.51/containers/create?name=good-restart",
                 headers: ["Content-Type": "application/json"],

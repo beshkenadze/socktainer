@@ -74,7 +74,13 @@ func configure(
     try app.register(collection: ContainerAttachRoute(client: containerClient))
     try app.register(collection: ContainerAttachWSRoute(client: containerClient))
     try app.register(collection: ContainerChangesRoute())
-    try app.register(collection: ContainerCreateRoute(client: containerClient, systemConfig: systemConfig))
+    try app.register(
+        collection: ContainerCreateRoute(
+            client: containerClient,
+            systemConfig: systemConfig,
+            controlSocketPath: location?.socketPath ?? RuntimeLocation.defaultSocketPath()
+        )
+    )
     try app.register(collection: ContainerDeleteRoute(client: containerClient))
     try app.register(collection: ContainerExportRoute(containerClient: containerClient, archiveClient: archiveClient))
     try app.register(collection: ContainerInspectRoute(client: containerClient))
