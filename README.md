@@ -176,12 +176,15 @@ Download from socktainer [releases](https://github.com/socktainer/socktainer/rel
 ```bash
 ./socktainer
 ./socktainer --app-root /path/to/runtime --socket /tmp/scratch.sock
+./socktainer --socket /tmp/secondary.sock --no-startup-housekeeping
 ```
 
 `--app-root` must match `container system start --app-root`. `NSHomeDirectory()`
 ignores `$HOME`, so a throwaway runtime is invisible unless this flag is set.
 `--socket` starts a second instance and leaves the shared `socktainer` Docker
-context pointing at the machine's usual socket.
+context pointing at the machine's usual socket. Startup housekeeping remains
+enabled for custom sockets; pass `--no-startup-housekeeping` only when another
+bridge owns DNS-sidecar adoption and orphaned-network reaping for the runtime.
 
 
 ### Volume sync mode
