@@ -9,7 +9,11 @@ struct AppleContainerAppSupportUrlKey: StorageKey {
 
 /// `location` says where this instance serves and which runtime data root it reads; the default is
 /// the machine's usual one, so a plain `configure(app)` behaves as it always did.
-func configure(_ app: Application, location: RuntimeLocation? = nil) async throws {
+func configure(
+    _ app: Application,
+    location: RuntimeLocation? = nil,
+    performsStartupHousekeeping: Bool = true
+) async throws {
 
     // Docker container-create payloads (large env / config — e.g. Supabase's
     // edge-runtime + storage-api) exceed Vapor's 16 KB default collected-body
@@ -248,16 +252,10 @@ func configure(_ app: Application, location: RuntimeLocation? = nil) async throw
     // as orphaned networks accumulate and eventually breaks container-to-container
     // routing (EHOSTUNREACH).
     let housekeepingLogger = app.logger
-    // Only the instance serving the machine's usual socket sweeps: the reaper deletes every network
-    // with no containers on it, and a second bridge started beside the first would take away the
-    // networks it is holding open for a compose project mid-`up`.
-    let housekeepingFinished =
-        (location?.hasCustomSocket ?? false)
-        ? true
-        : await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
-            await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
-            await OrphanedNetworkReaper.reap(networkClient: ClientNetworkService(), logger: housekeepingLogger)
-        }
+    let housekeepingFinished = await StartupHousekeeping.run(enabled: performsStartupHousekeeping, timeout: .seconds(30)) {
+        await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
+        await OrphanedNetworkReaper.reap(networkClient: ClientNetworkService(), logger: housekeepingLogger)
+    }
     if !housekeepingFinished {
         app.logger.warning(
             "[startup] DNS-sidecar adoption / orphaned-network reaping did not finish within 30s — continuing startup without it. The container runtime may be unhealthy (see apple/container#1884)."

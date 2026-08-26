@@ -15,6 +15,9 @@ struct CLIOptions: ParsableArguments {
     @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Create or update the 'socktainer' Docker context on startup")
     var dockerContext: Bool = true
 
+    @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Run startup housekeeping (DNS-sidecar adoption and orphaned-network reaping) on this bridge. Disable only when another process owns the runtime's startup maintenance.")
+    var startupHousekeeping: Bool = true
+
     @ArgumentParser.Option(
         name: .long,
         help:
@@ -73,7 +76,7 @@ if options.dockerContext, !runtimeLocation.hasCustomSocket,
     DockerContextSetup.install(homeDirectory: homeDir)
 }
 app.storage[VolumeSyncModeKey.self] = Filesystem.SyncMode.resolve(from: options.volumeSync)
-try await configure(app, location: runtimeLocation)
+try await configure(app, location: runtimeLocation, performsStartupHousekeeping: options.startupHousekeeping)
 
 // Start the app
 try await app.startup()
