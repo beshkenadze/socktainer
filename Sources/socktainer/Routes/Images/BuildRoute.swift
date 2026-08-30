@@ -444,6 +444,8 @@ extension BuildRoute {
             buildArgs: buildArgs,
             // TODO: Implement secrets once integration with buildkit materializes
             secrets: [:],
+            // Upstream enables agent forwarding only on the literal "default"; "" is its own no-op.
+            ssh: "",
             contextDir: contextDir,
             dockerfile: dockerfileData,
             dockerignore: nil,

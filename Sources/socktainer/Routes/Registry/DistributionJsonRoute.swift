@@ -54,7 +54,11 @@ struct RegistryDistributionProvider: DistributionInspectProviding {
     }
 
     private func registryClient(server: String, authentication: Authentication?) throws -> RegistryClient {
-        let scheme = try RequestScheme.auto.schemeFor(host: server, internalDnsDomain: containerSystemConfig.dns.domain)
+        // 1.3.0 removed `RequestScheme.auto`, and deleted `isInternalHost` with it rather than
+        // renaming it: the host-shaped downgrade to http is gone upstream, not moved. https is the
+        // new default, and it is the one Docker uses too, where plain http needs an explicit
+        // insecure-registry opt-in. `schemeFor` is kept for its empty-host check.
+        let scheme = try RequestScheme.https.schemeFor(host: server, internalDnsDomain: containerSystemConfig.dns.domain)
         guard let url = URL(string: "\(scheme.rawValue)://\(server)"), let host = url.host else {
             throw Abort(.badRequest, reason: "invalid registry host: \(server)")
         }
@@ -149,6 +153,11 @@ struct DistributionJsonRoute: RouteCollection {
             default:
                 return Abort(.internalServerError, reason: String(describing: error))
             }
+        // The registry asked for the credentials in a way that could hand them to a third party,
+        // and the client refused. The upstream misbehaved, so this is 502 rather than a 4xx that
+        // would read as the caller's mistake.
+        case .insecureCredentialExchange(let message):
+            return Abort(.badGateway, reason: "refusing insecure credential exchange for \(reference): \(message)")
         }
     }
 }

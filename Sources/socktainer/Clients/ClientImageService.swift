@@ -372,7 +372,8 @@ struct ClientImageService: ClientImageProtocol {
                 do {
                     try await image.push(
                         platform: effectivePlatform,
-                        scheme: .auto,
+                        // `.auto` is gone in 1.3.0; https is upstream's replacement default.
+                        scheme: .https,
                         containerSystemConfig: containerSystemConfig,
                         progressUpdate: { progressEvents in
                             for event in progressEvents {
