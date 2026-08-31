@@ -150,6 +150,31 @@ struct OCILayoutPrunerTests {
         #expect(rewrittenIndex.manifests.map(\.digest) == [intact.digest])
     }
 
+    /// The pruner resolves a blob by the algorithm in its digest, so a layout addressed by
+    /// something other than sha256 is a shape it was built to handle. containerization
+    /// validates digests at decode and accepts sha256 alone, and a JSON array decodes all or
+    /// nothing - so without care one such entry loses every image beside it.
+    @Test("an entry addressed by another algorithm does not take its siblings down")
+    func foreignAlgorithmEntryIsSkippedNotFatal() throws {
+        let layout = try LayoutFixture()
+        defer { layout.cleanUp() }
+
+        let intact = try layout.writePresentManifest(platform: Platform(arch: "arm64", os: "linux"))
+        let foreign = Descriptor(
+            mediaType: MediaTypes.imageManifest,
+            digest: "sha512:" + String(repeating: "a", count: 128),
+            size: 8
+        )
+        let indexDescriptor = try layout.writeIndexBlob(manifests: [foreign, intact], annotations: nil)
+        try layout.writeTopIndex(manifests: [indexDescriptor])
+
+        try OCILayoutPruner.pruneManifestsWithMissingBlobs(at: layout.root, logger: Logger(label: "test"))
+
+        let top = try layout.readTopIndex()
+        let rewritten = try layout.readIndexBlob(digest: top.manifests[0].digest)
+        #expect(rewritten.manifests.map(\.digest) == [intact.digest])
+    }
+
     @Test("a manifest-typed descriptor whose blob is really an index is dropped")
     func typeConfusedDescriptorIsDropped() throws {
         let layout = try LayoutFixture()

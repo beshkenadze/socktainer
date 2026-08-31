@@ -25,7 +25,8 @@ enum OCILayoutPruner {
 
     static func pruneManifestsWithMissingBlobs(at layout: URL, logger: Logger) throws {
         let indexURL = layout.appendingPathComponent("index.json")
-        var index = try JSONDecoder().decode(Index.self, from: Data(contentsOf: indexURL))
+        let decoded = try decodeIndexSkippingUnreadableEntries(Data(contentsOf: indexURL))
+        var index = decoded.index
         let originalDigests = index.manifests.map(\.digest)
 
         let cache = PruneCache()
@@ -34,7 +35,7 @@ enum OCILayoutPruner {
         guard !index.manifests.isEmpty else {
             throw PruneError.nothingLoadable
         }
-        if index.manifests.map(\.digest) != originalDigests {
+        if index.manifests.map(\.digest) != originalDigests || decoded.dropped > 0 {
             try JSONEncoder().encode(index).write(to: indexURL)
         }
     }
@@ -73,14 +74,15 @@ enum OCILayoutPruner {
                 return complete ? descriptor : nil
             }
             if isIndex(descriptor.mediaType) {
-                guard var childIndex = try? JSONDecoder().decode(Index.self, from: Data(contentsOf: blobURL(descriptor.digest, in: layout))) else {
+                guard let decodedChild = try? decodeIndexSkippingUnreadableEntries(Data(contentsOf: blobURL(descriptor.digest, in: layout))) else {
                     return nil
                 }
+                var childIndex = decodedChild.index
                 let pruned = try childIndex.manifests.compactMap {
                     try prunedDescriptor($0, in: layout, depth: depth + 1, visiting: visiting.union([descriptor.digest]), cache: cache, logger: logger)
                 }
                 guard !pruned.isEmpty else { return nil }
-                guard pruned.map(\.digest) != childIndex.manifests.map(\.digest) else { return descriptor }
+                guard pruned.map(\.digest) != childIndex.manifests.map(\.digest) || decodedChild.dropped > 0 else { return descriptor }
                 childIndex.manifests = pruned
                 return try rewrittenIndex(childIndex, keeping: descriptor, in: layout, logger: logger)
             }
@@ -131,6 +133,55 @@ enum OCILayoutPruner {
     /// Digests come from attacker-suppliable tarball JSON and are spliced into
     /// filesystem paths — anything but `algorithm:hex` addressing a regular file is
     /// treated as absent (a digest-named directory is not a blob).
+    /// Decodes an index, dropping only the entries this containerization refuses to parse.
+    ///
+    /// `Descriptor` validates its digest since containerization 0.42.0, and a JSON array
+    /// decodes all or nothing: one entry naming an algorithm the store does not use, or
+    /// carrying a traversing digest, would otherwise take every sibling manifest down with
+    /// it and leave a tarball of good images unloadable. Upstream's check still does its
+    /// work here - a rejected digest never reaches a filesystem path - it just stops short
+    /// of the siblings.
+    private static func decodeIndexSkippingUnreadableEntries(_ data: Data) throws -> DecodedIndex {
+        struct LenientIndex: Decodable {
+            struct Entry: Decodable {
+                let descriptor: Descriptor?
+
+                init(from decoder: any Decoder) throws {
+                    descriptor = try? Descriptor(from: decoder)
+                }
+            }
+
+            let schemaVersion: Int
+            let mediaType: String?
+            let manifests: [Entry]
+            let annotations: [String: String]?
+            let subject: Entry?
+            let artifactType: String?
+        }
+
+        let lenient = try JSONDecoder().decode(LenientIndex.self, from: data)
+        let kept = lenient.manifests.compactMap(\.descriptor)
+        return DecodedIndex(
+            index: Index(
+                schemaVersion: lenient.schemaVersion,
+                mediaType: lenient.mediaType ?? "",
+                manifests: kept,
+                annotations: lenient.annotations,
+                subject: lenient.subject?.descriptor,
+                artifactType: lenient.artifactType
+            ),
+            dropped: lenient.manifests.count - kept.count
+        )
+    }
+
+    /// An index and how many entries were unreadable. The count matters: a caller that
+    /// compared only the surviving digests would see no change and leave the original blob
+    /// on disk, entries and all, for the loader to choke on later.
+    private struct DecodedIndex {
+        let index: Index
+        let dropped: Int
+    }
+
     private static func blobExists(_ digest: String, in layout: URL) -> Bool {
         guard isWellFormedDigest(digest) else { return false }
         var isDirectory: ObjCBool = false
