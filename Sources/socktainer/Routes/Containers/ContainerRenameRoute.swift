@@ -12,6 +12,7 @@ import Vapor
 /// - the writable layer: files written inside the container outside a mount are gone; volumes and
 ///   bind mounts are unaffected, since they live outside the container;
 /// - the previous run's logs and exit code;
+/// - a subtree network alias below the old hostname, since the hostname follows the new name;
 /// - the Docker id: recreating derives a new one, so `inspect` after a rename reports a different
 ///   `Id`. `ContainerRenameMap` keeps the retired id *resolving* for the life of the daemon, which
 ///   is what clients holding the old id need, but it is in-memory and does not survive a restart.
@@ -103,7 +104,12 @@ struct ContainerRenameRoute: RouteCollection {
             configuration.networks = configuration.networks.map { attachment in
                 AttachmentConfiguration(
                     network: attachment.network,
-                    options: AttachmentOptions(hostname: hostname, macAddress: nil, mtu: attachment.options.mtu)
+                    options: AttachmentOptions(
+                        hostname: hostname,
+                        macAddress: nil,
+                        mtu: attachment.options.mtu,
+                        aliases: ContainerRenameRoute.keptAliases(attachment.options.aliases)
+                    )
                 )
             }
 
@@ -171,6 +177,15 @@ struct ContainerRenameRoute: RouteCollection {
 
             return Response(status: .noContent)
         }
+    }
+
+    /// The aliases the replacement can still claim. The runtime accepts a subtree alias such as
+    /// `.api.example.test` only below the hostname or an exact alias of the same attachment. The
+    /// hostname changes, so a subtree alias below the old one would fail the create after the
+    /// original is gone.
+    private static func keptAliases(_ aliases: [String]) -> [String] {
+        let exactAliases = Set(aliases.filter { !$0.hasPrefix(".") }.map(AttachmentOptions.canonicalHostname))
+        return aliases.filter { !$0.hasPrefix(".") || exactAliases.contains(AttachmentOptions.canonicalHostname(String($0.dropFirst()))) }
     }
 
     /// Moves the bookkeeping that is keyed by container identity: DNS aliases, healthchecks, the

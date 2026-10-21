@@ -140,6 +140,32 @@ struct ContainerRenameRouteTests {
         #expect(await recorder.created?.networks.first?.network == "demo", "the attachment itself is preserved")
     }
 
+    /// A subtree alias must sit below the hostname or an exact alias of its attachment. The hostname
+    /// changes, so a subtree alias below the old one would make the runtime refuse the create after
+    /// the original is gone.
+    @Test("The replacement keeps the network aliases that the new hostname still allows")
+    func replacementKeepsNetworkAliases() async throws {
+        let recorder = RenameRecorder()
+        var configuration = Self.snapshot(id: "web", status: .stopped).configuration
+        let options = AttachmentOptions(hostname: "web.demo.test", aliases: ["db.demo.test", ".db.demo.test", ".web.demo.test"])
+        configuration.networks = [AttachmentConfiguration(network: "demo", options: options)]
+        let container = ContainerSnapshot(configuration: configuration, status: .stopped, networks: [], startedDate: nil)
+
+        try await withRoute(
+            containers: [container],
+            recreate: { store, configuration in
+                await recorder.recordCreate(configuration)
+                await store.add(configuration)
+            }
+        ) { app, _ in
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        #expect(await recorder.created?.networks.first?.options.aliases == ["db.demo.test", ".db.demo.test"])
+    }
+
     @Test("A failed create leaves the original alone rather than half-renaming it")
     func failedRecreateIsReported() async throws {
         try await withRoute(
