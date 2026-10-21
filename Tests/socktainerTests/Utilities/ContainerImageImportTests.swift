@@ -281,15 +281,12 @@ struct ContainerImageImportTests {
         // for bzip2/xz, which are reserialized to gzip; the zstd decoder for
         // zstd, which is stored as-is) and compare hashes directly, rather
         // than only asserting the layer's file contents extract correctly.
-        let decompressed: Data
+        let expectedDiffID: String
         if fixtureCase.format == "zstd" {
-            let decompressedPath = try ArchiveReader.decompressZstd(layerPath)
-            defer { ArchiveReader.cleanUpDecompressedZstd(decompressedPath) }
-            decompressed = try Data(contentsOf: decompressedPath)
+            expectedDiffID = "sha256:" + (try ZstdStreamDecoder.sha256OfDecompressedContent(at: layerPath, cap: 10_000_000))
         } else {
-            decompressed = try #require(layerData.gunzip())
+            expectedDiffID = "sha256:\(try #require(layerData.gunzip()).sha256Hex())"
         }
-        let expectedDiffID = "sha256:\(decompressed.sha256Hex())"
         #expect(try fixture.config(manifest).rootfs.diffIDs == [expectedDiffID])
     }
 
@@ -522,6 +519,23 @@ struct ContainerImageImportTests {
                 logger: fixture.logger
             )
         }
+    }
+
+    @Test("a corrupt header after a valid entry is rejected, not taken as the end of the tar")
+    func corruptLaterHeaderIsRejected() async throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+
+        var tar = try Data(contentsOf: fixture.makeTar(fileContents: "before the corrupt header\n"))
+        let zeroBlock = Data(count: 512)
+        while tar.count >= 512, tar.suffix(512) == zeroBlock {
+            tar.removeLast(512)
+        }
+        tar += Data(repeating: 0x58, count: 512)
+        let bodyPath = fixture.root.appendingPathComponent("corrupt.tar")
+        try tar.write(to: bodyPath)
+
+        try assertRejected(bodyPath: bodyPath, fixture: fixture, expectedFormat: "not a valid tar archive")
     }
 }
 

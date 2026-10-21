@@ -26,12 +26,13 @@ let package = Package(
         .macOS(.v15)
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/container.git", exact: "1.3.1"),
-        .package(url: "https://github.com/apple/containerization.git", exact: "0.42.0"),
+        .package(url: "https://github.com/apple/container.git", exact: "1.6.0"),
+        .package(url: "https://github.com/apple/containerization.git", exact: "0.52.1"),
         .package(url: "https://github.com/vapor/vapor.git", from: "4.121.3"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.11.0"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.7.1"),
         .package(url: "https://github.com/mw99/DataCompression.git", from: "3.9.0"),
+        .package(url: "https://github.com/facebook/zstd.git", exact: "1.5.7"),
         .package(url: "https://github.com/socktainer/dns-forwarder.git", exact: "0.2.0"),
     ],
     targets: [
@@ -51,6 +52,7 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "DataCompression", package: "DataCompression"),
+                .product(name: "libzstd", package: "zstd"),
                 .product(name: "SocktainerDNSImage", package: "dns-forwarder"),
                 "BuildInfo",
             ]
@@ -60,6 +62,7 @@ let package = Package(
             dependencies: [
                 .target(name: "socktainer"),
                 .product(name: "ContainerAPIClient", package: "container"),
+                .product(name: "libzstd", package: "zstd"),
                 .product(name: "SocktainerDNSImage", package: "dns-forwarder"),
                 .product(name: "VaporTesting", package: "vapor"),
             ],
