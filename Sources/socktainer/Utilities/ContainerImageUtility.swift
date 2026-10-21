@@ -407,7 +407,9 @@ enum ContainerImageUtility {
                 }
             }
             var buffer = [UInt8](repeating: 0, count: 1 << 16)
+            var readAnyEntry = false
             for (_, entryReader) in reader.makeStreamingIterator() {
+                readAnyEntry = true
                 totalDecompressedBytes += tarBlockSize
                 try enforceCap()
                 var entryContentBytes = 0
@@ -428,7 +430,13 @@ enum ContainerImageUtility {
             }
             // A header the tar parser rejects ends iteration with a recorded
             // stream failure, so a corrupt tar would otherwise end early.
-            try reader.throwIfStreamFailed()
+            // Without an entry, `isRecognizedTarFamily` has already checked
+            // the first header, and the failure can be a false one: format
+            // detection reads past the end of a short zstd stream, which the
+            // zstd source reports as an error instead of EOF.
+            if readAnyEntry {
+                try reader.throwIfStreamFailed()
+            }
         } catch let error as Error {
             throw error
         } catch {

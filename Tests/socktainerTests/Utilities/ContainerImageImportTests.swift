@@ -104,6 +104,29 @@ struct ContainerImageImportTests {
         #expect(index.manifests.count == 1)
     }
 
+    @Test("a zstd-wrapped zero-entry tar is also accepted")
+    func zstdWrappedZeroEntryTarIsAccepted() async throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+
+        // `dd if=/dev/zero bs=1024 count=1 | zstd -c`
+        let tarPath = fixture.root.appendingPathComponent("scratch.tar.zst")
+        try #require(Data(base64Encoded: "KLUv/QRYTQAAEAAAAQD7K4AFzayF8A==")).write(to: tarPath)
+
+        _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+            tarPath: tarPath,
+            ociLayoutPath: fixture.ociLayoutDir,
+            platform: Platform(arch: "arm64", os: "linux"),
+            config: SynthesizedImageConfig(),
+            message: nil,
+            reference: nil,
+            logger: fixture.logger
+        )
+
+        let index = try fixture.index()
+        #expect(index.manifests.count == 1)
+    }
+
     @Test("a repo:tag reference registers the tag via the manifest annotation")
     func repoTagRegistersAnnotation() async throws {
         let fixture = try ImportFixture()
