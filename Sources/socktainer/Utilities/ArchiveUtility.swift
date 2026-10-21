@@ -154,5 +154,6 @@ struct ArchiveUtility {
                 continue
             }
         }
+        try archiveReader.throwIfStreamFailed()
     }
 }

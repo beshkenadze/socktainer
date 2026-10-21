@@ -540,6 +540,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
                     message: "unsupported archive entry type for copy into a running container: \(relativePath)")
             }
         }
+        try archiveReader.throwIfStreamFailed()
         return plan
     }
 
