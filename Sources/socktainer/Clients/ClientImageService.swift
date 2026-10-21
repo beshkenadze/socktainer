@@ -273,11 +273,13 @@ struct ClientImageService: ClientImageProtocol {
             logger.info("Starting to pull image \(reference) for platform \(platform.description)")
             continuation.yield(.message("Trying to pull \(reference)"))
             Task {
+                let scheme = await RegistryScheme.scheme(forReference: reference)
                 do {
                     let byteCounter = PullByteCounter()
                     let image = try await ClientImage.pull(
                         reference: reference,
                         platform: platform,
+                        scheme: scheme,
                         containerSystemConfig: containerSystemConfig,
                         progressUpdate: { progressEvents in
                             for event in progressEvents {
@@ -323,6 +325,7 @@ struct ClientImageService: ClientImageProtocol {
                             let fallbackImage = try await ClientImage.pull(
                                 reference: reference,
                                 platform: amd64,
+                                scheme: scheme,
                                 containerSystemConfig: containerSystemConfig,
                                 progressUpdate: nil
                             )
@@ -369,11 +372,11 @@ struct ClientImageService: ClientImageProtocol {
             logger.info("Retrieved image object with reference: \(image.reference)")
             continuation.yield("Trying to push \(normalizedReference)")
             Task {
+                let scheme = await RegistryScheme.scheme(forReference: image.reference)
                 do {
                     try await image.push(
                         platform: effectivePlatform,
-                        // `.auto` is gone in 1.3.0; https is upstream's replacement default.
-                        scheme: .https,
+                        scheme: scheme,
                         containerSystemConfig: containerSystemConfig,
                         progressUpdate: { progressEvents in
                             for event in progressEvents {
