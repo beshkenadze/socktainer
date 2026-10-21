@@ -5,6 +5,7 @@ import DataCompression
 import Foundation
 import Logging
 import Testing
+import libzstd
 
 @testable import socktainer
 
@@ -301,12 +302,20 @@ struct ContainerImageImportTests {
         // diff_id must be the digest of the real decompressed layer content —
         // not the still-compressed input, and not disconnected from what's
         // actually stored. Independently decompress the stored blob (gunzip
-        // for bzip2/xz, which are reserialized to gzip; the zstd decoder for
-        // zstd, which is stored as-is) and compare hashes directly, rather
-        // than only asserting the layer's file contents extract correctly.
+        // for bzip2/xz, which are reserialized to gzip; one-shot
+        // `ZSTD_decompress` for zstd, which is stored as-is and whose diff_id
+        // comes from the streaming decoder) and compare hashes directly,
+        // rather than only asserting the layer's file contents extract
+        // correctly.
         let expectedDiffID: String
         if fixtureCase.format == "zstd" {
-            expectedDiffID = "sha256:" + (try ZstdStreamDecoder.sha256OfDecompressedContent(at: layerPath, cap: 10_000_000))
+            let contentSize = layerData.withUnsafeBytes { ZSTD_getFrameContentSize($0.baseAddress, $0.count) }
+            var decompressed = Data(count: try #require(Int(exactly: contentSize)))
+            let written = decompressed.withUnsafeMutableBytes { output in
+                layerData.withUnsafeBytes { ZSTD_decompress(output.baseAddress, output.count, $0.baseAddress, $0.count) }
+            }
+            try #require(ZSTD_isError(written) == 0)
+            expectedDiffID = "sha256:\(decompressed.sha256Hex())"
         } else {
             expectedDiffID = "sha256:\(try #require(layerData.gunzip()).sha256Hex())"
         }
