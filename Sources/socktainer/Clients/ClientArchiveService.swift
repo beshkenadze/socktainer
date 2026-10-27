@@ -793,7 +793,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     ) async throws {
         let plan = try parseArchiveEntries(tarPath: tarPath, destinationPath: destinationPath)
 
-        try await prepareGuestForCopy(
+        let resolved = try await prepareGuestForCopy(
             container: container,
             destinationPath: destinationPath,
             entries: plan,
@@ -819,7 +819,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
             guard FileManager.default.fileExists(atPath: stagedURL.path) else {
                 throw ClientArchiveError.operationFailed(message: "archive entry missing after extraction: \(file.relativePath)")
             }
-            if Self.liesUnderMount(file.guestPath, mountDestinations: mountDestinations) {
+            if Self.needsGuestShell(file.guestPath, mountDestinations: mountDestinations, resolved: resolved) {
                 try await writeFileThroughGuestShell(
                     container: container,
                     source: stagedURL,
@@ -904,7 +904,8 @@ struct ClientArchiveService: ClientArchiveProtocol {
     ) -> GuestPreparationLaunch {
         let script = buildPreparationScript(
             entries: entries,
-            noOverwriteDirNonDir: noOverwriteDirNonDir
+            noOverwriteDirNonDir: noOverwriteDirNonDir,
+            mountDestinations: container.configuration.mounts.map(\.destination)
         )
 
         var processConfig = container.configuration.initProcess
@@ -976,12 +977,13 @@ struct ClientArchiveService: ClientArchiveProtocol {
     /// must exist (404) and be a directory (400), optional per-entry
     /// noOverwriteDirNonDir conflict checks, `mkdir` for missing directories
     /// (existing ones are left untouched), and `ln -sfn` for symlinks.
+    /// Returns where the guest resolved the parent directories and mounts, nil when it could not tell.
     private func prepareGuestForCopy(
         container: ContainerSnapshot,
         destinationPath: String,
         entries: [ArchiveEntryPlan],
         noOverwriteDirNonDir: Bool
-    ) async throws {
+    ) async throws -> ResolvedGuestPaths? {
         let launch = makeGuestPreparationLaunch(
             container: container,
             destinationPath: destinationPath,
@@ -989,16 +991,21 @@ struct ClientArchiveService: ClientArchiveProtocol {
             noOverwriteDirNonDir: noOverwriteDirNonDir
         )
 
-        let (exitCode, stderrText, _) = try await runGuestProcess(
+        let (exitCode, stderrText, stdoutText, _) = try await runGuestProcess(
             container: container,
             configuration: launch.configuration,
             stdin: launch.stdin,
-            purpose: "validation"
+            purpose: "validation",
+            captureStdout: true
         )
 
         switch exitCode {
         case 0:
-            return
+            return Self.parseResolvedGuestPaths(
+                stdoutText,
+                parents: Self.implicitParents(of: entries),
+                mountDestinations: container.configuration.mounts.map(\.destination)
+            )
         case 40:
             throw ClientArchiveError.pathNotFound(path: destinationPath)
         case 41:
@@ -1026,7 +1033,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
         // Mapped, not read: the pages come off the disk as the guest takes them.
         let contents = try Data(contentsOf: source, options: .alwaysMapped)
-        let (exitCode, stderrText, stdinError) = try await runGuestProcess(
+        let (exitCode, stderrText, _, stdinError) = try await runGuestProcess(
             container: container,
             configuration: processConfig,
             stdin: contents,
@@ -1044,16 +1051,18 @@ struct ClientArchiveService: ClientArchiveProtocol {
     }
 
     /// Start `configuration` in the running container, feed it `stdin`, and wait for it. Returns the
-    /// exit code, the first 16 KiB of stderr and, after a clean exit, the error of the stdin write: a
-    /// shell that read to the end has also let the write finish, while one that failed may have
-    /// stopped reading, and its own exit code is then the error to report.
+    /// exit code, the first 16 KiB of stderr, all of stdout when `captureStdout` asks for it and,
+    /// after a clean exit, the error of the stdin write: a shell that read to the end has also let
+    /// the write finish, while one that failed may have stopped reading, and its own exit code is
+    /// then the error to report.
     private func runGuestProcess(
         container: ContainerSnapshot,
         configuration: ProcessConfiguration,
         stdin: Data,
-        purpose: String
-    ) async throws -> (exitCode: Int32, stderr: String, stdinError: Error?) {
-        guard let pipes = StdioPipes.make([.stdin, .stderr]) else {
+        purpose: String,
+        captureStdout: Bool = false
+    ) async throws -> (exitCode: Int32, stderr: String, stdout: String, stdinError: Error?) {
+        guard let pipes = StdioPipes.make(captureStdout ? [.stdin, .stdout, .stderr] : [.stdin, .stderr]) else {
             throw ClientArchiveError.operationFailed(message: "Failed to create stdio pipes")
         }
 
@@ -1096,6 +1105,16 @@ struct ClientArchiveService: ClientArchiveProtocol {
             }
             return collected
         }
+        let stdoutReader = pipes.stdout?.read
+        let stdoutTask = Task.detached { () -> Data in
+            guard let stdoutReader else { return Data() }
+            defer { try? stdoutReader.close() }
+            var collected = Data()
+            while let chunk = try? stdoutReader.read(upToCount: 4096), !chunk.isEmpty {
+                collected.append(chunk)
+            }
+            return collected
+        }
 
         let exitCode: Int32
         do {
@@ -1117,7 +1136,8 @@ struct ClientArchiveService: ClientArchiveProtocol {
         let stderrText =
             String(data: await stderrTask.value, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return (exitCode, stderrText, stdinError)
+        let stdoutText = String(decoding: await stdoutTask.value, as: UTF8.self)
+        return (exitCode, stderrText, stdoutText, stdinError)
     }
 
     /// Whether `guestPath` is a mount destination or lies below one. The runtime's `copyIn` writes
@@ -1129,6 +1149,59 @@ struct ClientArchiveService: ClientArchiveProtocol {
             let mountPoint = lexicallyNormalized(destination)
             return path == mountPoint || path.hasPrefix(mountPoint + "/")
         }
+    }
+
+    /// Where the guest resolved each parent directory of the archive's files and each mount
+    /// destination, as the preparation script reported it.
+    struct ResolvedGuestPaths: Equatable {
+        let parents: [String: String]
+        let mounts: [String]
+    }
+
+    /// Read the report the preparation script prints: one `P <path>` line per parent directory, then
+    /// one `M <path>` line per mount destination, in the order asked. Nil when it does not line up,
+    /// for example when a path holds a newline.
+    static func parseResolvedGuestPaths(
+        _ output: String, parents: [String], mountDestinations: [String]
+    ) -> ResolvedGuestPaths? {
+        var resolvedParents: [String] = []
+        var resolvedMounts: [String] = []
+        var lines = output.split(separator: "\n", omittingEmptySubsequences: false)
+        if lines.last?.isEmpty == true { lines.removeLast() }
+        for line in lines {
+            if line.hasPrefix("P ") {
+                resolvedParents.append(String(line.dropFirst(2)))
+            } else if line.hasPrefix("M ") {
+                resolvedMounts.append(String(line.dropFirst(2)))
+            } else {
+                return nil
+            }
+        }
+        guard resolvedParents.count == parents.count, resolvedMounts.count == mountDestinations.count else {
+            return nil
+        }
+        return ResolvedGuestPaths(
+            parents: Dictionary(zip(parents, resolvedParents), uniquingKeysWith: { first, _ in first }),
+            mounts: resolvedMounts
+        )
+    }
+
+    /// Whether only a process in the container can write `guestPath`: it lies below a mount, as
+    /// spelled or where the guest resolves its parent directory. gitea-runner sends `run/act/...` for
+    /// the `/var/run/act` volume, because `/var/run` links to `/run`, and the text alone misses it.
+    /// Without a report the answer is yes: the shell writes where the container sees the path, so it
+    /// is never wrong, while `copyIn` below an unrecognised mount loses the file and still answers 200.
+    static func needsGuestShell(
+        _ guestPath: String, mountDestinations: [String], resolved: ResolvedGuestPaths?
+    ) -> Bool {
+        if liesUnderMount(guestPath, mountDestinations: mountDestinations) { return true }
+        guard let resolved else { return true }
+        let path = guestPath as NSString
+        let location =
+            resolved.parents[path.deletingLastPathComponent].map {
+                ($0 as NSString).appendingPathComponent(path.lastPathComponent)
+            } ?? guestPath
+        return liesUnderMount(location, mountDestinations: resolved.mounts)
     }
 
     /// `//`, `.` and `..` resolved on the text alone. `standardizingPath` is no substitute: it
@@ -1153,7 +1226,8 @@ struct ClientArchiveService: ClientArchiveProtocol {
     /// are never modified, mirroring how tar treats implicit parents.
     func buildPreparationScript(
         entries: [ArchiveEntryPlan],
-        noOverwriteDirNonDir: Bool
+        noOverwriteDirNonDir: Bool,
+        mountDestinations: [String] = []
     ) -> String {
         var lines = [
             "set -u",
@@ -1192,15 +1266,8 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
         // Implicit parents of file/symlink entries (mkdir -p is a no-op on
         // existing directories).
-        var parents = Set<String>()
-        for entry in entries {
-            if case .directory = entry.kind { continue }
-            let parent = (entry.guestPath as NSString).deletingLastPathComponent
-            if !parent.isEmpty, parent != "/" {
-                parents.insert(parent)
-            }
-        }
-        for parent in parents.sorted() {
+        let parents = Self.implicitParents(of: entries)
+        for parent in parents {
             lines.append("mkdir -p \(shellSingleQuoted(parent)) || { echo \"failed to create parent directory \(parent)\" >&2; exit 44; }")
         }
 
@@ -1210,8 +1277,34 @@ struct ClientArchiveService: ClientArchiveProtocol {
                 "ln -sfn \(shellSingleQuoted(target)) \(shellSingleQuoted(entry.guestPath)) || { echo \"failed to create symlink \(entry.guestPath)\" >&2; exit 45; }")
         }
 
+        // Report where the guest resolves each parent and mount, read by `parseResolvedGuestPaths`.
+        // `cd` and `pwd -P` are shell builtins, so this needs no other program. `cd` cannot enter a
+        // file, so a single-file mount such as `/var/run/docker.sock` is resolved through its directory.
+        for (tag, path) in parents.map({ ("P", $0) }) + mountDestinations.map({ ("M", $0) }) {
+            let quoted = shellSingleQuoted(path)
+            let directory = shellSingleQuoted((path as NSString).deletingLastPathComponent)
+            let name = shellSingleQuoted((path as NSString).lastPathComponent)
+            lines.append(
+                "if cd \(quoted) 2>/dev/null; then printf '\(tag) '; pwd -P; "
+                    + "elif cd \(directory) 2>/dev/null; then d=$(pwd -P); printf '\(tag) %s/%s\\n' \"${d%/}\" \(name); "
+                    + "else printf '\(tag) %s\\n' \(quoted); fi")
+        }
+
         lines.append("exit 0")
         return lines.joined(separator: "\n")
+    }
+
+    /// The directories that must exist for the archive's files and symlinks, sorted, without `/`.
+    static func implicitParents(of entries: [ArchiveEntryPlan]) -> [String] {
+        var parents = Set<String>()
+        for entry in entries {
+            if case .directory = entry.kind { continue }
+            let parent = (entry.guestPath as NSString).deletingLastPathComponent
+            if !parent.isEmpty, parent != "/" {
+                parents.insert(parent)
+            }
+        }
+        return parents.sorted()
     }
 
     private func shellSingleQuoted(_ value: String) -> String {
