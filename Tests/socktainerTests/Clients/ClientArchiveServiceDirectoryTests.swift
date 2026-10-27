@@ -100,6 +100,25 @@ struct ClientArchiveServiceDirectoryTests {
         #expect(outside == "../usr/lib/os-release", "a target climbing out of the copied tree is still the target")
     }
 
+    @Test("a target too long to read fails the archive instead of omitting the entry")
+    func unreadableSymlinkTargetFailsLoudly() async throws {
+        let fixture = DirectoryFixture()
+        defer { fixture.cleanUp() }
+        // ext4 keeps targets under 60 bytes in the inode; longer ones live in data blocks the reader
+        // does not expose. Skipping such an entry would hand back a tar quietly missing a file.
+        let longTarget = "/" + String(repeating: "d", count: 40) + "/" + String(repeating: "n", count: 30)
+        #expect(longTarget.count >= 60)
+        try fixture.writeRootfs(containerId: "web", files: [:], symlinks: ["/etc/long": longTarget])
+
+        await #expect(throws: ClientArchiveError.self) {
+            _ = try await fixture.service.getArchive(container: DirectoryFixture.stopped("web"), path: "/etc")
+        }
+        // The link asked for by its own path is packed alone, and must not go out without its target.
+        await #expect(throws: ClientArchiveError.self) {
+            _ = try await fixture.service.getArchive(container: DirectoryFixture.stopped("web"), path: "/etc/long")
+        }
+    }
+
     @Test("a file below a symlinked directory is reachable")
     func fileBelowSymlinkedDirectory() async throws {
         let fixture = DirectoryFixture()

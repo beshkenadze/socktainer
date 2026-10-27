@@ -490,7 +490,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
             entry.group = inode.fullGid
             entry.modificationDate = Date(timeIntervalSince1970: TimeInterval(inode.mtime))
             if inode.isSymlink {
-                entry.symlinkTarget = readSymlinkTarget(reader: reader, path: normalizedPath)
+                entry.symlinkTarget = try readableSymlinkTarget(reader: reader, path: normalizedPath)
             }
             let data = inode.isRegularFile ? try reader.readFile(at: FilePath(normalizedPath)) : nil
             if let data {
@@ -1297,6 +1297,17 @@ struct ClientArchiveService: ClientArchiveProtocol {
     /// bytes, the overwhelming majority in practice) store the target inline
     /// in the inode block field, which is public; slow symlinks (>= 60 bytes)
     /// are not readable through the public API and report nil.
+    /// Dropping the entry when the target cannot be read is silent data loss: the client gets a tar
+    /// that is missing a file and no indication of it. ext4 stores targets under 60 bytes inline;
+    /// anything longer needs block arithmetic the reader keeps private, so say so.
+    private func readableSymlinkTarget(reader: EXT4.EXT4Reader, path: String) throws -> String {
+        guard let target = readSymlinkTarget(reader: reader, path: path) else {
+            throw ClientArchiveError.operationFailed(
+                message: "cannot read the symlink target of \(path); refusing to omit it from the archive")
+        }
+        return target
+    }
+
     private func readSymlinkTarget(reader: EXT4.EXT4Reader, path: String) -> String? {
         guard
             let inode = try? reader.stat(FilePath(path), followSymlinks: false).inode,
@@ -1395,14 +1406,12 @@ struct ClientArchiveService: ClientArchiveProtocol {
                 ofItemAtPath: fileDest.path
             )
         } else if inode.isSymlink {
-            // Read symlink target
-            if let target = readSymlinkTarget(reader: reader, path: sourcePath) {
-                guard let baseName else {
-                    throw ClientArchiveError.invalidPath(path: sourcePath)
-                }
-                let linkDest = destDir.appendingPathComponent(baseName)
-                try FileManager.default.createSymbolicLink(atPath: linkDest.path, withDestinationPath: target)
+            guard let baseName else {
+                throw ClientArchiveError.invalidPath(path: sourcePath)
             }
+            let target = try readableSymlinkTarget(reader: reader, path: sourcePath)
+            let linkDest = destDir.appendingPathComponent(baseName)
+            try FileManager.default.createSymbolicLink(atPath: linkDest.path, withDestinationPath: target)
         }
         // Skip other file types (devices, fifos, sockets)
     }
