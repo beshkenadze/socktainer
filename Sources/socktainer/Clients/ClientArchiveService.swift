@@ -715,23 +715,15 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
     /// Hold an archive uploaded before the container was ever started.
     ///
-    /// Only regular files: a directory would need a whole-directory mount,
-    /// which hides what the image put there, and a symlink has no mount that
-    /// reproduces it. Both are refused while the copy can still be retried
-    /// after start.
+    /// Only regular files are held, each mounted into place at start. See
+    /// `entryRefusedBeforeStart` for what else an archive may carry.
     private func stagePreStartInjection(
         container: ContainerSnapshot, destinationPath: String, tarPath: URL
     ) async throws {
         let plan = try parseArchiveEntries(tarPath: tarPath, destinationPath: destinationPath)
-        for entry in plan {
-            if case .symlink = entry.kind {
-                throw ClientArchiveError.operationFailed(
-                    message: "cannot copy a symlink into \(container.id) before it starts")
-            }
-            if case .directory = entry.kind {
-                throw ClientArchiveError.operationFailed(
-                    message: "cannot copy a directory into \(container.id) before it starts")
-            }
+        if let refused = Self.entryRefusedBeforeStart(plan) {
+            throw ClientArchiveError.operationFailed(
+                message: "cannot copy \(refused) into \(container.id) before it starts")
         }
 
         // An empty tar carries nothing to stage, and `ArchiveReader.extractContents`
@@ -758,6 +750,35 @@ struct ClientArchiveService: ClientArchiveProtocol {
                 containerId: container.id, guestPath: entry.guestPath,
                 source: extracted, mode: entry.mode)
         }
+    }
+
+    /// What an archive for a never-started container carries that cannot be held, nil when all of it
+    /// can. A 0755 directory with a held file below it needs nothing of its own: the file's mount
+    /// creates the missing directories at start, as 0755. buildx sends `buildkit/` and
+    /// `buildkit/provenance.d/` around the provenance file it writes in GitHub Actions jobs. Any other
+    /// directory would need a whole-directory mount, which hides what the image put there, and a
+    /// symlink has no mount that reproduces it. Both are refused while the copy can still be retried
+    /// after start.
+    static func entryRefusedBeforeStart(_ plan: [ArchiveEntryPlan]) -> String? {
+        let files = plan.compactMap { entry -> String? in
+            guard case .file = entry.kind else { return nil }
+            return lexicallyNormalized(entry.guestPath)
+        }
+        for entry in plan {
+            switch entry.kind {
+            case .symlink:
+                return "a symlink"
+            case .directory:
+                let directory = lexicallyNormalized(entry.guestPath)
+                let prefix = directory == "/" ? "/" : directory + "/"
+                if entry.mode != 0o755 || !files.contains(where: { $0.hasPrefix(prefix) }) {
+                    return "a directory"
+                }
+            case .file:
+                continue
+            }
+        }
+        return nil
     }
 
     /// One parsed entry of the uploaded archive.
