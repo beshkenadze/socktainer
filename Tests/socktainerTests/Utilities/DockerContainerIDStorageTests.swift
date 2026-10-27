@@ -76,7 +76,7 @@ struct DockerContainerIDStorageTests {
     func idLabelIsInternal() {
         let restored = LabelNormalization.restore([
             DockerContainerID.idLabel: Self.storedId,
-            "com.example.app": "demo"
+            "com.example.app": "demo",
         ])
 
         #expect(restored[DockerContainerID.idLabel] == nil, "Docker reports the id in Id, never as a label")

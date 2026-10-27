@@ -60,7 +60,7 @@ struct ContainerInspectPortsTests {
     func duplicateContainerPortIsCollapsed() async throws {
         let snapshot = try Self.snapshot(publishedPorts: [
             Self.publish(host: 3000, container: 3000),
-            Self.publish(host: 3100, container: 3000)
+            Self.publish(host: 3100, container: 3000),
         ])
 
         try await withRoute(snapshot: snapshot) { app in
@@ -78,7 +78,7 @@ struct ContainerInspectPortsTests {
     func distinctProtocolsRemainSeparate() async throws {
         let snapshot = try Self.snapshot(publishedPorts: [
             Self.publish(host: 3000, container: 3000, proto: .tcp),
-            Self.publish(host: 3000, container: 3000, proto: .udp)
+            Self.publish(host: 3000, container: 3000, proto: .udp),
         ])
 
         try await withRoute(snapshot: snapshot) { app in

@@ -33,10 +33,11 @@ struct DockerSocketRelayDetectionTests {
             DockerSocketRelay.detect(
                 candidates: candidates,
                 controlSocketPath: testControlSocketPath
-            ) == DockerSocketRelay.Match(
-                guestPath: "/var/run/docker.sock",
-                sourcePath: testControlSocketPath
             )
+                == DockerSocketRelay.Match(
+                    guestPath: "/var/run/docker.sock",
+                    sourcePath: testControlSocketPath
+                )
         )
     }
 
