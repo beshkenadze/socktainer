@@ -991,21 +991,22 @@ struct ClientArchiveService: ClientArchiveProtocol {
             noOverwriteDirNonDir: noOverwriteDirNonDir
         )
 
-        let (exitCode, stderrText, stdoutText, _) = try await runGuestProcess(
+        let parents = Self.implicitParents(of: entries)
+        let mountDestinations = container.configuration.mounts.map(\.destination)
+        // One line per path, and a Linux path is at most 4096 bytes (PATH_MAX).
+        let reportLimit = (parents.count + mountDestinations.count) * (4096 + 3)
+        let (exitCode, stderrText, report, _) = try await runGuestProcess(
             container: container,
             configuration: launch.configuration,
             stdin: launch.stdin,
             purpose: "validation",
-            captureStdout: true
+            stdoutLimit: reportLimit
         )
 
         switch exitCode {
         case 0:
-            return Self.parseResolvedGuestPaths(
-                stdoutText,
-                parents: Self.implicitParents(of: entries),
-                mountDestinations: container.configuration.mounts.map(\.destination)
-            )
+            guard let report else { return nil }
+            return Self.parseResolvedGuestPaths(report, parents: parents, mountDestinations: mountDestinations)
         case 40:
             throw ClientArchiveError.pathNotFound(path: destinationPath)
         case 41:
@@ -1051,7 +1052,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     }
 
     /// Start `configuration` in the running container, feed it `stdin`, and wait for it. Returns the
-    /// exit code, the first 16 KiB of stderr, all of stdout when `captureStdout` asks for it and,
+    /// exit code, the first 16 KiB of stderr, stdout when `stdoutLimit` asks for it and it fits, and,
     /// after a clean exit, the error of the stdin write: a shell that read to the end has also let
     /// the write finish, while one that failed may have stopped reading, and its own exit code is
     /// then the error to report.
@@ -1060,9 +1061,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
         configuration: ProcessConfiguration,
         stdin: Data,
         purpose: String,
-        captureStdout: Bool = false
-    ) async throws -> (exitCode: Int32, stderr: String, stdout: String, stdinError: Error?) {
-        guard let pipes = StdioPipes.make(captureStdout ? [.stdin, .stdout, .stderr] : [.stdin, .stderr]) else {
+        stdoutLimit: Int? = nil
+    ) async throws -> (exitCode: Int32, stderr: String, stdout: String?, stdinError: Error?) {
+        guard let pipes = StdioPipes.make(stdoutLimit == nil ? [.stdin, .stderr] : [.stdin, .stdout, .stderr]) else {
             throw ClientArchiveError.operationFailed(message: "Failed to create stdio pipes")
         }
 
@@ -1106,14 +1107,10 @@ struct ClientArchiveService: ClientArchiveProtocol {
             return collected
         }
         let stdoutReader = pipes.stdout?.read
-        let stdoutTask = Task.detached { () -> Data in
-            guard let stdoutReader else { return Data() }
+        let stdoutTask = Task.detached { () -> Data? in
+            guard let stdoutReader, let stdoutLimit else { return nil }
             defer { try? stdoutReader.close() }
-            var collected = Data()
-            while let chunk = try? stdoutReader.read(upToCount: 4096), !chunk.isEmpty {
-                collected.append(chunk)
-            }
-            return collected
+            return Self.readAll(stdoutReader, limit: stdoutLimit)
         }
 
         let exitCode: Int32
@@ -1136,8 +1133,23 @@ struct ClientArchiveService: ClientArchiveProtocol {
         let stderrText =
             String(data: await stderrTask.value, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let stdoutText = String(decoding: await stdoutTask.value, as: UTF8.self)
+        let stdoutText = await stdoutTask.value.map { String(decoding: $0, as: UTF8.self) }
         return (exitCode, stderrText, stdoutText, stdinError)
+    }
+
+    /// Everything `reader` holds up to its end, or nil when that is more than `limit` bytes. The rest
+    /// is still read, so a writer in the guest never blocks on a full pipe.
+    static func readAll(_ reader: FileHandle, limit: Int) -> Data? {
+        var collected = Data()
+        var overflowed = false
+        while let chunk = try? reader.read(upToCount: 4096), !chunk.isEmpty {
+            if overflowed || collected.count + chunk.count > limit {
+                overflowed = true
+                continue
+            }
+            collected.append(chunk)
+        }
+        return overflowed ? nil : collected
     }
 
     /// Whether `guestPath` is a mount destination or lies below one. The runtime's `copyIn` writes

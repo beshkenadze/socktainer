@@ -203,4 +203,16 @@ struct ClientArchiveMountRoutingTests {
         #expect(resolved?.mounts == [root.path + "/run/app.conf"])
         #expect(ClientArchiveService.needsGuestShell(file.guestPath, mountDestinations: [mount], resolved: resolved))
     }
+
+    /// The guest's shell belongs to the image, so its output is not trusted to be short.
+    @Test("output past the limit is drained and dropped")
+    func cappedRead() throws {
+        for (limit, expected) in [(5, nil), (10, Data("0123456789".utf8))] as [(Int, Data?)] {
+            let pipe = Pipe()
+            try pipe.fileHandleForWriting.write(contentsOf: Data("0123456789".utf8))
+            try pipe.fileHandleForWriting.close()
+            #expect(ClientArchiveService.readAll(pipe.fileHandleForReading, limit: limit) == expected)
+            #expect(try pipe.fileHandleForReading.readToEnd() == nil, "the pipe is read to its end either way")
+        }
+    }
 }
