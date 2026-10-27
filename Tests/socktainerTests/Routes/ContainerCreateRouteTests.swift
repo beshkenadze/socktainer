@@ -151,6 +151,14 @@ struct LoopbackGatewayRewriteTests {
         #expect(result[1] == "BIND=127.0.0.1:80")  // unchanged
         #expect(result[2] == "CACHE=redis://10.1.2.3:6379")
     }
+
+    @Test("Rewrite is off by default so explicit public URLs are preserved (#416)")
+    func rewriteIsOptIn() {
+        #expect(!ContainerCreateRoute.shouldRewriteLoopback(labels: nil))
+        #expect(!ContainerCreateRoute.shouldRewriteLoopback(labels: ["app": "web"]))
+        #expect(!ContainerCreateRoute.shouldRewriteLoopback(labels: ["socktainer.rewrite-loopback": "false"]))
+        #expect(ContainerCreateRoute.shouldRewriteLoopback(labels: ["socktainer.rewrite-loopback": "true"]))
+    }
 }
 
 @Suite("ContainerCreateRoute — peer hostname rewrite")
@@ -646,6 +654,28 @@ struct DockerSocketRelayRouteTests {
     }
 }
 
+@Suite("ContainerCreateRoute.portBindingsLabelValue")
+struct PortBindingsLabelTests {
+    private let logger = Logger(label: "test")
+
+    @Test("A request without PortBindings is not persisted, an empty one is")
+    func emptyBindingsPersisted() {
+        #expect(ContainerCreateRoute.portBindingsLabelValue(for: nil, logger: logger) == nil)
+        #expect(ContainerCreateRoute.portBindingsLabelValue(for: [:], logger: logger) == "{}")
+    }
+
+    @Test("Requested bindings round-trip as JSON, unset HostIp and HostPort included")
+    func bindingsRoundTrip() throws {
+        let request = ["80/tcp": [PortBinding(HostIp: "", HostPort: "")], "81/tcp": [PortBinding(HostIp: "127.0.0.1", HostPort: "18081")]]
+        let label = try #require(ContainerCreateRoute.portBindingsLabelValue(for: request, logger: logger))
+        let decoded = try JSONDecoder().decode([String: [PortBinding]].self, from: Data(label.utf8))
+        #expect(decoded["80/tcp"]?.first?.HostIp == "")
+        #expect(decoded["80/tcp"]?.first?.HostPort == "")
+        #expect(decoded["81/tcp"]?.first?.HostIp == "127.0.0.1")
+        #expect(decoded["81/tcp"]?.first?.HostPort == "18081")
+    }
+}
+
 @Suite("ContainerCreateRoute.restartPolicyLabel")
 struct RestartPolicyLabelTests {
     private let logger = Logger(label: "test")
@@ -736,6 +766,29 @@ struct ConvertPortBindingsTests {
         #expect(ports.count == 1)
         #expect(ports[0].hostPort != 0)
     }
+    @Test("PublishAllPorts allocates a host port for an exposed port with no binding (#434)")
+    func publishAllAllocatesExposedPort() throws {
+        let bindings = publishAllPortBindings(bindings: [:], exposed: ["5000/tcp"])
+        let ports = try convertPortBindings(from: bindings)
+        #expect(ports.count == 1)
+        #expect(ports[0].containerPort == 5000)
+        #expect(ports[0].hostPort != 0)
+    }
+
+    @Test("PublishAllPorts keeps an explicit binding for an exposed port")
+    func publishAllKeepsExplicitBinding() throws {
+        let bindings = publishAllPortBindings(
+            bindings: ["5000/tcp": [PortBinding(HostIp: nil, HostPort: "15000")]], exposed: ["5000/tcp"])
+        let ports = try convertPortBindings(from: bindings)
+        #expect(ports.count == 1)
+        #expect(ports[0].hostPort == 15000)
+    }
+
+    @Test("PublishAllPorts treats a bare port as tcp and dedupes image and request ports")
+    func publishAllNormalizesAndDedupes() {
+        let bindings = publishAllPortBindings(bindings: [:], exposed: ["8080", "8080/tcp", "53/udp"])
+        #expect(Set(bindings.keys) == ["8080/tcp", "53/udp"])
+    }
 }
 
 @Suite("ContainerCreateRoute — image existence error mapping")
@@ -758,5 +811,46 @@ struct ImageExistenceErrorTests {
         // Must NOT be collapsed into a 404 "No such image" — the real cause has to reach the client.
         #expect((mapped as? AbortError)?.status != .notFound)
         #expect((mapped as? ContainerizationError)?.code == .interrupted)
+    }
+}
+
+@Suite("ContainerCreateRoute — anonymous volume mounts")
+struct ContainerCreateAnonymousMountTests {
+
+    @Test("a volume mount without Source (compose `- /data`) decodes with an empty source")
+    func mountWithoutSourceDecodes() throws {
+        let json = #"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"volume","Target":"/data","VolumeOptions":{}}]}}"#
+        let body = try JSONDecoder().decode(CreateContainerRequest.self, from: Data(json.utf8))
+        let mount = try #require(body.HostConfig?.Mounts?.first)
+        #expect(mount.Source.isEmpty)
+        #expect(mount.Target == "/data")
+        #expect(mount.MountType == "volume")
+    }
+
+    private func mount(target: String, readOnly: Bool?) throws -> Mount {
+        let ro = readOnly.map { ",\"ReadOnly\":\($0)" } ?? ""
+        let json = #"{"Type":"volume","Target":"\#(target)"\#(ro)}"#
+        return try JSONDecoder().decode(Mount.self, from: Data(json.utf8))
+    }
+
+    @Test("an anonymous mount becomes an anonymous volume, read-write by default")
+    func anonymousVolumeDefaults() throws {
+        let v = try ContainerCreateRoute.anonymousVolume(for: mount(target: "/data", readOnly: nil))
+        #expect(v.destination == "/data")
+        #expect(v.isAnonymous)
+        #expect(v.options.isEmpty)
+    }
+
+    @Test("ReadOnly is preserved on an anonymous mount")
+    func anonymousVolumeReadOnly() throws {
+        let v = try ContainerCreateRoute.anonymousVolume(for: mount(target: "/data", readOnly: true))
+        #expect(v.options == ["ro"])
+    }
+
+    @Test("a relative anonymous mount target is rejected")
+    func anonymousVolumeRelativeTarget() throws {
+        #expect(throws: (any Error).self) {
+            try ContainerCreateRoute.anonymousVolume(for: mount(target: "data", readOnly: nil))
+        }
     }
 }

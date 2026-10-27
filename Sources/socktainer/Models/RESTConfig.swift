@@ -12,6 +12,23 @@ struct HealthcheckConfig: Content {
     let Timeout: Int?
     let Retries: Int?
     let StartPeriod: Int?
+    var StartInterval: Int? = nil
+
+    /// Docker's create-time merge: an omitted request inherits the image's
+    /// HEALTHCHECK, and unset (empty/zero) request fields fall back to it.
+    static func merged(request: HealthcheckConfig?, image: HealthcheckConfig?) -> HealthcheckConfig? {
+        guard let request else { return image }
+        guard let image else { return request }
+        func pick(_ value: Int?, _ fallback: Int?) -> Int? { (value ?? 0) != 0 ? value : fallback }
+        return HealthcheckConfig(
+            Test: request.Test?.isEmpty == false ? request.Test : image.Test,
+            Interval: pick(request.Interval, image.Interval),
+            Timeout: pick(request.Timeout, image.Timeout),
+            Retries: pick(request.Retries, image.Retries),
+            StartPeriod: pick(request.StartPeriod, image.StartPeriod),
+            StartInterval: pick(request.StartInterval, image.StartInterval)
+        )
+    }
 }
 
 struct HealthLogEntry: Content {
@@ -450,6 +467,19 @@ struct Mount: Content {
         case BindOptions
         case VolumeOptions
         case TmpfsOptions
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        Target = try c.decode(String.self, forKey: .Target)
+        // Docker omits Source for anonymous volumes (e.g. compose `- /data`).
+        Source = try c.decodeIfPresent(String.self, forKey: .Source) ?? ""
+        MountType = try c.decode(String.self, forKey: .MountType)
+        ReadOnly = try c.decodeIfPresent(Bool.self, forKey: .ReadOnly)
+        Consistency = try c.decodeIfPresent(String.self, forKey: .Consistency)
+        BindOptions = try c.decodeIfPresent(socktainer.BindOptions.self, forKey: .BindOptions)
+        VolumeOptions = try c.decodeIfPresent(socktainer.VolumeOptions.self, forKey: .VolumeOptions)
+        TmpfsOptions = try c.decodeIfPresent(socktainer.TmpfsOptions.self, forKey: .TmpfsOptions)
     }
 }
 

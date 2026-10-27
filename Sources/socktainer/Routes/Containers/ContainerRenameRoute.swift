@@ -33,10 +33,11 @@ struct ContainerRenameRoute: RouteCollection {
         recreate: Recreate? = nil
     ) {
         self.client = client
-        self.recreate = recreate ?? { configuration in
-            let kernel = try await ClientKernel.getDefaultKernel(for: .current)
-            try await ContainerClient().create(configuration: configuration, options: .default, kernel: kernel)
-        }
+        self.recreate =
+            recreate ?? { configuration in
+                let kernel = try await ClientKernel.getDefaultKernel(for: .current)
+                try await ContainerClient().create(configuration: configuration, options: .default, kernel: kernel)
+            }
     }
 
     func boot(routes: RoutesBuilder) throws {
@@ -137,8 +138,17 @@ struct ContainerRenameRoute: RouteCollection {
                 throw Abort(.internalServerError, reason: "Failed to rename container: \(error)")
             }
 
+            // Files copied into a container that has not started yet wait under its id until the
+            // start rebuilds it with them; Compose renames its replacement after creating it.
+            do {
+                try await PreStartInjectionStore.shared.move(from: container.id, to: newName)
+            } catch {
+                req.logger.error("Failed to carry the staged files of \(container.id) over to \(newName): \(error)")
+            }
+
             let renamed = try? await client.getContainer(id: newName)
-            let renamedHexId = renamed.map(DockerContainerID.hexId(for:))
+            let renamedHexId =
+                renamed.map(DockerContainerID.hexId(for:))
                 ?? DockerContainerID.hexId(nativeId: newName, createdAt: nil)
             // A container carrying its own Docker ID keeps it through the recreate, so there is
             // nothing to redirect. Comparing the ids rather than looking for the label also covers a

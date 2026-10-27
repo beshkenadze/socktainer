@@ -71,13 +71,54 @@ enum ClientArchiveError: Error, LocalizedError {
     }
 }
 
+/// POSIX `st_mode` in Go's `os.FileMode` encoding, which is what the Docker API
+/// carries: permission bits are shared, but Go keeps the file type in the high
+/// bits rather than in `S_IFMT`.
+func goFileMode(posixMode: UInt32) -> UInt32 {
+    var mode = posixMode & 0o777
+    switch posixMode & 0o170000 {
+    case 0o040000: mode |= 1 << 31  // ModeDir
+    case 0o120000: mode |= 1 << 27  // ModeSymlink
+    case 0o020000: mode |= (1 << 26) | (1 << 21)  // ModeDevice | ModeCharDevice
+    case 0o060000: mode |= 1 << 26  // ModeDevice
+    case 0o010000: mode |= 1 << 25  // ModeNamedPipe
+    case 0o140000: mode |= 1 << 24  // ModeSocket
+    default: break  // regular files carry no type bit
+    }
+    if posixMode & 0o4000 != 0 { mode |= 1 << 23 }  // ModeSetuid
+    if posixMode & 0o2000 != 0 { mode |= 1 << 22 }  // ModeSetgid
+    if posixMode & 0o1000 != 0 { mode |= 1 << 20 }  // ModeSticky
+    return mode
+}
+
+/// Go's RFC3339Nano in the daemon's own timezone, as Docker reports it. An ext4
+/// inode holds whole seconds and Go omits a zero fraction, so only the offset
+/// differs from RFC3339.
+func dockerPathStatTimestamp(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone.current
+    formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssXXXXX"
+    return formatter.string(from: date)
+}
+
+/// Subset of Apple Container's `runtime-configuration.json` (written at
+/// container create time) containing the rootfs source reference.
+private struct RuntimeConfiguration: Decodable {
+    struct Filesystem: Decodable {
+        let source: String
+    }
+
+    let containerRootFilesystem: Filesystem
+}
+
 /// File stat information for the X-Docker-Container-Path-Stat header
 struct PathStat: Codable {
     let name: String
     let size: Int64
     let mode: UInt32
     let mtime: String
-    let linkTarget: String?
+    let linkTarget: String
 
     enum CodingKeys: String, CodingKey {
         case name
@@ -93,9 +134,11 @@ protocol ClientArchiveProtocol: Sendable {
     /// Get the path to a container's rootfs
     func getRootfsPath(containerId: String) -> URL
 
-    /// Read a file or directory from a container's filesystem and return as tar data.
-    /// Takes the snapshot, not the id: where the bytes live depends on whether the guest is running.
+    /// Read a file or directory from a container's filesystem and return as tar data
     func getArchive(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat)
+
+    /// Stat a path without reading it, for callers that only need the header
+    func statPath(container: ContainerSnapshot, path: String) async throws -> PathStat
 
     /// Extract a tar archive into a container's filesystem at the specified path
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws
@@ -107,11 +150,46 @@ protocol ClientArchiveProtocol: Sendable {
 
 /// Service for performing archive operations on container filesystems
 struct ClientArchiveService: ClientArchiveProtocol {
-    private static let log = Logger(label: "socktainer.archive")
     private let appSupportPath: URL
+    private let flushTimeout: Duration
+    private let flushDeadline: @Sendable (Duration) async throws -> Void
+    private let flushGuest: @Sendable (ContainerSnapshot) async throws -> Void
+    private let readGuest: @Sendable (ContainerSnapshot, String) async throws -> (tarData: Data, stat: PathStat)
+    private let flushBreaker: GuestFlushBreaker
 
-    init(appSupportPath: URL) {
+    private static let log = Logger(label: "socktainer.archive")
+
+    /// How long a read waits for the guest flush before it reads whatever is on disk.
+    static let defaultFlushTimeout: Duration = .seconds(5)
+
+    /// - Parameters:
+    ///   - flushTimeout: upper bound on each flush; past it the read proceeds anyway.
+    ///   - flushDeadline: waits out `flushTimeout` for one flush; the flush times out
+    ///     when it returns. Defaults to `Task.sleep`; injectable so tests decide when a
+    ///     flush times out instead of racing a wall-clock cap.
+    ///   - flushGuest: writes a running guest's page cache back to its `rootfs.ext4`
+    ///     before the image is read from the host. Defaults to running `sync` in the
+    ///     guest; injectable so tests need no VM.
+    ///   - readGuest: reads through guest tar; injectable so fallback tests need no VM.
+    ///   - flushBreaker: containers whose flush timed out and has not returned (see
+    ///     `GuestFlushBreaker` for when that expires). A reference type, so copies of
+    ///     this service share it; the server creates one service for its lifetime
+    ///     (`configure.swift`), and each new service (each test) starts with an empty
+    ///     breaker.
+    init(
+        appSupportPath: URL,
+        flushTimeout: Duration = ClientArchiveService.defaultFlushTimeout,
+        flushDeadline: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        flushGuest: @escaping @Sendable (ContainerSnapshot) async throws -> Void = ClientArchiveService.syncGuest,
+        readGuest: @escaping @Sendable (ContainerSnapshot, String) async throws -> (tarData: Data, stat: PathStat) = ClientArchiveService.getArchiveViaGuestTar,
+        flushBreaker: GuestFlushBreaker = GuestFlushBreaker()
+    ) {
         self.appSupportPath = appSupportPath
+        self.flushTimeout = flushTimeout
+        self.flushDeadline = flushDeadline
+        self.flushGuest = flushGuest
+        self.readGuest = readGuest
+        self.flushBreaker = flushBreaker
     }
 
     /// Get the path to a container's rootfs.ext4 file
@@ -122,56 +200,257 @@ struct ClientArchiveService: ClientArchiveProtocol {
             .appendingPathComponent("rootfs.ext4")
     }
 
-    /// A running guest owns the filesystem. Its writes sit in the VM's page cache and do not reach
-    /// `rootfs.ext4` on the host — measured: a file written through `exec` was still missing from the
-    /// image 45 seconds later, and only a `sync` inside the guest ever brought it across. Reading the
-    /// image therefore answers with the container's past, which is how every runtime-written file came
-    /// back 404 while `docker exec cat` printed it (ContainerStack #10).
+    /// Resolve the ext4 file backing a container's rootfs.
     ///
-    /// So while the guest runs, it packs the path itself, over the channel `docker exec` already uses;
-    /// once it is gone the image is the whole truth and is read directly.
-    func getArchive(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat) {
-        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
-
-        if container.status == .running {
-            do {
-                return try await getArchiveViaGuestTar(container: container, path: normalizedPath)
-            } catch let error as ClientArchiveError {
-                // A running guest is the authority on its own filesystem: if it says the path is not
-                // there, it is not there, and falling back to the image would resurrect a deleted file.
-                if case .pathNotFound = error { throw error }
-                Self.log.warning("guest could not pack \(normalizedPath), reading the image instead: \(error)")
-            } catch {
-                Self.log.warning("guest could not pack \(normalizedPath), reading the image instead: \(error)")
-            }
+    /// Apple Container provisions `containers/{id}/rootfs.ext4` only at first
+    /// start, so a created-but-never-started container has no rootfs file
+    /// (its `containers/{id}` directory holds runtime config only). Until the
+    /// container boots, its filesystem is the image's shared snapshot
+    /// referenced by `runtime-configuration.json` — read-only by construction
+    /// (every container of an image points at the same file), so reads can
+    /// safely serve from it.
+    ///
+    /// A container that has ever booted always has a private rootfs.ext4
+    /// (provisioned at start, persists after stop), so absence of the file
+    /// means "never started" — unless the rootfs was removed out-of-band, in
+    /// which case falling back to the image snapshot would silently serve
+    /// stale image content. `startedDate` is the runtime's ground truth for
+    /// "has booted" and gates the fallback.
+    private func resolveRootfsPath(container: ContainerSnapshot) throws -> URL {
+        let rootfsPath = getRootfsPath(containerId: container.id)
+        guard !FileManager.default.fileExists(atPath: rootfsPath.path) else {
+            return rootfsPath
         }
 
-        return try getArchiveFromImage(containerId: container.id, normalizedPath: normalizedPath)
+        guard container.startedDate == nil else {
+            throw ClientArchiveError.rootfsNotFound(id: container.id)
+        }
+
+        let configURL =
+            appSupportPath
+            .appendingPathComponent("containers")
+            .appendingPathComponent(container.id)
+            .appendingPathComponent("runtime-configuration.json")
+        guard
+            let data = try? Data(contentsOf: configURL),
+            let config = try? JSONDecoder().decode(RuntimeConfiguration.self, from: data),
+            !config.containerRootFilesystem.source.isEmpty
+        else {
+            throw ClientArchiveError.rootfsNotFound(id: container.id)
+        }
+
+        let snapshotURL = URL(fileURLWithPath: config.containerRootFilesystem.source)
+        guard FileManager.default.fileExists(atPath: snapshotURL.path) else {
+            throw ClientArchiveError.rootfsNotFound(id: container.id)
+        }
+        return snapshotURL
     }
 
-    /// Reads the path out of the container's `rootfs.ext4` on the host. Correct for a container that
-    /// is not running, and the fallback for a running one whose image has no `tar`.
-    private func getArchiveFromImage(containerId: String, normalizedPath: String) throws -> (tarData: Data, stat: PathStat) {
-        let rootfsPath = getRootfsPath(containerId: containerId)
+    /// Make recent guest writes visible to a host-side read of `rootfs.ext4`.
+    ///
+    /// The reads below parse the ext4 image from the host while the guest VM owns
+    /// it. A file the guest wrote recently sits in the guest page cache until it is
+    /// written back, so reading it straight away reports "not found" (for example a
+    /// step's `$GITHUB_OUTPUT` file read back by `docker cp`). Only a running
+    /// container has a live guest; stopped and never-started ones are read as-is.
+    ///
+    /// Best effort: a failed or stalled flush is logged and the read goes ahead with
+    /// whatever is already on disk, which is what happened before the flush existed.
+    ///
+    /// A flush that times out is abandoned, not killed (see `boundedFlush`). To keep a
+    /// client polling a wedged guest from piling up abandoned work, the timeout trips
+    /// the container in `flushBreaker`: reads skip the flush and read as-is (the same
+    /// outcome as a timeout) until that flush returns or the trip expires, after which
+    /// one probe flush is tried. Reads that arrive concurrently before the first
+    /// timeout each start their own flush; the breaker bounds sequential and polling
+    /// clients.
+    private func flushIfRunning(_ container: ContainerSnapshot) async {
+        guard container.status == .running else { return }
+        let breaker = flushBreaker
+        guard let attempt = breaker.begin(containerId: container.id) else {
+            Self.log.debug(
+                "Skipping guest sync before archive read for \(container.id): an earlier sync timed out; reading rootfs as-is until it returns or the trip expires"
+            )
+            return
+        }
+        if attempt.isProbe {
+            Self.log.debug("Probing guest sync before archive read for \(container.id) after an earlier timeout")
+        }
+        let flushGuest = flushGuest
+        let outcome = await Self.boundedFlush(timeout: flushTimeout, sleep: flushDeadline) {
+            // Runs inside the work `runBounded` waits on, so it also runs when this
+            // flush returns long after the read gave up on it.
+            defer { breaker.finish(attempt) }
+            try await flushGuest(container)
+        }
+        switch outcome {
+        case .flushed:
+            break
+        case .failed(let error):
+            Self.log.debug("Guest sync before archive read failed for \(container.id): \(error)")
+        case .timedOut:
+            breaker.abandon(attempt)
+            Self.log.warning(
+                "Guest sync before archive read did not finish within \(flushTimeout) for \(container.id); reading rootfs as-is and skipping guest syncs for this container until it returns or the trip expires"
+            )
+        }
+    }
+
+    enum FlushOutcome: Sendable {
+        case flushed
+        case failed(any Error)
+        case timedOut
+    }
+
+    /// Runs `flush`, returning once it finishes or `timeout` passes, whichever is first.
+    ///
+    /// The guest flush is an exec over XPC (`createProcess`, `start`, `wait`), and none
+    /// of those awaits react to task cancellation, so a task-group race would still wait
+    /// for a stuck exec after the deadline. `StartupHousekeeping.runBounded` runs the work
+    /// in an unstructured task and resumes on whichever finishes first; a flush still
+    /// running at the deadline is abandoned, not killed. `sleep` is the deadline's wait
+    /// (see `runBounded`).
+    static func boundedFlush(
+        timeout: Duration,
+        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        _ flush: @escaping @Sendable () async throws -> Void
+    ) async -> FlushOutcome {
+        final class ErrorBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var stored: (any Error)?
+            var error: (any Error)? {
+                get { lock.withLock { stored } }
+                set { lock.withLock { stored = newValue } }
+            }
+        }
+        let box = ErrorBox()
+        let finished = await StartupHousekeeping.runBounded(timeout: timeout, sleep: sleep) {
+            do {
+                try await flush()
+            } catch {
+                box.error = error
+            }
+        }
+        guard finished else { return .timedOut }
+        if let error = box.error { return .failed(error) }
+        return .flushed
+    }
+
+    struct GuestSyncExitError: Error, CustomStringConvertible {
+        let status: Int32
+        var description: String { "/bin/sync exited with status \(status)" }
+    }
+
+    /// Run `/bin/sync` as root in the guest, from `/` (the image's working directory
+    /// may not exist). Throws if the exec cannot be created or started (for example
+    /// an image without `/bin/sync`) or exits non-zero.
+    static func syncGuest(container: ContainerSnapshot) async throws {
+        var processConfig = container.configuration.initProcess
+        processConfig.executable = "/bin/sync"
+        processConfig.arguments = []
+        processConfig.workingDirectory = "/"
+        processConfig.terminal = false
+        processConfig.user = .id(uid: 0, gid: 0)
+
+        let process = try await ContainerClient().createProcess(
+            containerId: container.id,
+            processId: UUID().uuidString.lowercased(),
+            configuration: processConfig,
+            stdio: [nil, nil, nil]
+        )
+        try await process.start()
+        let status = try await process.wait()
+        guard status == 0 else { throw GuestSyncExitError(status: status) }
+    }
+
+    /// Read a file or directory from a container's filesystem and return as tar data
+    /// This implementation reads only the requested path directly, avoiding full filesystem export.
+    /// Stat a single path, reading the inode and nothing else.
+    ///
+    /// `getArchive` builds a tar of everything under the path before its caller
+    /// discards it. For `/` that is the whole filesystem, which is why a HEAD
+    /// against a large image took as long as reading it.
+    /// A running guest is asked first: it sees what its mounts hold, which no host-side read of
+    /// `rootfs.ext4` can — act keeps every step's `$GITHUB_OUTPUT` in its `/var/run/act` volume.
+    /// Nil sends the caller to the image, for a guest that is not running or cannot pack the path.
+    private func readThroughGuest(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat)? {
+        guard container.status == .running else { return nil }
+        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
+        do {
+            return try await readGuest(container, normalizedPath)
+        } catch let error as ClientArchiveError {
+            // A running guest is the authority on its own filesystem: if it says the path is not
+            // there, it is not there, and falling back to the image would resurrect a deleted file.
+            if case .pathNotFound = error { throw error }
+            Self.log.warning("guest could not pack \(normalizedPath), reading the image instead: \(error)")
+        } catch {
+            Self.log.warning("guest could not pack \(normalizedPath), reading the image instead: \(error)")
+        }
+        return nil
+    }
+
+    func statPath(container: ContainerSnapshot, path: String) async throws -> PathStat {
+        if let fromGuest = try await readThroughGuest(container: container, path: path) {
+            return fromGuest.stat
+        }
+        await flushIfRunning(container)
+        let rootfsPath = try resolveRootfsPath(container: container)
+        guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
+            throw ClientArchiveError.rootfsNotFound(id: container.id)
+        }
+
+        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
+        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
+        guard reader.exists(FilePath(normalizedPath)) else {
+            throw ClientArchiveError.pathNotFound(path: normalizedPath)
+        }
+
+        let (_, inode) = try reader.stat(FilePath(normalizedPath))
+        return PathStat(
+            name: (normalizedPath as NSString).lastPathComponent,
+            size: inode.size,
+            mode: goFileMode(posixMode: UInt32(inode.mode)),
+            mtime: dockerPathStatTimestamp(Date(timeIntervalSince1970: TimeInterval(inode.mtime))),
+            linkTarget: (inode.isSymlink ? readSymlinkTarget(reader: reader, path: normalizedPath) : nil) ?? ""
+        )
+    }
+
+    func getArchive(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat) {
+        if let fromGuest = try await readThroughGuest(container: container, path: path) {
+            return fromGuest
+        }
+        await flushIfRunning(container)
+        let rootfsPath = try resolveRootfsPath(container: container)
 
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
-            throw ClientArchiveError.rootfsNotFound(id: containerId)
+            throw ClientArchiveError.rootfsNotFound(id: container.id)
         }
+
+        // Normalize the path
+        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
 
         // Open the ext4 filesystem
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
 
-        guard let (_, inode) = Self.lstat(reader: reader, path: normalizedPath) else {
+        // Check if path exists and get stat. Like moby's lstat-based path
+        // resolution, a final-component symlink is reported as the symlink
+        // itself (linkTarget + symlink tar entry, dangling included), while
+        // intermediate symlink components are followed.
+        guard reader.exists(FilePath(normalizedPath)) || reader.exists(FilePath(normalizedPath), followSymlinks: false) else {
             throw ClientArchiveError.pathNotFound(path: normalizedPath)
         }
+
+        let (_, inode) =
+            try (try? reader.stat(FilePath(normalizedPath), followSymlinks: false))
+            ?? reader.stat(FilePath(normalizedPath))
 
         // Create PathStat for the response header
         let pathStat = PathStat(
             name: (normalizedPath as NSString).lastPathComponent,
             size: inode.size,
-            mode: UInt32(inode.mode),
-            mtime: ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval(inode.mtime))),
-            linkTarget: inode.isSymlink ? readSymlinkTarget(reader: reader, path: normalizedPath) : nil
+            mode: goFileMode(posixMode: UInt32(inode.mode)),
+            mtime: dockerPathStatTimestamp(Date(timeIntervalSince1970: TimeInterval(inode.mtime))),
+            linkTarget: (inode.isSymlink ? readSymlinkTarget(reader: reader, path: normalizedPath) : nil) ?? ""
         )
 
         // Create temporary directory for tar creation
@@ -185,13 +464,43 @@ struct ClientArchiveService: ClientArchiveProtocol {
             try? FileManager.default.removeItem(at: tarPath)
         }
 
-        try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        let baseName = (normalizedPath as NSString).lastPathComponent
 
-        // Extract the requested path to the staging directory
-        try extractPathToDirectory(reader: reader, sourcePath: normalizedPath, destDir: stagingDir)
+        if inode.isDirectory {
+            // Directories: stage the subtree, then archive it. Entries are
+            // `./`-prefixed — accepted by docker cp.
+            try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
 
-        // Create tar archive from the staging directory
-        try ArchiveUtility.create(tarPath: tarPath, from: stagingDir)
+            // Extract the requested path to the staging directory
+            try extractPathToDirectory(reader: reader, sourcePath: normalizedPath, destDir: stagingDir)
+
+            // Create tar archive from the staging directory
+            try ArchiveUtility.create(tarPath: tarPath, from: stagingDir)
+        } else {
+            // Single file or symlink: emit exactly one tar entry named after
+            // the basename, matching moby's archivePath output (no `./`
+            // directory entry). The directory-wrapped form breaks consumers
+            // that take the first tar entry as the payload
+            let writer = try ArchiveWriter(format: .paxRestricted, filter: .none, file: tarPath)
+            let entry = WriteEntry(writer)
+            entry.path = baseName
+            entry.fileType = inode.isRegularFile ? .regular : .symbolicLink
+            entry.permissions = inode.permissions
+            entry.owner = inode.fullUid
+            entry.group = inode.fullGid
+            entry.modificationDate = Date(timeIntervalSince1970: TimeInterval(inode.mtime))
+            if inode.isSymlink {
+                entry.symlinkTarget = readSymlinkTarget(reader: reader, path: normalizedPath)
+            }
+            let data = inode.isRegularFile ? try reader.readFile(at: FilePath(normalizedPath)) : nil
+            if let data {
+                entry.size = Int64(data.count)
+                try writer.writeEntry(entry: entry, data: data)
+            } else {
+                try writer.writeEntry(entry: entry, data: nil as UnsafeRawBufferPointer?)
+            }
+            try writer.finishEncoding()
+        }
 
         // Read the tar data
         let tarData = try Data(contentsOf: tarPath)
@@ -212,7 +521,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     /// The cost is a dependency on `tar` inside the image. Every image with a shell has one; a
     /// `scratch` or distroless one does not, and its read falls back to the host image, which is the
     /// behaviour it had before this path existed.
-    private func getArchiveViaGuestTar(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat) {
+    private static func getArchiveViaGuestTar(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat) {
         let (parent, name) = Self.splitForTar(path)
 
         var processConfig = container.configuration.initProcess
@@ -323,11 +632,11 @@ struct ClientArchiveService: ClientArchiveProtocol {
         return PathStat(
             name: (path as NSString).lastPathComponent,
             size: entry.size ?? 0,
-            // Raw Unix mode, matching what the image read reports for the same file, so a client
+            // Docker's encoding, the same as the image read reports for the same file, so a client
             // cannot see the mode change under it when a container starts or stops.
-            mode: UInt32(entry.permissions) | typeBits,
-            mtime: ISO8601DateFormatter().string(from: entry.modificationDate ?? Date(timeIntervalSince1970: 0)),
-            linkTarget: typeBits == UInt32(S_IFLNK) ? entry.symlinkTarget : nil
+            mode: goFileMode(posixMode: UInt32(entry.permissions) | typeBits),
+            mtime: dockerPathStatTimestamp(entry.modificationDate ?? Date(timeIntervalSince1970: 0)),
+            linkTarget: typeBits == UInt32(S_IFLNK) ? (entry.symlinkTarget ?? "") : ""
         )
     }
 
@@ -355,29 +664,6 @@ struct ClientArchiveService: ClientArchiveProtocol {
         return tarPath
     }
 
-    /// Replays the writes held for a container that has now started, through the running guest.
-    ///
-    /// Called by the start path once the container is up, so the boot that materialises its
-    /// filesystem is the start the client asked for and not a side effect of a copy. Failures are
-    /// reported to the caller: a builder whose certificates never arrived is worse than a start that
-    /// says why it failed.
-    func applyPendingArchives(container: ContainerSnapshot) async throws {
-        let pending = await PendingArchiveStore.shared.take(id: container.id)
-        guard !pending.isEmpty else { return }
-        defer {
-            for entry in pending { try? FileManager.default.removeItem(at: entry.tarPath) }
-        }
-
-        for entry in pending {
-            try await putArchiveViaCopyIn(
-                container: container,
-                destinationPath: entry.destination,
-                tarPath: entry.tarPath,
-                noOverwriteDirNonDir: entry.noOverwriteDirNonDir
-            )
-        }
-    }
-
     /// Extract a tar archive into a container's filesystem at the specified path
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws {
         // Normalize the destination path
@@ -399,22 +685,17 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
         let rootfsPath = getRootfsPath(containerId: container.id)
 
-        // A container that has only been created has no filesystem yet — the runtime materialises it
-        // when the guest first boots — so there is nothing to write into and nothing to boot without
-        // making the container look like it has run. The write is held and replayed by the start
-        // that is coming: buildx creates its builder, copies into it and then starts it, which is
-        // how the first `docker build` used to fail before BuildKit ran at all (#9).
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
-            guard !ContainerRunHistory.hasRun(id: container.id) else {
-                throw ClientArchiveError.rootfsNotFound(id: container.id)
+            // Never booted: hold the files until the runtime builds the
+            // filesystem, rather than refuse a copy Docker would accept.
+            if container.startedDate == nil {
+                try await stagePreStartInjection(
+                    container: container, destinationPath: normalizedPath, tarPath: tarPath)
+                return
             }
-            try await PendingArchiveStore.shared.stash(
-                id: container.id,
-                tarPath: tarPath,
-                destination: normalizedPath,
-                noOverwriteDirNonDir: noOverwriteDirNonDir
-            )
-            return
+            // Booted before and the rootfs is gone: staging would quietly
+            // resurrect the container carrying only these files.
+            throw ClientArchiveError.rootfsNotFound(id: container.id)
         }
 
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
@@ -432,8 +713,55 @@ struct ClientArchiveService: ClientArchiveProtocol {
         )
     }
 
+    /// Hold an archive uploaded before the container was ever started.
+    ///
+    /// Only regular files: a directory would need a whole-directory mount,
+    /// which hides what the image put there, and a symlink has no mount that
+    /// reproduces it. Both are refused while the copy can still be retried
+    /// after start.
+    private func stagePreStartInjection(
+        container: ContainerSnapshot, destinationPath: String, tarPath: URL
+    ) async throws {
+        let plan = try parseArchiveEntries(tarPath: tarPath, destinationPath: destinationPath)
+        for entry in plan {
+            if case .symlink = entry.kind {
+                throw ClientArchiveError.operationFailed(
+                    message: "cannot copy a symlink into \(container.id) before it starts")
+            }
+            if case .directory = entry.kind {
+                throw ClientArchiveError.operationFailed(
+                    message: "cannot copy a directory into \(container.id) before it starts")
+            }
+        }
+
+        // An empty tar carries nothing to stage, and `ArchiveReader.extractContents`
+        // rejects an archive with no entries, so extracting it would turn a no-op
+        // Docker answers with 200 into a 500. buildx's docker-container driver
+        // sends exactly this when it has no buildkitd.toml to inject. Mirrors the
+        // empty-plan return in the running-container path.
+        guard !plan.isEmpty else { return }
+
+        let stagingDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("prestart-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: stagingDir) }
+        try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        try ArchiveUtility.extract(tarPath: tarPath, to: stagingDir)
+
+        for entry in plan {
+            guard case .file = entry.kind else { continue }
+            let extracted = stagingDir.appendingPathComponent(entry.relativePath)
+            guard FileManager.default.fileExists(atPath: extracted.path) else {
+                throw ClientArchiveError.operationFailed(
+                    message: "archive entry missing after extraction: \(entry.relativePath)")
+            }
+            try await PreStartInjectionStore.shared.stage(
+                containerId: container.id, guestPath: entry.guestPath,
+                source: extracted, mode: entry.mode)
+        }
+    }
+
     /// One parsed entry of the uploaded archive.
-    private struct ArchiveEntryPlan {
+    struct ArchiveEntryPlan {
         enum Kind {
             case directory
             case file
@@ -484,11 +812,21 @@ struct ClientArchiveService: ClientArchiveProtocol {
         defer { try? FileManager.default.removeItem(at: stagingDir) }
         try ArchiveUtility.extract(tarPath: tarPath, to: stagingDir)
 
+        let mountDestinations = container.configuration.mounts.map(\.destination)
         let client = ContainerClient()
         for file in files {
             let stagedURL = stagingDir.appendingPathComponent(file.relativePath)
             guard FileManager.default.fileExists(atPath: stagedURL.path) else {
                 throw ClientArchiveError.operationFailed(message: "archive entry missing after extraction: \(file.relativePath)")
+            }
+            if Self.liesUnderMount(file.guestPath, mountDestinations: mountDestinations) {
+                try await writeFileThroughGuestShell(
+                    container: container,
+                    source: stagedURL,
+                    guestPath: file.guestPath,
+                    mode: file.mode
+                )
+                continue
             }
             do {
                 try await client.copyIn(
@@ -544,6 +882,95 @@ struct ClientArchiveService: ClientArchiveProtocol {
         return plan
     }
 
+    /// The guest process that runs the preparation script, and the bytes to
+    /// write to its stdin.
+    ///
+    /// The script holds one line per directory in the archive, so it grows
+    /// without bound. A single argv string is capped at 128 KiB on Linux
+    /// (MAX_ARG_STRLEN), and exec fails past that, so the script is fed over
+    /// stdin (`sh -s`) and only the destination path travels in argv.
+    struct GuestPreparationLaunch {
+        let configuration: ProcessConfiguration
+        let stdin: Data
+    }
+
+    /// Build the exact process configuration and stdin payload that
+    /// `prepareGuestForCopy` launches in the guest.
+    func makeGuestPreparationLaunch(
+        container: ContainerSnapshot,
+        destinationPath: String,
+        entries: [ArchiveEntryPlan],
+        noOverwriteDirNonDir: Bool
+    ) -> GuestPreparationLaunch {
+        let script = buildPreparationScript(
+            entries: entries,
+            noOverwriteDirNonDir: noOverwriteDirNonDir
+        )
+
+        var processConfig = container.configuration.initProcess
+        processConfig.executable = "/bin/sh"
+        processConfig.arguments = ["-s", destinationPath]
+        processConfig.terminal = false
+        // Validate as root so restrictive permissions on parent directories
+        // cannot mask the existence checks.
+        processConfig.user = .id(uid: 0, gid: 0)
+
+        return GuestPreparationLaunch(configuration: processConfig, stdin: Data(script.utf8))
+    }
+
+    /// Queue that runs the blocking stdin writes of `feedStdin`.
+    ///
+    /// A dedicated GCD queue rather than a Swift task: the write can block for
+    /// as long as the guest shell does not read, and a task blocked in write(2)
+    /// would hold one of the Swift cooperative pool's threads (about one per
+    /// core) for that whole time, so a few stuck uploads could stall every
+    /// async route in the daemon.
+    ///
+    /// A stuck write still pins one GCD worker thread until the guest process
+    /// exits and the pipe breaks; this only frees the cooperative pool. GCD
+    /// caps its worker pool (about 64 threads), and saturating it would also
+    /// delay other GCD work in the process, such as the DispatchIO-based exec
+    /// and attach output pumping and upstream DNS forwarding. An asynchronous
+    /// DispatchIO write would not pin a thread and is a possible follow-up.
+    static let stdinFeedQueue = DispatchQueue(
+        label: "socktainer.archive.prepare-stdin",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    /// Write `data` to `writer` on `queue`, then close `writer`, then call
+    /// `completion` with the write error, if any.
+    ///
+    /// Returns immediately. The payload can be larger than the pipe buffer, so
+    /// the write blocks until the reader has consumed it; it runs on a GCD
+    /// queue so it holds neither the caller nor a cooperative-pool thread
+    /// (it does occupy one GCD worker thread while blocked).
+    /// Closing the write end gives the reader (`sh -s`) its EOF. The reader may
+    /// exit before consuming everything (e.g. exit 40 when the destination is
+    /// missing), so SIGPIPE is suppressed on this fd before the write is
+    /// queued, and the write fails with EPIPE instead of killing the daemon;
+    /// the write end is closed in that case too. `writer` is owned by the
+    /// queued work item; the caller must not close it.
+    static func feedStdin(
+        writer: FileHandle,
+        data: Data,
+        queue: DispatchQueue = stdinFeedQueue,
+        completion: @escaping @Sendable (Error?) -> Void = { _ in }
+    ) {
+        _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
+        queue.async {
+            let result: Error?
+            do {
+                try writer.write(contentsOf: data)
+                result = nil
+            } catch {
+                result = error
+            }
+            try? writer.close()
+            completion(result)
+        }
+    }
+
     /// Run Docker's PUT-archive validation inside the running guest and create
     /// the directory/symlink structure for the incoming archive: destination
     /// must exist (404) and be a directory (400), optional per-entry
@@ -555,21 +982,79 @@ struct ClientArchiveService: ClientArchiveProtocol {
         entries: [ArchiveEntryPlan],
         noOverwriteDirNonDir: Bool
     ) async throws {
-        let script = buildPreparationScript(
+        let launch = makeGuestPreparationLaunch(
+            container: container,
+            destinationPath: destinationPath,
             entries: entries,
             noOverwriteDirNonDir: noOverwriteDirNonDir
         )
 
+        let (exitCode, stderrText, _) = try await runGuestProcess(
+            container: container,
+            configuration: launch.configuration,
+            stdin: launch.stdin,
+            purpose: "validation"
+        )
+
+        switch exitCode {
+        case 0:
+            return
+        case 40:
+            throw ClientArchiveError.pathNotFound(path: destinationPath)
+        case 41:
+            throw ClientArchiveError.notADirectory(path: destinationPath)
+        default:
+            let detail = stderrText.isEmpty ? "" : ": \(stderrText)"
+            throw ClientArchiveError.operationFailed(message: "Validation in running container failed (exit \(exitCode))\(detail)")
+        }
+    }
+
+    /// Write one file below a mount, where `copyIn` cannot reach, through a shell in the container's
+    /// own mount namespace. Needs only `sh`, `cat` and `chmod`, like the preparation script.
+    private func writeFileThroughGuestShell(
+        container: ContainerSnapshot,
+        source: URL,
+        guestPath: String,
+        mode: UInt32
+    ) async throws {
         var processConfig = container.configuration.initProcess
         processConfig.executable = "/bin/sh"
-        processConfig.arguments = ["-c", script, "sh", destinationPath]
+        processConfig.arguments = ["-c", "cat > \"$1\" && chmod \"$2\" \"$1\"", "sh", guestPath, String(mode, radix: 8)]
         processConfig.terminal = false
-        // Validate as root so restrictive permissions on parent directories
-        // cannot mask the existence checks.
+        // As root, so restrictive permissions on parent directories cannot get in the way.
         processConfig.user = .id(uid: 0, gid: 0)
 
-        guard let pipes = StdioPipes.make([.stderr]) else {
-            throw ClientArchiveError.operationFailed(message: "Failed to create stderr pipe")
+        // Mapped, not read: the pages come off the disk as the guest takes them.
+        let contents = try Data(contentsOf: source, options: .alwaysMapped)
+        let (exitCode, stderrText, stdinError) = try await runGuestProcess(
+            container: container,
+            configuration: processConfig,
+            stdin: contents,
+            purpose: "copying \(guestPath)"
+        )
+        guard exitCode == 0 else {
+            let detail = stderrText.isEmpty ? "" : ": \(stderrText)"
+            throw ClientArchiveError.operationFailed(
+                message: "Failed to copy \(guestPath) into running container (exit \(exitCode))\(detail)")
+        }
+        if let stdinError {
+            throw ClientArchiveError.operationFailed(
+                message: "Failed to stream \(guestPath) into running container: \(stdinError.localizedDescription)")
+        }
+    }
+
+    /// Start `configuration` in the running container, feed it `stdin`, and wait for it. Returns the
+    /// exit code, the first 16 KiB of stderr and, after a clean exit, the error of the stdin write: a
+    /// shell that read to the end has also let the write finish, while one that failed may have
+    /// stopped reading, and its own exit code is then the error to report.
+    private func runGuestProcess(
+        container: ContainerSnapshot,
+        configuration: ProcessConfiguration,
+        stdin: Data,
+        purpose: String
+    ) async throws -> (exitCode: Int32, stderr: String, stdinError: Error?) {
+        guard let pipes = StdioPipes.make([.stdin, .stderr]) else {
+            throw ClientArchiveError.operationFailed(message: "Failed to create stdio pipes")
         }
 
         let process: ClientProcess
@@ -577,7 +1062,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
             process = try await ContainerClient().createProcess(
                 containerId: container.id,
                 processId: UUID().uuidString.lowercased(),
-                configuration: processConfig,
+                configuration: configuration,
                 stdio: pipes.stdioArray
             )
         } catch {
@@ -589,6 +1074,12 @@ struct ClientArchiveService: ClientArchiveProtocol {
         } catch {
             pipes.closeAfterHandoff()
             throw ClientArchiveError.operationFailed(message: "Failed to exec into running container: \(error.localizedDescription)")
+        }
+
+        let (feedResult, feedDone) = AsyncStream<Error?>.makeStream()
+        Self.feedStdin(writer: pipes.stdin!.write, data: stdin) { error in
+            feedDone.yield(error)
+            feedDone.finish()
         }
 
         // Drain stderr concurrently (capped at 16 KiB) while waiting.
@@ -613,30 +1104,54 @@ struct ClientArchiveService: ClientArchiveProtocol {
             // Concurrent close(2) + read(2) on the same fd is unsafe (NSException risk).
             // Rethrow immediately; stderrTask exits naturally when the process terminates
             // and Apple closes the write end.
-            throw ClientArchiveError.operationFailed(message: "Failed waiting for validation in running container: \(error.localizedDescription)")
+            throw ClientArchiveError.operationFailed(message: "Failed waiting for \(purpose) in running container: \(error.localizedDescription)")
+        }
+
+        var stdinError: Error?
+        if exitCode == 0 {
+            for await error in feedResult {
+                stdinError = error
+            }
         }
 
         let stderrText =
             String(data: await stderrTask.value, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return (exitCode, stderrText, stdinError)
+    }
 
-        switch exitCode {
-        case 0:
-            return
-        case 40:
-            throw ClientArchiveError.pathNotFound(path: destinationPath)
-        case 41:
-            throw ClientArchiveError.notADirectory(path: destinationPath)
-        default:
-            let detail = stderrText.isEmpty ? "" : ": \(stderrText)"
-            throw ClientArchiveError.operationFailed(message: "Validation in running container failed (exit \(exitCode))\(detail)")
+    /// Whether `guestPath` is a mount destination or lies below one. The runtime's `copyIn` writes
+    /// below the rootfs as the VM sees it, and a mount exists only in the container's own mount
+    /// namespace, so a file sent there lands under the mount point, out of the container's sight.
+    static func liesUnderMount(_ guestPath: String, mountDestinations: [String]) -> Bool {
+        let path = lexicallyNormalized(guestPath)
+        return mountDestinations.contains { destination in
+            let mountPoint = lexicallyNormalized(destination)
+            return path == mountPoint || path.hasPrefix(mountPoint + "/")
         }
+    }
+
+    /// `//`, `.` and `..` resolved on the text alone. `standardizingPath` is no substitute: it
+    /// consults the host's filesystem, and these are paths inside the guest.
+    static func lexicallyNormalized(_ path: String) -> String {
+        var components: [Substring] = []
+        for component in path.split(separator: "/") {
+            switch component {
+            case ".":
+                continue
+            case "..":
+                _ = components.popLast()
+            default:
+                components.append(component)
+            }
+        }
+        return "/" + components.joined(separator: "/")
     }
 
     /// Build the validation/preparation shell script run inside the guest.
     /// Only `sh`, `mkdir`, `ln` and `test` are required. Existing directories
     /// are never modified, mirroring how tar treats implicit parents.
-    private func buildPreparationScript(
+    func buildPreparationScript(
         entries: [ArchiveEntryPlan],
         noOverwriteDirNonDir: Bool
     ) -> String {
@@ -774,50 +1289,27 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
-    /// `lstat`: describe the entry itself, never what it points at — which is what tar stores and what
-    /// moby's archive path does (`os.Lstat`, daemon/archive_unix.go).
+    /// Read a symlink's target.
     ///
-    /// `EXT4Reader` has no lstat. Its `followSymlinks` flag applies to *every* component of the path,
-    /// not just the last one, so asking it not to follow also refuses to walk *through* a symlinked
-    /// directory: `/var/run/app.sock` where `/var/run -> /run` stops dead at `run`. Hence two steps —
-    /// describe the entry without following, and if the walk could not get there, resolve normally.
-    ///
-    /// Residual divergence, deliberate: a path whose parent chain contains a symlink *and* whose final
-    /// component is one too is archived as its target rather than as a link. moby would store the
-    /// link. The alternative is re-implementing symlink resolution here, and returning the target's
-    /// bytes is the smaller lie than 404 for a path that plainly exists.
-    static func lstat(reader: EXT4.EXT4Reader, path: String) -> (EXT4.InodeNumber, EXT4.Inode)? {
-        if let entry = try? reader.stat(FilePath(path), followSymlinks: false) {
-            return entry
-        }
-        return try? reader.stat(FilePath(path), followSymlinks: true)
-    }
-
-    /// The target a symlink points at, read the way the reader's own exporter reads it.
-    ///
-    /// `readFile` cannot: it rejects any inode that is not a regular file, so every symlink came back
-    /// nil and was dropped from the archive entirely — `docker cp <ctr>:/etc .` silently lost `mtab`,
-    /// `os-release` and friends instead of copying them as links.
-    ///
-    /// ext4 stores a target shorter than 60 bytes inline in the inode's block array (a "fast
-    /// symlink"), which is what EXT4Reader+Export reads. A longer target lives in data blocks, and
-    /// reaching those needs block arithmetic the reader keeps private, so such an entry is logged and
-    /// skipped rather than guessed at.
+    /// EXT4.EXT4Reader has no public symlink API — `readFile(followSymlinks:
+    /// false)` rejects symlink inodes with `notAFile`, and `followSymlinks:
+    /// true` returns the *target file's* content. Fast symlinks (target < 60
+    /// bytes, the overwhelming majority in practice) store the target inline
+    /// in the inode block field, which is public; slow symlinks (>= 60 bytes)
+    /// are not readable through the public API and report nil.
     private func readSymlinkTarget(reader: EXT4.EXT4Reader, path: String) -> String? {
-        guard let (_, inode) = try? reader.stat(FilePath(path), followSymlinks: false), inode.isSymlink else {
+        guard
+            let inode = try? reader.stat(FilePath(path), followSymlinks: false).inode,
+            inode.isSymlink
+        else {
             return nil
         }
-        let size = Int(inode.size)
-        guard size > 0 else { return nil }
-        guard size < 60 else {
-            // Not readable through the public API, and silence here means the entry vanishes from the
-            // archive — the exact failure this whole change is about. A copy that quietly returns
-            // fewer files than the container holds is worse than one that says it cannot.
-            Self.log.error("symlink target of \(path) is \(size) bytes; only inline targets are readable")
+        let targetLength = inode.size
+        guard targetLength > 0, targetLength < 60 else {
             return nil
         }
-        let inlineBytes = Mirror(reflecting: inode.block).children.compactMap { $0.value as? UInt8 }
-        return String(bytes: inlineBytes.prefix(size), encoding: .utf8)
+        let blockBytes = Mirror(reflecting: inode.block).children.map { $0.value as! UInt8 }
+        return String(bytes: blockBytes.prefix(Int(targetLength)), encoding: .utf8)
     }
 
     private func validateArchiveEntries(
@@ -853,14 +1345,14 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
-    /// Extract a path from the ext4 filesystem to a local directory
+    /// Extract a path from the ext4 filesystem to a local directory.
+    /// Symlinks are reported as symlinks (non-following stat, matching moby's
+    /// lstat semantics) — recursive children are only listed for real
+    /// directories, never followed through symlinks.
     private func extractPathToDirectory(reader: EXT4.EXT4Reader, sourcePath: String, destDir: URL) throws {
-        // lstat, not stat: a symlink is archived as itself. Following it also breaks the walk
-        // outright when the target is outside the filesystem — `/etc/mtab -> /proc/mounts` threw
-        // and took the whole directory's archive with it.
-        guard let (_, inode) = Self.lstat(reader: reader, path: sourcePath) else {
-            throw ClientArchiveError.pathNotFound(path: sourcePath)
-        }
+        let (_, inode) =
+            try (try? reader.stat(FilePath(sourcePath), followSymlinks: false))
+            ?? reader.stat(FilePath(sourcePath))
         let baseName = sourcePath == "/" ? nil : (sourcePath as NSString).lastPathComponent
 
         if inode.isDirectory {
@@ -903,21 +1395,147 @@ struct ClientArchiveService: ClientArchiveProtocol {
                 ofItemAtPath: fileDest.path
             )
         } else if inode.isSymlink {
-            guard let baseName else {
-                throw ClientArchiveError.invalidPath(path: sourcePath)
+            // Read symlink target
+            if let target = readSymlinkTarget(reader: reader, path: sourcePath) {
+                guard let baseName else {
+                    throw ClientArchiveError.invalidPath(path: sourcePath)
+                }
+                let linkDest = destDir.appendingPathComponent(baseName)
+                try FileManager.default.createSymbolicLink(atPath: linkDest.path, withDestinationPath: target)
             }
-            // Dropping the entry when the target cannot be read is silent data loss: the client gets a
-            // tar that is missing a file and no indication of it. ext4 stores targets under 60 bytes
-            // inline; anything longer needs block arithmetic the reader keeps private, so say so.
-            guard let target = readSymlinkTarget(reader: reader, path: sourcePath) else {
-                throw ClientArchiveError.operationFailed(
-                    message: "cannot read the symlink target of \(sourcePath); refusing to omit it from the archive"
-                )
-            }
-            let linkDest = destDir.appendingPathComponent(baseName)
-            try FileManager.default.createSymbolicLink(atPath: linkDest.path, withDestinationPath: target)
         }
         // Skip other file types (devices, fifos, sockets)
     }
 
+}
+
+/// Per-container circuit breaker for the guest flush before archive reads.
+///
+/// A container trips when a flush times out and is abandoned. While it is tripped,
+/// reads skip the flush and read rootfs as-is, so a client polling a wedged guest
+/// does not start one abandoned flush per read.
+///
+/// A trip does not last forever: the XPC call behind an abandoned flush may never
+/// return, and a container restarted with the same id would otherwise stay tripped
+/// (and read stale data) for the life of the server. `reArmInterval` after the trip
+/// was last renewed, `begin` grants one probe flush and renews the trip, so other
+/// reads keep skipping while the probe runs. A probe that times out trips the
+/// container again; one that returns untrips it. Abandoned work is therefore bounded
+/// to about one flush per interval per container.
+///
+/// Each flush is an `Attempt`. The flush work calls `finish` when it returns; the read
+/// calls `abandon` after it timed out. Both run under one lock, and `abandon` does
+/// nothing for an attempt that already finished, so a flush that returns right at the
+/// deadline cannot leave the container tripped. An attempt that returns without having
+/// been abandoned proves the guest answers and clears the trip, including attempts
+/// abandoned earlier that may never return. An abandoned attempt that returns late
+/// only counts for the trip it was abandoned into: it untrips the container once no
+/// other abandoned attempt of that trip is still out, and does nothing once that trip
+/// has ended (a later trip is about a later timeout it says nothing about).
+///
+/// Limit: an entry lives until its trip ends, so a container removed while tripped
+/// leaves one small entry behind (reused if a container with the same id is created
+/// later). Only containers whose flush timed out get one, so the map is bounded by
+/// the wedged containers the server has seen.
+final class GuestFlushBreaker: @unchecked Sendable {
+    /// How long a trip lasts before one probe flush is allowed.
+    static let defaultReArmInterval: Duration = .seconds(60)
+
+    final class Attempt: @unchecked Sendable {
+        let containerId: String
+        /// Whether this attempt was granted while the container was tripped.
+        let isProbe: Bool
+        // Guarded by the owning breaker's lock.
+        fileprivate var finished = false
+        /// Set by `abandon`; the attempt then sits in that trip's `pending`.
+        fileprivate var abandoned = false
+
+        fileprivate init(containerId: String, isProbe: Bool) {
+            self.containerId = containerId
+            self.isProbe = isProbe
+        }
+    }
+
+    private struct Trip {
+        /// Abandoned attempts that have not returned.
+        var pending: Set<ObjectIdentifier>
+        /// The last abandon, or the last probe granted.
+        var renewedAt: ContinuousClock.Instant
+    }
+
+    private let lock = NSLock()
+    private let reArmInterval: Duration
+    private let now: @Sendable () -> ContinuousClock.Instant
+    private var trips: [String: Trip] = [:]
+
+    /// - Parameters:
+    ///   - reArmInterval: how long after the last abandoned (or probe) flush a tripped
+    ///     container gets one new flush attempt.
+    ///   - now: the clock; injectable so tests can expire a trip without waiting.
+    init(
+        reArmInterval: Duration = GuestFlushBreaker.defaultReArmInterval,
+        now: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock.now }
+    ) {
+        self.reArmInterval = reArmInterval
+        self.now = now
+    }
+
+    /// Whether reads of `containerId` currently skip the flush: an abandoned flush
+    /// has not returned and the trip has not expired yet.
+    func isTripped(containerId: String) -> Bool {
+        lock.withLock {
+            guard let trip = trips[containerId] else { return false }
+            return now() - trip.renewedAt < reArmInterval
+        }
+    }
+
+    /// Starts a flush attempt for `containerId`, or returns `nil` if the container is
+    /// tripped and the read should skip the flush. Once a trip has expired, the first
+    /// caller gets a probe attempt and renews the trip, so concurrent callers skip.
+    func begin(containerId: String) -> Attempt? {
+        lock.withLock {
+            guard var trip = trips[containerId] else {
+                return Attempt(containerId: containerId, isProbe: false)
+            }
+            let instant = now()
+            guard instant - trip.renewedAt >= reArmInterval else { return nil }
+            trip.renewedAt = instant
+            trips[containerId] = trip
+            return Attempt(containerId: containerId, isProbe: true)
+        }
+    }
+
+    /// The flush returned (in time or not).
+    func finish(_ attempt: Attempt) {
+        lock.withLock {
+            attempt.finished = true
+            let id = attempt.containerId
+            guard var trip = trips[id] else { return }
+            guard attempt.abandoned else {
+                // Returned before the read gave up on it: the guest answers.
+                trips[id] = nil
+                return
+            }
+            // Abandoned: it only belongs to the trip whose `pending` holds it. If that
+            // trip already ended, the current one is a later, unrelated timeout.
+            guard trip.pending.remove(ObjectIdentifier(attempt)) != nil else { return }
+            trips[id] = trip.pending.isEmpty ? nil : trip
+        }
+    }
+
+    /// The read stopped waiting for the flush. Trips its container (renewing the trip)
+    /// unless the flush already returned. Returns whether it tripped.
+    @discardableResult
+    func abandon(_ attempt: Attempt) -> Bool {
+        lock.withLock {
+            guard !attempt.finished else { return false }
+            attempt.abandoned = true
+            let id = attempt.containerId
+            var trip = trips[id] ?? Trip(pending: [], renewedAt: now())
+            trip.pending.insert(ObjectIdentifier(attempt))
+            trip.renewedAt = now()
+            trips[id] = trip
+            return true
+        }
+    }
 }

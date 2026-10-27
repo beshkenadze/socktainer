@@ -20,6 +20,19 @@ extension ContainerInspectRoute {
         }
     }
 
+    /// Docker's `HostConfig.PortBindings` is the request, which can leave HostIp and
+    /// HostPort unset, while `NetworkSettings.Ports` is what was bound. The request
+    /// comes from the create route's label; a container created without it reports
+    /// its published ports instead.
+    static func hostConfigPortBindings(labels: [String: String], published: [String: [PortBinding]]) -> [String: [PortBinding]]? {
+        if let json = labels[ContainerCreateRoute.portBindingsLabel],
+            let requested = try? JSONDecoder().decode([String: [PortBinding]].self, from: Data(json.utf8))
+        {
+            return requested
+        }
+        return published.isEmpty ? nil : published
+    }
+
     /// Apple Container only reports live network attachments while a
     /// container is running (`container.networks` is hardcoded to `[]` once
     /// stopped), whereas Docker's `NetworkSettings.Networks` reflects the
@@ -178,7 +191,8 @@ extension ContainerInspectRoute {
             // `shmSize` was defaulted at create time to Docker's 64 MiB.
             let hostConfig = HostConfig(
                 restartPolicy: restartPolicy,
-                portBindings: portBindings,
+                // What the client asked for, as Docker reports it; what was bound is in NetworkSettings.
+                portBindings: Self.hostConfigPortBindings(labels: container.configuration.labels, published: portBindings),
                 memory: Int(clamping: container.configuration.resources.memoryInBytes),
                 nanoCpus: container.configuration.resources.cpus * 1_000_000_000,
                 shmSize: container.configuration.shmSize.map { Int(clamping: $0) },

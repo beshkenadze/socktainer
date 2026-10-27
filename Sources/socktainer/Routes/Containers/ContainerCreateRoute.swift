@@ -163,9 +163,10 @@ extension ContainerCreateRoute {
             // Validate the requested platform only if provided
             var requestedPlatform = try Platform(from: containerPlatform)
 
-            // Check if image exists locally
+            // Check if image exists locally; resolve an image ID to its reference
+            let imageReference: String
             do {
-                _ = try await ClientImage.get(reference: body.Image, containerSystemConfig: systemConfig)
+                imageReference = try await ImageIDResolver.get(body.Image, containerSystemConfig: systemConfig).reference
             } catch {
                 throw ContainerCreateRoute.imageExistenceError(error, image: body.Image)
             }
@@ -178,8 +179,9 @@ extension ContainerCreateRoute {
             var img: ClientImage
             do {
                 img = try await ClientImage.fetch(
-                    reference: body.Image,
+                    reference: imageReference,
                     platform: requestedPlatform,
+                    scheme: await RegistryScheme.scheme(forReference: imageReference),
                     containerSystemConfig: systemConfig
                 )
                 // Case 2: image exists locally but may have been pulled as amd64
@@ -198,8 +200,9 @@ extension ContainerCreateRoute {
                 let amd64 = Platform(arch: "amd64", os: requestedPlatform.os, variant: nil)
                 req.logger.info("\(body.Image) has no arm64 variant — falling back to amd64 (Rosetta)")
                 img = try await ClientImage.fetch(
-                    reference: body.Image,
+                    reference: imageReference,
                     platform: amd64,
+                    scheme: await RegistryScheme.scheme(forReference: imageReference),
                     containerSystemConfig: systemConfig
                 )
                 requestedPlatform = amd64
@@ -214,6 +217,7 @@ extension ContainerCreateRoute {
 
             let initImage = try await ClientImage.fetch(
                 reference: systemConfig.vminit.image, platform: .current,
+                scheme: await RegistryScheme.scheme(forReference: systemConfig.vminit.image),
                 containerSystemConfig: systemConfig
             )
 
@@ -221,6 +225,8 @@ extension ContainerCreateRoute {
                 platform: .current)
 
             let imageConfig = try await img.config(for: requestedPlatform).config
+            let rawImageConfig = try await ImageVolumeConfiguration.read(image: img, platform: requestedPlatform)
+            let imageVolumes = rawImageConfig?.Volumes
 
             let workingDirectory = imageConfig?.workingDir ?? "/"
 
@@ -230,7 +236,9 @@ extension ContainerCreateRoute {
             let mergedEnv = try Parser.allEnv(imageEnvs: imageConfigEnvironment, envFiles: [], envs: requestedEnvironment)
 
             // Inside a VM 127.0.0.1 is the container's own loopback, not the host. Rewrite
-            // URL-form connection strings to the vmnet gateway. host-mode containers are
+            // URL-form connection strings to the vmnet gateway. Opt-in via the
+            // `socktainer.rewrite-loopback=true` label: Docker never rewrites env, and
+            // client-facing URLs must stay intact (#416). host-mode containers are
             // excluded — they stay on "default" with loopback DNS so NPM imports fail fast.
             var finalEnv = mergedEnv
             let envNetworkKeys = body.NetworkingConfig?.EndpointsConfig.map { Array($0.keys) } ?? []
@@ -240,7 +248,8 @@ extension ContainerCreateRoute {
                 endpointsConfigKeys: envNetworkKeys,
                 networkMode: body.HostConfig?.NetworkMode
             )
-            if let firstNet = namedNet,
+            if ContainerCreateRoute.shouldRewriteLoopback(labels: body.Labels),
+                let firstNet = namedNet,
                 let networkResource = try? await NetworkClient().get(id: firstNet)
             {
                 let gatewayIP = networkResource.status.ipv4Gateway.description
@@ -274,9 +283,14 @@ extension ContainerCreateRoute {
 
             let publishedPorts: [PublishPort]
             do {
-                publishedPorts = try convertPortBindings(
-                    from: body.HostConfig?.PortBindings ?? [:]
-                )
+                var portBindings = body.HostConfig?.PortBindings ?? [:]
+                if body.HostConfig?.PublishAllPorts == true {
+                    portBindings = publishAllPortBindings(
+                        bindings: portBindings,
+                        exposed: Array((rawImageConfig?.ExposedPorts ?? [:]).keys) + Array((body.ExposedPorts ?? [:]).keys)
+                    )
+                }
+                publishedPorts = try convertPortBindings(from: portBindings)
             } catch {
                 req.logger.error("Failed to allocate ports: \(error)")
                 throw Abort(.internalServerError, reason: "Failed to allocate ports: \(error)")
@@ -446,11 +460,12 @@ extension ContainerCreateRoute {
             // does instead of deriving a new one from the new name.
             containerLabels[DockerContainerID.idLabel] = DockerContainerID.mint()
 
-            // Persist the requested healthcheck across create → start so the
+            // Persist the effective healthcheck (request merged over the image's
+            // HEALTHCHECK) across create → start so the
             // start route can launch the probe loop and inspect can return it
             // in Config.Healthcheck. Apple Container has no native field for
             // this, so a JSON-encoded label is the carrier.
-            if let healthcheck = body.Healthcheck {
+            if let healthcheck = HealthcheckConfig.merged(request: body.Healthcheck, image: rawImageConfig?.Healthcheck) {
                 do {
                     let json = try JSONEncoder().encode(healthcheck)
                     if let jsonString = String(data: json, encoding: .utf8) {
@@ -465,6 +480,12 @@ extension ContainerCreateRoute {
             // policy the same way as Healthcheck so the start route's die observer can honor it.
             if let restartPolicyLabel = ContainerCreateRoute.restartPolicyLabel(for: body.HostConfig?.RestartPolicy, logger: req.logger) {
                 containerLabels[RestartPolicyManager.label] = restartPolicyLabel
+            }
+
+            // Apple Container keeps only the resolved published ports; persist the request so
+            // inspect can report HostConfig.PortBindings as sent, unset HostIp/HostPort included.
+            if let portBindingsLabel = ContainerCreateRoute.portBindingsLabelValue(for: body.HostConfig?.PortBindings, logger: req.logger) {
+                containerLabels[ContainerCreateRoute.portBindingsLabel] = portBindingsLabel
             }
 
             if !dnsNames.isEmpty {
@@ -510,9 +531,17 @@ extension ContainerCreateRoute {
                     req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
                 }
             }
-            containerConfiguration.labels = containerLabels
+            var labelsWithTimestamp = containerLabels
+            // Stamp the creation time so the Docker-facing id stays the same if
+            // the container is later rebuilt to carry pre-start files.
+            labelsWithTimestamp[AppleContainerTimestampResolver.legacyCreationTimestampLabel] =
+                String(Date().timeIntervalSince1970)
+            containerConfiguration.labels = labelsWithTimestamp
 
             var resolvedMounts: [Filesystem] = []
+            // Named volumes worth a copy-up, collected here and populated once the
+            // container exists: the image's contents are only reachable from it.
+            var copyUpCandidates: [(source: String, destination: String)] = []
 
             // Docker creates missing bind-mount source directories on the host automatically.
             // Parser.mounts() validates that the source path exists and throws if not, so we
@@ -564,8 +593,17 @@ extension ContainerCreateRoute {
                 let otherMounts = mounts.filter { $0.MountType.lowercased() != "volume" && !isSocketPath($0.Source) }
 
                 // Handle volume mounts using the volume format (source:destination)
-                if !volumeMounts.isEmpty {
-                    let volumeStrings = volumeMounts.map { mount in
+                // A volume mount without a source is anonymous (compose `- /data`).
+                for mount in volumeMounts where mount.Source.isEmpty {
+                    do {
+                        mountsOrFs.append(.volume(try ContainerCreateRoute.anonymousVolume(for: mount)))
+                    } catch {
+                        throw Abort(.badRequest, reason: "Invalid volume declaration: \(error)")
+                    }
+                }
+                let namedVolumeMounts = volumeMounts.filter { !$0.Source.isEmpty }
+                if !namedVolumeMounts.isEmpty {
+                    let volumeStrings = namedVolumeMounts.map { mount in
                         var volumeString = "\(mount.Source):\(mount.Target)"
                         if mount.ReadOnly == true {
                             volumeString += ":ro"
@@ -605,88 +643,171 @@ extension ContainerCreateRoute {
                 }
             }
 
-            // Resolve volumes from both volumes and mounts
-            for item in (volumesOrFs + mountsOrFs) {
-                switch item {
-                case .filesystem(let fs):
-                    resolvedMounts.append(fs)
-                case .volume(let parsed):
-                    // Check if volume exists by listing all volumes and finding a match
-                    let existingVolumes = try await ClientVolume.list()
-                    let existingVolume = existingVolumes.first { $0.name == parsed.name }
+            let declaredMounts: [VolumeOrFilesystem]
+            do {
+                declaredMounts = try ImageVolumeConfiguration.mounts(
+                    imagePaths: imageVolumes.map { Array($0.keys) } ?? [],
+                    requestPaths: body.Volumes.map { Array($0.keys) } ?? [],
+                    explicit: volumesOrFs + mountsOrFs)
+            } catch {
+                throw Abort(.badRequest, reason: "Invalid volume declaration: \(error)")
+            }
 
-                    let volume: ContainerResource.VolumeConfiguration
-                    if let existing = existingVolume {
-                        volume = existing
-                    } else {
-                        // Volume doesn't exist, create it automatically (Docker behavior)
-                        // might be revisited if https://github.com/apple/container/issues/690 is closed
-                        req.logger.debug("Volume '\(parsed.name)' not found, creating it automatically")
-                        volume = try await ClientVolume.create(
-                            name: parsed.name,
-                            driver: "local",
-                            driverOpts: [:],
-                            // moby marks anonymous volumes with this label so that
-                            // volume prune (without all=true) targets only them.
-                            // Apple's own anonymous label keeps `container volume ls`
-                            // displaying it as anonymous too.
-                            labels: parsed.isAnonymous
-                                ? [ClientVolumeService.anonymousVolumeLabel: "", ContainerResource.VolumeConfiguration.anonymousLabel: ""] : [:]
-                        )
-                    }
-
-                    // Strip /lost+found when PGDATA is set (any value) — that
-                    // reliably signals a Postgres container, and named volumes are
-                    // always mounted at their root so /lost+found is always reachable.
-                    if VolumeImageCleaner.isPostgresDataVolume(mergedEnv: mergedEnv),
-                        volume.format == "ext4",
-                        VolumeImageCleaner.isEnabled(labels: volume.labels)
-                    {
-                        VolumeImageCleaner.removeLostFound(imagePath: volume.source, logger: req.logger)
-                    }
-
-                    // Per-volume sync label wins; fall back to global --volume-sync (default: nosync).
-                    let syncMode =
-                        volume.labels[Filesystem.SyncMode.socktainerLabel]
-                        .flatMap { Filesystem.SyncMode(rawString: $0) }
-                        ?? req.application.storage[VolumeSyncModeKey.self]
-                        ?? .nosync
-                    let volumeMount = Filesystem.volume(
-                        name: parsed.name,
-                        format: volume.format,
-                        source: volume.source,
-                        destination: parsed.destination,
-                        options: parsed.options,
-                        sync: syncMode
-                    )
-                    resolvedMounts.append(volumeMount)
-                }
+            // Before any volume is created: a refused request must leave nothing behind.
+            let extraHosts = body.HostConfig?.ExtraHosts ?? []
+            let invalidExtraHosts = ExtraHostsFile.invalidEntries(extraHosts)
+            guard invalidExtraHosts.isEmpty else {
+                throw Abort(.badRequest, reason: "invalid ExtraHosts entries: \(invalidExtraHosts.joined(separator: ", "))")
             }
 
             if let dockerSockRelay {
                 resolvedMounts.append(.virtiofs(source: dockerSockRelay.sourcePath, destination: dockerSockRelay.guestPath, options: []))
             }
-
-            containerConfiguration.mounts = resolvedMounts
-
-            if let memoryBytes = resolveMemoryInBytes(body.HostConfig?.Memory) {
-                containerConfiguration.resources.memoryInBytes = memoryBytes
-            }
-
-            if let nanoCpus = body.HostConfig?.NanoCpus, nanoCpus > 0 {
-                containerConfiguration.resources.cpus = ContainerCreateRoute.vCpus(fromNanoCpus: nanoCpus)
-            }
-
             let options = ContainerCreateOptions(autoRemove: body.HostConfig?.AutoRemove ?? false)
             let container: ContainerSnapshot
+            var createdAnonymousVolumes: [String] = []
             do {
-                let containerClient = ContainerClient()
-                try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
-                container = try await containerClient.get(id: containerConfiguration.id)
-                req.logger.debug("Container created successfully with ID: \(container.id)")
+                // Resolve explicit and declared volumes through the same copy-up path.
+                for item in (volumesOrFs + mountsOrFs + declaredMounts) {
+                    switch item {
+                    case .filesystem(let fs):
+                        resolvedMounts.append(fs)
+                    case .volume(let parsed):
+                        // Check if volume exists by listing all volumes and finding a match
+                        let existingVolumes = try await ClientVolume.list()
+                        let existingVolume = existingVolumes.first { $0.name == parsed.name }
+
+                        let volume: ContainerResource.VolumeConfiguration
+                        if let existing = existingVolume {
+                            volume = existing
+                        } else {
+                            // Volume doesn't exist, create it automatically (Docker behavior)
+                            // might be revisited if https://github.com/apple/container/issues/690 is closed
+                            req.logger.debug("Volume '\(parsed.name)' not found, creating it automatically")
+                            volume = try await ClientVolume.create(
+                                name: parsed.name,
+                                driver: "local",
+                                driverOpts: [:],
+                                // moby marks anonymous volumes with this label so that
+                                // volume prune (without all=true) targets only them.
+                                // Apple's own anonymous label keeps `container volume ls`
+                                // displaying it as anonymous too.
+                                labels: parsed.isAnonymous
+                                    ? [ClientVolumeService.anonymousVolumeLabel: "", ContainerResource.VolumeConfiguration.anonymousLabel: ""] : [:]
+                            )
+                        }
+
+                        if parsed.isAnonymous, existingVolume == nil {
+                            createdAnonymousVolumes.append(volume.name)
+                        }
+
+                        // Strip /lost+found when PGDATA is set (any value) — that
+                        // reliably signals a Postgres container, and named volumes are
+                        // always mounted at their root so /lost+found is always reachable.
+                        // An empty volume is rebuilt by the copy-up below, which drops
+                        // /lost+found as part of it; reformatting here would be undone.
+                        if VolumeImageCleaner.isPostgresDataVolume(mergedEnv: mergedEnv),
+                            volume.format == "ext4",
+                            VolumeImageCleaner.isEnabled(labels: volume.labels),
+                            !VolumeCopyUp.isEmpty(volumeImagePath: volume.source)
+                        {
+                            VolumeImageCleaner.removeLostFound(imagePath: volume.source, logger: req.logger)
+                        }
+
+                        // Per-volume sync label wins; fall back to global --volume-sync (default: nosync).
+                        let syncMode =
+                            volume.labels[Filesystem.SyncMode.socktainerLabel]
+                            .flatMap { Filesystem.SyncMode(rawString: $0) }
+                            ?? req.application.storage[VolumeSyncModeKey.self]
+                            ?? .nosync
+                        let volumeMount = Filesystem.volume(
+                            name: parsed.name,
+                            format: volume.format,
+                            source: volume.source,
+                            destination: parsed.destination,
+                            options: parsed.options,
+                            sync: syncMode
+                        )
+                        if volume.format == "ext4" {
+                            copyUpCandidates.append((source: volume.source, destination: parsed.destination))
+                        }
+                        resolvedMounts.append(volumeMount)
+                    }
+                }
+
+                // Never trust a client-supplied value: it names a directory socktainer deletes.
+                containerConfiguration.labels[ExtraHostsFile.label] = nil
+
+                containerConfiguration.mounts = resolvedMounts
+                // Always overwrite client-supplied metadata, including an empty list.
+                containerConfiguration.labels[ContainerAnonymousVolumes.label] =
+                    try ContainerAnonymousVolumes.encode(createdAnonymousVolumes)
+
+                // Fall back to Apple Container's own `[container]` configuration when the
+                // request carries no explicit limits, so `container system property set
+                // container.cpus` / `container.memory` applies to containers created through
+                // the Docker API too. Without this they were always sized 4 CPUs / 1 GiB.
+                //
+                // Only loaded when at least one limit is missing: the first load pings the
+                // daemon with a 10s timeout, and a create that specifies both limits would
+                // otherwise wait on a configuration read whose result it never uses.
+                let requestedMemory = body.HostConfig?.Memory
+                let requestedNanoCpus = body.HostConfig?.NanoCpus
+                let needsConfiguredDefaults = !((requestedMemory ?? 0) > 0 && (requestedNanoCpus ?? 0) > 0)
+                let configuredDefaults =
+                    needsConfiguredDefaults
+                    ? await ContainerResourceDefaults.shared.current(logger: req.logger)
+                    : nil
+
+                if let memoryBytes = ContainerResourceResolution.memoryInBytes(
+                    requested: requestedMemory,
+                    configured: configuredDefaults
+                ) {
+                    containerConfiguration.resources.memoryInBytes = memoryBytes
+                }
+
+                if let cpus = ContainerResourceResolution.cpus(
+                    requestedNanoCpus: requestedNanoCpus,
+                    configured: configuredDefaults
+                ) {
+                    containerConfiguration.resources.cpus = cpus
+                }
+
+                do {
+                    let containerClient = ContainerClient()
+                    // Recorded before the container exists: recording afterwards turns a
+                    // creation that happened into a reported failure, and the retry then
+                    // collides with the name.
+                    try await PreStartInjectionStore.shared.rememberCreateOptions(
+                        containerId: containerConfiguration.id, autoRemove: options.autoRemove)
+                    do {
+                        // Generated last, inside this cleanup scope, so no earlier failure can strand it.
+                        if !extraHosts.isEmpty,
+                            !containerConfiguration.mounts.contains(where: { $0.destination == ExtraHostsFile.guestPath })
+                        {
+                            let generated = try ExtraHostsFile.create(extraHosts: extraHosts, hostname: hostname)
+                            containerConfiguration.mounts.append(generated.mount)
+                            containerConfiguration.labels[ExtraHostsFile.label] = generated.label
+                        }
+                        try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
+                    } catch {
+                        try? await PreStartInjectionStore.shared.clear(containerId: containerConfiguration.id)
+                        ExtraHostsFile.remove(labels: containerConfiguration.labels)
+                        throw error
+                    }
+                    container = try await containerClient.get(id: containerConfiguration.id)
+                    req.logger.debug("Container created successfully with ID: \(container.id)")
+                    ContainerCreateRoute.populateEmptyVolumes(copyUpCandidates, for: container, logger: req.logger)
+                } catch {
+                    req.logger.error("Failed to create container: \(error)")
+                    throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
+                }
+
             } catch {
-                req.logger.error("Failed to create container: \(error)")
-                throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
+                // Reclaim only volumes allocated by this request. The runtime
+                // refuses removal if creation succeeded and they remain in use.
+                await ContainerAnonymousVolumes.remove(names: createdAnonymousVolumes, logger: req.logger)
+                throw error
             }
 
             let hexId = DockerContainerID.hexId(for: container)
@@ -765,6 +886,13 @@ extension ContainerCreateRoute {
         return UInt64(raw)
     }
 
+    /// Container label that opts in to `rewriteLoopbackToGateway` on named networks.
+    static let rewriteLoopbackLabel = "socktainer.rewrite-loopback"
+
+    static func shouldRewriteLoopback(labels: [String: String]?) -> Bool {
+        labels?[rewriteLoopbackLabel] == "true"
+    }
+
     /// Rewrite `127.0.0.1:PORT` → `gatewayIP:PORT` in URL-form env vars (`@` or `://` prefix).
     /// Bind-address vars like `LISTEN=127.0.0.1:80` are left unchanged.
     static func rewriteLoopbackToGateway(_ envVars: [String], gatewayIP: String) -> [String] {
@@ -800,6 +928,37 @@ extension ContainerCreateRoute {
         }
     }
 
+    /// Docker's copy-up: an empty named volume mounted over a path the image
+    /// populates takes that path's contents, ownership and permissions. Runs once
+    /// the container exists, which is when the image's filesystem can be read, and
+    /// always before it starts. Best-effort: a volume that cannot be prepared is
+    /// left as it was rather than failing the creation.
+    static func populateEmptyVolumes(
+        _ candidates: [(source: String, destination: String)],
+        for container: ContainerSnapshot,
+        logger: Logger
+    ) {
+        guard !candidates.isEmpty else { return }
+        let appSupport = URL(fileURLWithPath: "\(NSHomeDirectory())/Library/Application Support/com.apple.container")
+        guard
+            let rootfs = VolumeCopyUp.imageFilesystem(
+                containerId: container.id, appSupportPath: appSupport)
+        else { return }
+
+        for candidate in candidates where VolumeCopyUp.isEmpty(volumeImagePath: candidate.source) {
+            do {
+                try VolumeCopyUp.populate(
+                    volumeImagePath: candidate.source,
+                    fromRootfs: rootfs.path,
+                    sourcePath: candidate.destination,
+                    logger: logger
+                )
+            } catch {
+                logger.warning("[volume-copyup] \(candidate.destination) left empty: \(error)")
+            }
+        }
+    }
+
     static func makeCreateEvent(for container: ContainerSnapshot) -> DockerEvent {
         DockerEvent.simpleEvent(
             id: DockerContainerID.hexId(for: container),
@@ -828,6 +987,15 @@ extension ContainerCreateRoute {
     /// period/quota knobs are mutually exclusive, NanoCpus must fall within the host's core
     /// count, and CpuShares must be a positive weight. Returns the moby-verbatim error message
     /// to send as a 400, or nil if the request is valid.
+    static func anonymousVolume(for mount: Mount) throws -> ParsedVolume {
+        guard mount.Target.hasPrefix("/") else {
+            throw ContainerizationError(.invalidArgument, message: "invalid volume destination: \(mount.Target)")
+        }
+        return ParsedVolume(
+            name: VolumeStorage.generateAnonymousVolumeName(), destination: mount.Target,
+            options: mount.ReadOnly == true ? ["ro"] : [], isAnonymous: true)
+    }
+
     static func validateCpuLimits(hostConfig: HostConfig?) -> String? {
         let nanoCpus = hostConfig?.NanoCpus ?? 0
         let cpuPeriod = hostConfig?.CpuPeriod ?? 0
@@ -869,6 +1037,21 @@ extension ContainerCreateRoute {
             return String(data: json, encoding: .utf8)
         } catch {
             logger.warning("Failed to encode restart policy: \(error) — restart policy will not be honored")
+            return nil
+        }
+    }
+
+    static let portBindingsLabel = "socktainer.port-bindings"
+
+    static func portBindingsLabelValue(for bindings: [String: [PortBinding]]?, logger: Logger) -> String? {
+        // An empty request is kept too: Docker reports {} for it, even when -P published ports.
+        guard let bindings else { return nil }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .sortedKeys
+            return String(data: try encoder.encode(bindings), encoding: .utf8)
+        } catch {
+            logger.warning("Failed to encode port bindings: \(error) — inspect will report the bound ports instead")
             return nil
         }
     }
@@ -946,6 +1129,21 @@ func convertPortBindings(from portBindings: [String: [PortBinding]]) throws -> [
     }
 
     return publishedPorts
+}
+
+// Docker `-P` / HostConfig.PublishAllPorts: every exposed port (image + request)
+// without an explicit binding gets an ephemeral host port. Bare "8080" means tcp.
+func publishAllPortBindings(
+    bindings: [String: [PortBinding]], exposed: [String]
+) -> [String: [PortBinding]] {
+    var result = bindings
+    for spec in exposed {
+        let key = spec.contains("/") ? spec : "\(spec)/tcp"
+        if result[key]?.isEmpty ?? true {
+            result[key] = [PortBinding(HostIp: nil, HostPort: nil)]
+        }
+    }
+    return result
 }
 
 // Maps Docker HostConfig.Memory (bytes, 0 = no limit) to Apple Container memoryInBytes.

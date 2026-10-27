@@ -16,33 +16,13 @@ private struct ContainerAttachQuery: Content {
 }
 
 struct ContainerAttachRoute: RouteCollection {
-    /// How the stopped-container attach path starts the container: the runtime call
-    /// to bootstrap it, and how long to wait before declaring the start failed.
-    /// Injectable as a test seam — the start-failure contract (issue #19) has to be
-    /// exercisable without the Apple Container runtime.
-    struct StartAttempt: Sendable {
-        var bootstrap: @Sendable (_ id: String, _ stdio: [FileHandle?]) async throws -> ClientProcess =
-            { id, stdio in try await ContainerClient().bootstrap(id: id, stdio: stdio) }
-
-        /// Normal starts take ~1s. The bound exists for the pathological wedge
-        /// (issue #19: a client sat attached for 29 minutes on a container that had
-        /// long exited) and stays inside the usual `timeout 90` acceptance probe, so
-        /// a wedged runtime surfaces as an error rather than a hang.
-        var deadlineNs: UInt64 = 60_000_000_000
-    }
-
     let client: ClientContainerProtocol
-    let start: StartAttempt
-
-    init(client: ClientContainerProtocol, start: StartAttempt = StartAttempt()) {
-        self.client = client
-        self.start = start
-    }
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/attach", use: ContainerAttachRoute.handler(client: client, start: start))
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/attach", use: ContainerAttachRoute.handler(client: client))
     }
 }
+
 extension ContainerAttachRoute {
     /// Builds the container event emitted when `docker run --rm` triggers Apple Container's
     /// auto-removal: no DELETE arrives, so ContainerDeleteRoute never fires and this path
@@ -80,7 +60,7 @@ extension ContainerAttachRoute {
         await broadcaster.broadcast(DockerEvent.containerEvent("detach", container: container))
     }
 
-    static func handler(client: ClientContainerProtocol, start: StartAttempt) -> @Sendable (Request) async throws -> Response {
+    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             // TODO: This should be refactored to some generic implementation that is shared
             //       with /containers/{id}/exec route.
@@ -88,7 +68,7 @@ extension ContainerAttachRoute {
             let upgradeHeader = req.headers.first(name: "Upgrade")?.lowercased()
             let shouldUpgradeToTCP = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp"
 
-            let response = try await handleAttachRequest(req: req, client: client, start: start)
+            let response = try await handleAttachRequest(req: req, client: client)
 
             // If client requested upgrade and handler returned OK,
             // convert to 101 Switching Protocols
@@ -108,7 +88,21 @@ extension ContainerAttachRoute {
         }
     }
 
-    private static func handleAttachRequest(req: Request, client: ClientContainerProtocol, start: StartAttempt) async throws -> Response {
+    /// Preparation can recreate the container, or wait while another request
+    /// starts it. Select the attach path using the fresh state in either case.
+    static func preparedContainer(id: String, client: ClientContainerProtocol) async throws -> ContainerSnapshot {
+        guard let container = try await client.getContainer(id: id) else {
+            throw Abort(.notFound, reason: "No such container: \(id)")
+        }
+        guard container.status == .stopped else { return container }
+        try await client.prepareForStart(container: container)
+        guard let prepared = try await client.getContainer(id: id) else {
+            throw Abort(.notFound, reason: "No such container: \(id)")
+        }
+        return prepared
+    }
+
+    private static func handleAttachRequest(req: Request, client: ClientContainerProtocol) async throws -> Response {
         guard let id = req.parameters.get("id") else {
             throw Abort(.badRequest, reason: "Missing container ID")
         }
@@ -119,7 +113,7 @@ extension ContainerAttachRoute {
         // Docker's `httputils.BoolValue` accepts anything (`no`, an empty string) while Vapor's
         // decoder throws on a value it cannot read as Bool — which would answer 400 for a container
         // that does not exist, the exact confusion this ordering removes.
-        guard let container = try await client.getContainer(id: id) else {
+        guard try await client.getContainer(id: id) != nil else {
             throw Abort(.notFound, reason: "No such container: \(id)")
         }
 
@@ -143,6 +137,10 @@ extension ContainerAttachRoute {
         guard stdout || stderr || (!stdout && !stderr) else {
             throw Abort(.badRequest, reason: "At least one of stdout or stderr must be true")
         }
+
+        let container = try await preparedContainer(id: id, client: client)
+
+        // hijack connection
         let isUpgrade = req.headers.contains(where: { $0.name.lowercased() == "upgrade" && $0.value.lowercased() == "tcp" })
         let hasConnectionUpgrade = req.headers.contains(where: { $0.name.lowercased() == "connection" && $0.value.lowercased().contains("upgrade") })
 
@@ -168,8 +166,7 @@ extension ContainerAttachRoute {
                     query: query,
                     isTTY: isTTY,
                     isUpgrade: isUpgrade,
-                    hasConnectionUpgrade: hasConnectionUpgrade,
-                    start: start
+                    hasConnectionUpgrade: hasConnectionUpgrade
                 )
             }
             // stdin=true (docker run -it): full bidirectional pipe approach via TCP upgrade.
@@ -183,8 +180,7 @@ extension ContainerAttachRoute {
                 query: query,
                 isUpgrade: isUpgrade,
                 hasConnectionUpgrade: hasConnectionUpgrade,
-                isTTY: isTTY,
-                start: start
+                isTTY: isTTY
             )
         }
 
@@ -304,66 +300,33 @@ extension ContainerAttachRoute {
         )
     }
 
-    /// Turns a failed container start inside the attach route into moby's outcome
-    /// (issue #19). docker's client can never render an attach answer that is not
-    /// 101 — moby closes the body unread and reports "unable to upgrade to tcp,
-    /// received 500" (client/hijack.go) — and it attaches *before* POST /start
-    /// (docker/cli cli/command/container/run.go), so the failure must be delivered
-    /// by /start. Records the classified failure for /start to replay and the mapped
-    /// exit code so a parallel /wait resolves, then answers 101 with an immediately
-    /// terminated stream for upgrade clients. Non-upgrade clients get the plain,
-    /// renderable HTTP error — their attach is an ordinary request.
-    ///
-    /// A benign start race (someone else is starting this container) records
-    /// nothing: the container's real outcome is reported by whoever is starting it,
-    /// and this attach still terminates instead of streaming pipes that will never
-    /// carry data.
-    private static func respondToFailedStart(
-        container: ContainerSnapshot,
-        reason: String,
-        isUpgrade: Bool,
-        hasConnectionUpgrade: Bool,
-        isTTY: Bool,
-        benignRace: Bool
-    ) async throws -> Response {
-        if benignRace {
-            guard isUpgrade && hasConnectionUpgrade else {
-                throw Abort(.conflict, reason: "Container is already starting")
-            }
-            return immediateEndUpgradeResponse(isTTY: isTTY)
+    /// Parks `pipes` for the container's next start, or fails when another client is already
+    /// attached and waiting for it: a container gets one set of stdio when it boots.
+    static func parkForStart(container: ContainerSnapshot, pipes: StdioPipes) async throws -> UUID {
+        guard let token = await PendingAttachStart.shared.park(containerId: container.id, pipes: pipes) else {
+            pipes.closeAll()
+            throw Abort(.conflict, reason: "Container \(container.id) already has a client attached and waiting for it to start")
         }
-
-        let failure = ContainerStartFailure.classify(reason)
-        await ContainerExitCodeStore.shared.set(id: container.id, code: failure.exitCode)
-        await StartFailureLedger.shared.record(id: container.id, failure: failure)
-
-        guard isUpgrade && hasConnectionUpgrade else {
-            throw Abort(failure.status, reason: failure.message)
-        }
-        return immediateEndUpgradeResponse(isTTY: isTTY)
+        return token
     }
 
-    /// The attach answer for a start that will never produce output: the 101 a
-    /// hijacked client requires, followed by an immediate stream end, so the client
-    /// moves on to POST /start instead of waiting on an open stream — issue #19's
-    /// client sat attached for 29 minutes on a container that had long exited.
-    private static func immediateEndUpgradeResponse(isTTY: Bool) -> Response {
-        var headers = HTTPHeaders()
-        headers.add(
-            name: "Content-Type",
-            value: isTTY ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream"
-        )
-        headers.add(name: "Connection", value: "Upgrade")
-        headers.add(name: "Upgrade", value: "tcp")
-
-        let body = Response.Body { writer in
-            Task.detached {
-                // An empty buffer flushes the 101 head before .end closes the stream.
-                _ = writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
-                _ = writer.write(.end)
+    /// Returns once a write to `writer` fails, which is how a streaming body learns that its
+    /// client disconnected while there is nothing to send yet. An empty write never reaches the
+    /// socket, so the probe is an empty multiplexed-stream frame: a header announcing zero bytes,
+    /// which Docker's stdcopy demuxer skips. A TTY stream has no framing, so there is nothing
+    /// harmless to send and this only returns when cancelled.
+    static func untilWriteFails(_ writer: BodyStreamWriter, isTTY: Bool) async {
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !isTTY else { continue }
+            var probe = sharedAllocator.buffer(capacity: 8)
+            probe.writeBytes([DockerStreamFrame.StreamType.stdout.rawValue, 0, 0, 0, 0, 0, 0, 0])
+            do {
+                try await writer.write(.buffer(probe)).get()
+            } catch {
+                return
             }
         }
-        return Response(status: .switchingProtocols, headers: headers, body: body)
     }
 
     // Output-only attach for stopped containers (docker run without -i, issue #220).
@@ -375,8 +338,7 @@ extension ContainerAttachRoute {
         query: ContainerAttachQuery,
         isTTY: Bool,
         isUpgrade: Bool,
-        hasConnectionUpgrade: Bool,
-        start: StartAttempt
+        hasConnectionUpgrade: Bool
     ) async throws -> Response {
         let attachStdout = query.stdout ?? true
         let stderrOnly = (query.stderr ?? false) && !(query.stdout ?? false)
@@ -399,51 +361,9 @@ extension ContainerAttachRoute {
         // our write end immediately so the container's stdin sees EOF.
         try? pipes.stdin?.write.close()
 
-        await ContainerExitCodeStore.shared.remove(id: container.id)
-
-        // One budget for bootstrap and start: the client must always end up with
-        // either a streaming attach or a terminated one, never an open connection
-        // waiting on a runtime that stopped answering (issue #19's 29-minute hang).
-        let startDeadline = ContinuousClock().now + .nanoseconds(Int(start.deadlineNs))
-
-        let process: ClientProcess
-        do {
-            process = try await withDeadline(until: startDeadline) {
-                try await start.bootstrap(container.id, pipes.stdioArray)
-            }
-        } catch {
-            pipes.closeAll()
-            return try await respondToFailedStart(
-                container: container,
-                reason: "Failed to start container: \(error.localizedDescription)",
-                isUpgrade: isUpgrade,
-                hasConnectionUpgrade: hasConnectionUpgrade,
-                isTTY: isTTY,
-                benignRace: isBenignStartRace(error)
-            )
-        }
-
-        do {
-            try await withDeadline(until: startDeadline) {
-                try await process.start()
-            }
-        } catch {
-            pipes.closeAfterHandoff()
-            return try await respondToFailedStart(
-                container: container,
-                reason: "Failed to start container: \(error.localizedDescription)",
-                isUpgrade: isUpgrade,
-                hasConnectionUpgrade: hasConnectionUpgrade,
-                isTTY: isTTY,
-                benignRace: isBenignStartRace(error)
-            )
-        }
-
-        // The container is executing now: open a run so this exit's `die` is claimable.
-        // `docker compose up` starts a service entirely through this path, never `POST /start`.
-        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
-
-        await ProcessRegistry.shared.set(id: container.id, process: process)
+        // Docker holds the stream open until the container is started; `POST /start` boots it
+        // with these pipes (PendingAttachStart).
+        let token = try await parkForStart(container: container, pipes: pipes)
 
         await broadcastAttach(
             container: container,
@@ -468,6 +388,15 @@ extension ContainerAttachRoute {
                 defer { _ = writer.write(.end) }
                 _ = writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
 
+                guard
+                    let process = await PendingAttachStart.awaitStart(
+                        containerId: container.id, token: token, pipes: pipes,
+                        clientGone: { await untilWriteFails(writer, isTTY: isTTY) })
+                else { return }
+                // Joins the run `POST /start` opened for this start.
+                let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
+                await ProcessRegistry.shared.set(id: container.id, process: process)
+
                 await withTaskGroup(of: Void.self) { group in
                     // Process monitor — stdout/stderr write ends and stdin read are Apple-owned.
                     group.addTask {
@@ -477,7 +406,6 @@ extension ContainerAttachRoute {
                             nativeId: container.id,
                             fallbackImage: container.configuration.image.reference,
                             fallbackLabels: LabelNormalization.restore(container.configuration.labels),
-                            dnsNames: ContainerAliasCleanup.dnsNames(in: container.configuration.labels),
                             dnsServer: req.application.storage[SocktainerDNSServerKey.self],
                             broadcaster: req.application.storage[EventBroadcasterKey.self],
                             runEpoch: runEpoch
@@ -525,8 +453,7 @@ extension ContainerAttachRoute {
         query: ContainerAttachQuery,
         isUpgrade: Bool,
         hasConnectionUpgrade: Bool,
-        isTTY: Bool,
-        start: StartAttempt
+        isTTY: Bool
     ) async throws -> Response {
 
         let connectionHeader = req.headers.first(name: "Connection")?.lowercased()
@@ -552,8 +479,7 @@ extension ContainerAttachRoute {
             container: currentContainer,
             query: query,
             shouldUpgrade: shouldUpgrade,
-            isTTY: isTTY,
-            start: start
+            isTTY: isTTY
         )
     }
 
@@ -565,8 +491,7 @@ extension ContainerAttachRoute {
         container: ContainerSnapshot,
         query: ContainerAttachQuery,
         shouldUpgrade: Bool,
-        isTTY: Bool,
-        start: StartAttempt
+        isTTY: Bool
     ) async throws -> Response {
 
         let attachStdout = query.stdout ?? true
@@ -583,52 +508,9 @@ extension ContainerAttachRoute {
             throw Abort(.internalServerError, reason: "Failed to create stdio pipes")
         }
 
-        // Mirror ClientContainerService.start()'s exit-code contract: /wait returns
-        // as soon as ContainerExitCodeStore is non-nil, so clear any stale code
-        // before starting and record the classified code if bootstrap/start fails
-        // (so /wait can't return a stale status or poll forever).
-        await ContainerExitCodeStore.shared.remove(id: container.id)
-
-        // One budget for bootstrap and start — see attachStoppedOutputOnly.
-        let startDeadline = ContinuousClock().now + .nanoseconds(Int(start.deadlineNs))
-
-        let process: ClientProcess
-        do {
-            process = try await withDeadline(until: startDeadline) {
-                try await start.bootstrap(container.id, pipes.stdioArray)
-            }
-        } catch {
-            pipes.closeAll()
-            return try await respondToFailedStart(
-                container: container,
-                reason: "Failed to start container: \(error.localizedDescription)",
-                isUpgrade: shouldUpgrade,
-                hasConnectionUpgrade: shouldUpgrade,
-                isTTY: isTTY,
-                benignRace: isBenignStartRace(error)
-            )
-        }
-
-        do {
-            try await withDeadline(until: startDeadline) {
-                try await process.start()
-            }
-        } catch {
-            pipes.closeAfterHandoff()
-            return try await respondToFailedStart(
-                container: container,
-                reason: "Failed to start container: \(error.localizedDescription)",
-                isUpgrade: shouldUpgrade,
-                hasConnectionUpgrade: shouldUpgrade,
-                isTTY: isTTY,
-                benignRace: isBenignStartRace(error)
-            )
-        }
-
-        // Executing now: open a run so this exit's `die` is claimable exactly once.
-        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
-
-        await ProcessRegistry.shared.set(id: container.id, process: process)
+        // Docker holds the stream open until the container is started; `POST /start` boots it
+        // with these pipes (PendingAttachStart).
+        let token = try await parkForStart(container: container, pipes: pipes)
 
         let broadcaster = req.application.storage[EventBroadcasterKey.self]
         await broadcastAttach(
@@ -644,6 +526,20 @@ extension ContainerAttachRoute {
                 request: req,
                 ttyEnabled: isTTY
             ) { streamContinuation in
+
+                // Without an upgrade there is no cheap way to see the client leave before the
+                // start, so this waits for `/start` alone. The Docker CLI always upgrades.
+                guard
+                    let process = await PendingAttachStart.awaitStart(
+                        containerId: container.id, token: token, pipes: pipes,
+                        clientGone: { while !Task.isCancelled { try? await Task.sleep(nanoseconds: 1_000_000_000) } })
+                else {
+                    streamContinuation.finish()
+                    return
+                }
+                // Joins the run `POST /start` opened for this start.
+                let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
+                await ProcessRegistry.shared.set(id: container.id, process: process)
 
                 await withTaskGroup(of: Void.self) { group in
                     // Process monitor - when process exits, close pipes and finish stream
@@ -661,7 +557,6 @@ extension ContainerAttachRoute {
                             nativeId: container.id,
                             fallbackImage: container.configuration.image.reference,
                             fallbackLabels: LabelNormalization.restore(container.configuration.labels),
-                            dnsNames: ContainerAliasCleanup.dnsNames(in: container.configuration.labels),
                             dnsServer: req.application.storage[SocktainerDNSServerKey.self],
                             broadcaster: req.application.storage[EventBroadcasterKey.self],
                             runEpoch: runEpoch
@@ -748,6 +643,18 @@ extension ContainerAttachRoute {
             execId: container.id,
             ttyEnabled: isTTY
         ) { channel, tcpHandler in
+
+            guard
+                let process = await PendingAttachStart.awaitStart(
+                    containerId: container.id, token: token, pipes: pipes,
+                    clientGone: { try? await channel.closeFuture.get() })
+            else {
+                _ = try? await channel.close()
+                return
+            }
+            // Joins the run `POST /start` opened for this start.
+            let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
+            await ProcessRegistry.shared.set(id: container.id, process: process)
 
             tcpHandler.setStdinWriter(pipes.stdin!.write)
 
@@ -912,7 +819,6 @@ extension ContainerAttachRoute {
                         nativeId: container.id,
                         fallbackImage: container.configuration.image.reference,
                         fallbackLabels: LabelNormalization.restore(container.configuration.labels),
-                        dnsNames: ContainerAliasCleanup.dnsNames(in: container.configuration.labels),
                         dnsServer: req.application.storage[SocktainerDNSServerKey.self],
                         broadcaster: req.application.storage[EventBroadcasterKey.self],
                         runEpoch: runEpoch

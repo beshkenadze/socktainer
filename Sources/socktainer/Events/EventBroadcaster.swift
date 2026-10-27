@@ -117,6 +117,9 @@ actor EventBroadcaster {
 
     private var history: [DockerEvent] = []
     private var continuations: [UUID: AsyncStream<DockerEvent>.Continuation] = [:]
+    /// When each (actor id, action) of container and image events was last broadcast, so `ExternalEventWatcher`
+    /// can skip transitions socktainer's own routes already reported.
+    private var recentEvents: [String: Date] = [:]
 
     func stream() -> AsyncStream<DockerEvent> {
         // Live-only view of the atomic subscribe: nil/nil bounds select no backlog
@@ -161,6 +164,11 @@ actor EventBroadcaster {
             history.removeFirst()
         }
         history.append(event)
+        if event.Type == "container" || event.Type == "image" {
+            let now = Date()
+            recentEvents = recentEvents.filter { now.timeIntervalSince($0.value) < 60 }
+            recentEvents["\(event.Actor.ID)/\(event.Action)"] = now
+        }
         for continuation in continuations.values {
             continuation.yield(event)
         }
@@ -190,6 +198,14 @@ actor EventBroadcaster {
             buffered.insert(event, at: 0)
         }
         return buffered
+    }
+
+    /// Open `stream()` subscriptions; one drops once its stream is released.
+    var subscriberCount: Int { continuations.count }
+
+    func emittedRecently(id: String, action: String, within interval: TimeInterval) -> Bool {
+        guard let last = recentEvents["\(id)/\(action)"] else { return false }
+        return Date().timeIntervalSince(last) < interval
     }
 
     private func removeContinuation(id: UUID) {

@@ -5,7 +5,7 @@ import Vapor
 // MARK: - Docker /containers/{id}/stats response model
 
 struct RESTContainerStats: Content {
-    let id: String
+    let id: String  // Docker-shaped container ID
     // The Linux daemon reports the name with a leading "/" (moby: v.Name = "/" + name);
     // `docker stats` renders the row's NAME column from this field and prints "--" without it.
     let name: String
@@ -149,7 +149,7 @@ extension RESTContainerStats {
 
         return RESTContainerStats(
             id: id,
-            name: "/" + name,
+            name: name,
             os_type: "linux",
             read: iso8601.string(from: currRead),
             preread: iso8601.string(from: prevRead),

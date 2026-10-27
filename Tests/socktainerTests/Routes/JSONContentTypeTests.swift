@@ -168,7 +168,7 @@ private struct StubNetworkClient: ClientNetworkProtocol {
     }
     func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary? { nil }
     func delete(id: String, logger: Logger) async throws {}
-    func create(name: String, labels: [String: String], ipv4Subnet: String?, logger: Logger) async throws -> RESTNetworkCreate {
+    func create(name: String, labels: [String: String], ipv4Subnet: String?, mode: NetworkMode, logger: Logger) async throws -> RESTNetworkCreate {
         RESTNetworkCreate(Id: name, Warning: "")
     }
 }
@@ -178,7 +178,7 @@ private struct FailingNetworkClient: ClientNetworkProtocol {
     func list(filters: String?, logger: Logger) async throws -> [RESTNetworkSummary] { throw error }
     func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary? { nil }
     func delete(id: String, logger: Logger) async throws {}
-    func create(name: String, labels: [String: String], ipv4Subnet: String?, logger: Logger) async throws -> RESTNetworkCreate {
+    func create(name: String, labels: [String: String], ipv4Subnet: String?, mode: NetworkMode, logger: Logger) async throws -> RESTNetworkCreate {
         RESTNetworkCreate(Id: name, Warning: "")
     }
 }

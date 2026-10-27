@@ -89,7 +89,15 @@ extension EventsRoute {
                 // events` printed nothing and a `curl` against /events hung with zero bytes. Docker
                 // answers immediately and only then streams, which is what `--until` and any client
                 // that reads headers before events depends on.
-                _ = try? await writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
+                do {
+                    try await writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
+                } catch {
+                    // The client is already gone. End the response now, and drop the subscription by
+                    // returning, instead of holding it until the next event's write fails. Writing
+                    // .end rather than rethrowing: Vapor asserts if the writer is released without it.
+                    _ = try? await writer.write(.end)
+                    return
+                }
 
                 for event in backlog {
                     let clientStillThere = await writeJSONL(event, to: writer, logger: req.logger)

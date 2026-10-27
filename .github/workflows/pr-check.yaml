@@ -69,12 +69,12 @@ jobs:
         run: |
           make installer
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: socktainer
           path: ./.build/arm64-apple-macosx/release/socktainer
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: socktainer-installer
           path: ./pkginstaller/out/socktainer-installer.pkg
@@ -133,7 +133,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # fetch the artifact from the build job
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: socktainer
 
@@ -246,6 +246,28 @@ jobs:
           sudo docker load -i /tmp/oci-fixtures/roundtrip.tar
           sudo docker image ls | grep 'crafted-baseline'
           sudo docker rmi crafted-baseline:latest
+
+      # https://github.com/socktainer/socktainer/issues/399
+      - name: check image lookup by ID
+        run: |
+          sudo docker pull quay.io/podman/hello
+          # Id reported by inspect (config digest)
+          ID=$(sudo docker image inspect quay.io/podman/hello -f '{{.Id}}')
+          sudo docker image inspect "$ID" > /dev/null
+          # ID reported by image ls (index digest): full, bare hex and 12-char short forms
+          LS_ID=$(sudo docker image ls --no-trunc --format '{{.ID}} {{.Repository}}' | awk '/podman\/hello/{print $1; exit}')
+          sudo docker image inspect "$LS_ID" > /dev/null
+          sudo docker image inspect "${LS_ID#sha256:}" > /dev/null
+          sudo docker image inspect "$(echo "${LS_ID#sha256:}" | cut -c1-12)" > /dev/null
+          # other routes accepting an image ID
+          sudo docker history "$ID" > /dev/null
+          sudo docker tag "$ID" hello-by-id:test
+          sudo docker image inspect hello-by-id:test > /dev/null
+          # an ID naming an image with several tags is refused, like docker
+          sudo docker rmi "$ID" 2>&1 | grep 'must be forced'
+          sudo docker rmi hello-by-id:test
+          # unknown IDs keep docker's wording
+          sudo docker image inspect deadbeefdead 2>&1 | grep 'No such image: deadbeefdead'
 
       # NOTE: Disabling tests for now.
       #       Most likely calling some internal function that fails

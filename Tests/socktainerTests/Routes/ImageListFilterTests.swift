@@ -22,6 +22,15 @@ struct ImageListFilterTests {
         #expect(!ImageListFilter.isDangling(repoTags: [], repoDigests: ["docker.io/library/alpine@sha256:abc"]))
     }
 
+    @Test("The store's untagged@<digest> name (untagged build/load) is shown as dangling")
+    func untaggedStoreReferenceIsDangling() {
+        #expect(ImageListFilter.repoTags(for: "untagged@sha256:abc123") == [])
+        #expect(ImageListFilter.repoTags(for: "") == [])
+        #expect(ImageListFilter.isDangling(repoTags: ImageListFilter.repoTags(for: "untagged@sha256:abc123"), repoDigests: []))
+        #expect(ImageListFilter.repoTags(for: "docker.io/library/alpine:latest") == ["docker.io/library/alpine:latest"])
+        #expect(ImageListFilter.repoTags(for: "docker.io/library/alpine@sha256:abc123") == ["docker.io/library/alpine@sha256:abc123"])
+    }
+
     // MARK: - reference familiar-form matching
 
     @Test("A bare name matches any tag of that repo, in familiar form")

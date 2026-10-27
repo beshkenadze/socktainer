@@ -5,8 +5,8 @@ import PackageDescription
 let buildGitCommit = ProcessInfo.processInfo.environment["BUILD_GIT_COMMIT"] ?? "unspecified"
 let buildVersion = ProcessInfo.processInfo.environment["BUILD_VERSION"] ?? "unspecified"
 let buildTime = ProcessInfo.processInfo.environment["BUILD_TIME"] ?? "unspecified"
-let dockerEngineApiMinVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MIN_VERSION"] ?? "v1.32"
-let dockerEngineApiMaxVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MAX_VERSION"] ?? "v1.51"
+let dockerEngineApiMinVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MIN_VERSION"] ?? "1.32"
+let dockerEngineApiMaxVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MAX_VERSION"] ?? "1.51"
 func resolvedVersion(for identity: String) -> String {
     guard let data = FileManager.default.contents(atPath: "Package.resolved"),
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -41,8 +41,8 @@ let package = Package(
             dependencies: [
                 .product(name: "ContainerBuild", package: "container"),
                 .product(name: "ContainerAPIClient", package: "container"),
-                .product(name: "ContainerNetworkClient", package: "container"),
                 .product(name: "ContainerPersistence", package: "container"),
+                .product(name: "ContainerNetworkClient", package: "container"),
                 .product(name: "ContainerResource", package: "container"),
                 .product(name: "Containerization", package: "containerization"),
                 .product(name: "ContainerizationArchive", package: "containerization"),

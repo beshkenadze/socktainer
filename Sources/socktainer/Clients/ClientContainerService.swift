@@ -163,11 +163,13 @@ protocol ClientContainerProtocol: Sendable {
     func getContainer(id: String) async throws -> ContainerSnapshot?
     func enforceContainerRunning(container: ContainerSnapshot) throws
 
+    func prepareForStart(container: ContainerSnapshot) async throws
     func start(id: String, detachKeys: String?) async throws
     func stop(id: String, signal: String?, timeout: Int?) async throws
     func restart(id: String, signal: String?, timeout: Int?) async throws
     func kill(id: String, signal: String?) async throws
     func delete(id: String) async throws
+    func rename(id: String, newName: String) async throws
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64)
 }
@@ -177,6 +179,9 @@ enum ClientContainerError: Error {
     case notRunning(id: String)
     case ambiguousId(reference: String, matches: [String])
     case unsupportedCondition(ContainerWaitCondition)
+    case invalidName(String)
+    case nameConflict(String)
+    case renameRequiresUnstarted(id: String)
 }
 
 struct ClientContainerService: ClientContainerProtocol {
@@ -184,12 +189,45 @@ struct ClientContainerService: ClientContainerProtocol {
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
         let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
-        let running = showAll ? allContainers : allContainers.filter { $0.status == .running }
-        return Self.applyFilters(running, filters: filters, allContainers: allContainers)
+        return Self.listing(allContainers, showAll: showAll, filters: filters)
+    }
+
+    /// The `list(showAll:filters:)` result for `allContainers`, DNS sidecars already removed.
+    static func listing(_ allContainers: [ContainerSnapshot], showAll: Bool, filters: [String: [String]]) -> [ContainerSnapshot] {
+        let visible = withoutPluginContainers(allContainers, unlessLabelFilters: filters["label"])
+        let running = showAll ? visible : visible.filter { $0.status == .running }
+        return applyFilters(running, filters: filters, allContainers: allContainers)
     }
 
     static func withoutDNSSidecars(_ snapshots: [ContainerSnapshot]) -> [ContainerSnapshot] {
         snapshots.filter { !isDNSSidecar($0) }
+    }
+
+    /// Containers owned by an Apple Container plugin (`container k8s` cluster nodes,
+    /// `container machine` VMs) are managed through that plugin, and removing one from
+    /// under it breaks what it manages, so they stay out of Docker listings and prunes —
+    /// much as `container ls` hides machines. A `label` filter that names the plugin
+    /// label brings them back. Lookups by name or ID still find them.
+    static func isPluginContainer(_ snapshot: ContainerSnapshot) -> Bool {
+        snapshot.configuration.labels[ResourceLabelKeys.plugin] != nil
+    }
+
+    static func withoutPluginContainers(_ snapshots: [ContainerSnapshot], unlessLabelFilters labelFilters: [String]?) -> [ContainerSnapshot] {
+        guard !namesPluginLabel(labelFilters ?? []) else { return snapshots }
+        return snapshots.filter { !isPluginContainer($0) }
+    }
+
+    /// Whether any `key`, `key=value` or `key!=value` label filter has the plugin label as its key.
+    static func namesPluginLabel(_ labelFilters: [String]) -> Bool {
+        labelFilters.contains { filter in
+            let key: Substring
+            if let notEqual = filter.range(of: "!=") {
+                key = filter[..<notEqual.lowerBound]
+            } else {
+                key = filter.prefix { $0 != "=" }
+            }
+            return key == ResourceLabelKeys.plugin
+        }
     }
 
     static func isDNSSidecar(_ snapshot: ContainerSnapshot) -> Bool {
@@ -230,7 +268,10 @@ struct ClientContainerService: ClientContainerProtocol {
                     }
                 }
             case "name":
-                result = result.filter { values.contains($0.id) }
+                // Docker matches both the API name (with a leading slash)
+                // and the familiar name, allowing anchored patterns for either.
+                let matcher = DockerContainerNameMatcher(patterns: values)
+                result = result.filter { matcher.matches($0.id) }
             case "id":
                 result = result.filter { container in
                     values.contains { value in
@@ -313,6 +354,14 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func getContainer(id: String) async throws -> ContainerSnapshot? {
+        // A pre-start injection briefly removes the native container. Keep
+        // lookups (including /start's lookup) outside that replacement window.
+        try await Self.preStartInjectionAdmission.withSlot {
+            try await self.getContainerWithoutPreparationWait(id: id)
+        }
+    }
+
+    private func getContainerWithoutPreparationWait(id: String) async throws -> ContainerSnapshot? {
         let sanitizedId = ContainerNameUtility.sanitize(id)
         do {
             let snapshot = try await containerClient.withClient { try await $0.get(id: sanitizedId) }
@@ -369,15 +418,84 @@ struct ClientContainerService: ClientContainerProtocol {
         }
     }
 
-    private func startInternal(container: ContainerSnapshot) async throws {
-        let stdin: FileHandle? = nil
-        let stdout: FileHandle? = nil
-        let stderr: FileHandle? = nil
+    /// Rebuild a container so it carries the files copied into it before it was
+    /// ever started.
+    ///
+    /// There is no API to add a mount to a container that already exists, so the
+    /// only way to put the files where the guest will see them is to create it
+    /// again with the mounts included. The name is kept, and the creation
+    /// timestamp travels in a label, so the id the client holds does not change.
+    private static let preStartInjectionAdmission = VMLifecycleAdmission(limit: 1)
 
-        let stdio = [stdin, stdout, stderr]
+    func prepareForStart(container: ContainerSnapshot) async throws {
+        let staged = try await PreStartInjectionStore.shared.mounts(containerId: container.id)
+        guard !staged.isEmpty else { return }
+
+        try await Self.preStartInjectionAdmission.withSlot {
+            // Docker can issue /start while attach is preparing the same container.
+            // Refresh under the gate so a stale snapshot cannot recreate it twice.
+            guard let current = try await self.getContainerWithoutPreparationWait(id: container.id) else {
+                throw ClientContainerError.notFound(id: container.id)
+            }
+            guard current.status == .stopped else { return }
+            try await self.applyPreStartInjections(container: current, staged: staged)
+        }
+    }
+
+    private func applyPreStartInjections(container: ContainerSnapshot, staged: [Filesystem]) async throws {
+        var configuration = container.configuration
+        let existing = Set(configuration.mounts.map(\.destination))
+        let additions = staged.filter { !existing.contains($0.destination) }
+        guard !additions.isEmpty else { return }
+        configuration.mounts.append(contentsOf: additions)
+        let rebuilt = configuration
+
+        let kernel = try await ClientKernel.getDefaultKernel(for: .current)
+        let options = await PreStartInjectionStore.shared.createOptions(containerId: container.id)
+
+        try await containerClient.withClient { try await $0.delete(id: container.id, force: true) }
+        do {
+            try await containerClient.withClient {
+                try await $0.create(configuration: rebuilt, options: options, kernel: kernel)
+            }
+        } catch {
+            // The container is gone and could not be put back. Say so plainly:
+            // a client told only that start failed would look everywhere else.
+            throw ClientContainerError.notFound(id: container.id)
+        }
+    }
+
+    private func startInternal(container: ContainerSnapshot) async throws {
+        // A client that attached before this start (`docker run`, `docker start -a`, attached
+        // `docker compose up`) parked its pipes; boot with them so its stream gets the output.
+        // Claimed before anything can fail, so every failure below reaches the waiting attach.
+        let attached = await PendingAttachStart.shared.claim(containerId: container.id)
+        let stdio = attached?.stdioArray ?? [nil, nil, nil]
 
         do {
-            let process = try await containerClient.withClient { try await $0.bootstrap(id: container.id, stdio: stdio) }
+            try await prepareForStart(container: container)
+        } catch {
+            if let attached {
+                attached.closeAll()
+                await PendingAttachStart.shared.finish(containerId: container.id, result: .failure(error))
+            }
+            throw error
+        }
+
+        let process: ClientProcess
+        do {
+            process = try await containerClient.withClient { try await $0.bootstrap(id: container.id, stdio: stdio) }
+        } catch {
+            if let attached {
+                attached.closeAll()
+                await PendingAttachStart.shared.finish(containerId: container.id, result: .failure(error))
+            }
+            // A container that is already booted was started by an earlier request.
+            if Self.isAlreadyStarted(error) { return }
+            throw error
+        }
+
+        do {
             // Clear any exit code recorded by a previous run of this container so
             // /wait blocks for the new init process rather than immediately
             // returning the stale code (e.g. after a restart). Both keys: the monitor records under
@@ -386,28 +504,38 @@ struct ClientContainerService: ClientContainerProtocol {
             // run's exit code until the new one finished.
             await ContainerExitCodeStore.shared.remove(id: container.id)
             await ContainerExitCodeStore.shared.remove(id: DockerContainerID.hexId(for: container))
+            try await ExtraHostsFile.refresh(containerId: container.id)
             try await process.start()
-            // Wait for the init process in the background so we can capture its
-            // real exit code without blocking the /start response.
-            let containerId = container.id
-            let exitLogger = Logger(label: "socktainer.exitcode")
-            Task.detached {
-                let code = await ContainerExitCodeStore.resolveExitCode(logger: exitLogger) {
-                    try await process.wait()
-                }
-                await ContainerExitCodeStore.shared.set(id: containerId, code: code)
-            }
         } catch {
-            // NOTE: If bootstrap fails because container is already booted,
-            //       the attach handler may have already bootstrapped it
-            let errorMessage = error.localizedDescription
-            if errorMessage.contains("booted") || errorMessage.contains("expected to be in created state") {
-                return
+            if let attached {
+                attached.closeAfterHandoff()
+                await PendingAttachStart.shared.finish(containerId: container.id, result: .failure(error))
             }
-
-            // Re-throw any other errors
+            if Self.isAlreadyStarted(error) { return }
             throw error
         }
+
+        if attached != nil {
+            // The attach stream takes it from here, including recording the exit code.
+            await PendingAttachStart.shared.finish(containerId: container.id, result: .success(process))
+            return
+        }
+
+        // Wait for the init process in the background so we can capture its
+        // real exit code without blocking the /start response.
+        let containerId = container.id
+        let exitLogger = Logger(label: "socktainer.exitcode")
+        Task.detached {
+            let code = await ContainerExitCodeStore.resolveExitCode(logger: exitLogger) {
+                try await process.wait()
+            }
+            await ContainerExitCodeStore.shared.set(id: containerId, code: code)
+        }
+    }
+
+    private static func isAlreadyStarted(_ error: Error) -> Bool {
+        let errorMessage = error.localizedDescription
+        return errorMessage.contains("booted") || errorMessage.contains("expected to be in created state")
     }
 
     func stop(id: String, signal: String?, timeout: Int?) async throws {
@@ -469,6 +597,78 @@ struct ClientContainerService: ClientContainerProtocol {
             throw ClientContainerError.notFound(id: id)
         }
         try await containerClient.withClient { try await $0.delete(id: container.id) }
+        // After the delete, and by the native id: the reference a client holds may
+        // be a derived Docker id, and a delete that failed leaves a container that
+        // still needs its uploads.
+        try await PreStartInjectionStore.shared.clear(containerId: container.id)
+        ExtraHostsFile.remove(labels: container.configuration.labels)
+    }
+
+    /// Apple Container has no rename and identifies containers by name, so a
+    /// rename rebuilds the container under the new name, the same way staged
+    /// files are applied before start. Only a container that never booted can
+    /// be rebuilt without losing anything: one that ran has a private rootfs
+    /// the rebuild would discard. That covers Compose's recreate, which renames
+    /// its freshly created replacement before starting it.
+    func rename(id: String, newName: String) async throws {
+        let newId = ContainerNameUtility.sanitize(newName)
+        guard ManagedContainer.nameValid(newId) else {
+            throw ClientContainerError.invalidName(newName)
+        }
+        try await Self.preStartInjectionAdmission.withSlot {
+            guard let container = try await self.getContainerWithoutPreparationWait(id: id) else {
+                throw ClientContainerError.notFound(id: id)
+            }
+            let oldId = container.id
+            guard newId != oldId else { return }
+            if try await self.getContainerWithoutPreparationWait(id: newId)?.id == newId {
+                throw ClientContainerError.nameConflict(newId)
+            }
+            let rootfs = AppleContainerTimestampResolver.appSupportURL
+                .appendingPathComponent("containers").appendingPathComponent(oldId)
+                .appendingPathComponent("rootfs.ext4")
+            guard container.status == .stopped, container.startedDate == nil,
+                !FileManager.default.fileExists(atPath: rootfs.path)
+            else {
+                throw ClientContainerError.renameRequiresUnstarted(id: oldId)
+            }
+
+            // Keep the Docker id: clients hold it across the rename (Compose starts by it).
+            // Pin the creation time too: without the label it is read from the
+            // container's directory, which the rebuild replaces.
+            var original = container.configuration
+            let timestampLabel = AppleContainerTimestampResolver.legacyCreationTimestampLabel
+            if original.labels[timestampLabel] == nil,
+                let created = AppleContainerTimestampResolver.containerCreationDate(container)
+            {
+                original.labels[timestampLabel] = String(created.timeIntervalSince1970)
+            }
+            let restore = original
+            var configuration = original
+            configuration.id = newId
+            configuration.labels[DockerContainerID.idSeedLabel] = original.labels[DockerContainerID.idSeedLabel] ?? oldId
+            let renamed = configuration
+
+            let kernel = try await ClientKernel.getDefaultKernel(for: .current)
+            let options = await PreStartInjectionStore.shared.createOptions(containerId: oldId)
+            try await self.containerClient.withClient { try await $0.delete(id: oldId, force: true) }
+            do {
+                try await self.containerClient.withClient {
+                    try await $0.create(configuration: renamed, options: options, kernel: kernel)
+                }
+            } catch {
+                // Put the original back so a failed rename does not lose the container.
+                do {
+                    try await self.containerClient.withClient {
+                        try await $0.create(configuration: restore, options: options, kernel: kernel)
+                    }
+                } catch {
+                    throw ClientContainerError.notFound(id: oldId)
+                }
+                throw error
+            }
+            try await PreStartInjectionStore.shared.move(from: oldId, to: newId)
+        }
     }
 
     // Poll until the container is no longer running, then return the real exit
@@ -526,10 +726,10 @@ struct ClientContainerService: ClientContainerProtocol {
         return RESTContainerWait(statusCode: Int64(code))
     }
 
-    func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) {
-        let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
-
-        var containersToDelete: [ContainerSnapshot] = allContainers.filter { $0.status == .stopped }
+    /// The containers `prune(filters:)` deletes from `allContainers`, DNS sidecars already removed.
+    static func pruneCandidates(_ allContainers: [ContainerSnapshot], filters: [String: [String]]) -> [ContainerSnapshot] {
+        var containersToDelete: [ContainerSnapshot] = withoutPluginContainers(allContainers, unlessLabelFilters: filters["label"])
+            .filter { $0.status == .stopped }
 
         for (key, values) in filters {
             switch key {
@@ -589,6 +789,12 @@ struct ClientContainerService: ClientContainerProtocol {
                 continue
             }
         }
+        return containersToDelete
+    }
+
+    func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) {
+        let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
+        let containersToDelete = Self.pruneCandidates(allContainers, filters: filters)
 
         // NOTE: Apple container doesn't return the size of the container, only the
         //       image descriptor size (manifest) is logged.
@@ -600,6 +806,11 @@ struct ClientContainerService: ClientContainerProtocol {
         for container in containersToDelete {
             do {
                 try await containerClient.withClient { try await $0.delete(id: container.id) }
+                // Pruning reclaims a container, so it reclaims what was staged for
+                // it too: those files are whatever a client uploaded, secrets
+                // included.
+                try await PreStartInjectionStore.shared.clear(containerId: container.id)
+                ExtraHostsFile.remove(labels: container.configuration.labels)
                 deletedIds.append(container.id)
             } catch {
                 continue

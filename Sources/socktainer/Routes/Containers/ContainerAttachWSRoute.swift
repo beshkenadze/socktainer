@@ -31,9 +31,7 @@ extension ContainerAttachWSRoute {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
             let query = try req.query.decode(ContainerAttachWSQuery.self)
-            guard let container = try await client.getContainer(id: id) else {
-                throw Abort(.notFound, reason: "No such container: \(id)")
-            }
+            let container = try await ContainerAttachRoute.preparedContainer(id: id, client: client)
 
             // moby: MuxStreams=false — WebSocket is the mux; raw binary frames,
             // no stdcopy header, matches moby's wsContainersAttach behaviour.
@@ -85,32 +83,23 @@ extension ContainerAttachWSRoute {
             try? pipes.stdin?.write.close()
         }
 
-        await ContainerExitCodeStore.shared.remove(id: container.id)
-
-        let process: ClientProcess
-        do {
-            process = try await ContainerClient().bootstrap(id: container.id, stdio: pipes.stdioArray)
-        } catch {
+        // Docker holds the attach open until the container is started; `POST /start` boots it
+        // with these pipes (PendingAttachStart).
+        guard let token = await PendingAttachStart.shared.park(containerId: container.id, pipes: pipes) else {
             pipes.closeAll()
-            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
-            await ContainerExitCodeStore.shared.set(id: hexId, code: -1)
+            try? await ws.close(code: .policyViolation)
+            return
+        }
+        guard
+            let process = await PendingAttachStart.awaitStart(
+                containerId: container.id, token: token, pipes: pipes,
+                clientGone: { try? await ws.onClose.get() })
+        else {
             try? await ws.close(code: .unexpectedServerError)
             return
         }
 
-        do {
-            try await process.start()
-        } catch {
-            if !isBenignStartRace(error) {
-                pipes.closeAfterHandoff()
-                await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
-                await ContainerExitCodeStore.shared.set(id: hexId, code: -1)
-                try? await ws.close(code: .unexpectedServerError)
-                return
-            }
-        }
-
-        // Executing now: open a run so this exit's `die` is claimable exactly once.
+        // Joins the run `POST /start` opened for this start.
         let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
 
         await ProcessRegistry.shared.set(id: container.id, process: process)
@@ -142,7 +131,7 @@ extension ContainerAttachWSRoute {
                     nativeId: container.id,
                     fallbackImage: container.configuration.image.reference,
                     fallbackLabels: LabelNormalization.restore(container.configuration.labels),
-                            dnsNames: ContainerAliasCleanup.dnsNames(in: container.configuration.labels),
+                    dnsNames: ContainerAliasCleanup.dnsNames(in: container.configuration.labels),
                     dnsServer: req.application.storage[SocktainerDNSServerKey.self],
                     broadcaster: broadcaster,
                     runEpoch: runEpoch

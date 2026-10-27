@@ -39,8 +39,8 @@ struct ClientArchiveGuestReadTests {
         let stat = try ClientArchiveService.pathStat(fromTar: tar, path: "/data/exe.sh")
         #expect(stat.name == "exe.sh")
         #expect(stat.mode & 0o777 == 0o755)
-        #expect(stat.mode & UInt32(S_IFMT) == UInt32(S_IFREG))
-        #expect(stat.linkTarget == nil)
+        #expect(stat.mode & ((1 << 31) | (1 << 27)) == 0)
+        #expect(stat.linkTarget == "")
     }
 
     /// `docker cp` decides whether it is copying a file or a tree from this bit, so a directory read
@@ -52,7 +52,7 @@ struct ClientArchiveGuestReadTests {
         }
 
         let stat = try ClientArchiveService.pathStat(fromTar: tar, path: "/data/sub")
-        #expect(stat.mode & UInt32(S_IFMT) == UInt32(S_IFDIR))
+        #expect(stat.mode & (1 << 31) != 0)
     }
 
     @Test("a symlink reports where it points")
@@ -63,7 +63,7 @@ struct ClientArchiveGuestReadTests {
         }
 
         let stat = try ClientArchiveService.pathStat(fromTar: tar, path: "/etc/mtab")
-        #expect(stat.mode & UInt32(S_IFMT) == UInt32(S_IFLNK))
+        #expect(stat.mode & (1 << 27) != 0)
         #expect(stat.linkTarget == "/proc/mounts")
     }
 

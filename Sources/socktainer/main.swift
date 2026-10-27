@@ -12,10 +12,17 @@ struct CLIOptions: ParsableArguments {
     @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Check Apple Container compatibility and exit")
     var checkCompatibility: Bool = true
 
+    @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Start Apple Container's service automatically if it isn't already running")
+    var autoStart: Bool = true
+
     @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Create or update the 'socktainer' Docker context on startup")
     var dockerContext: Bool = true
 
-    @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Run startup housekeeping (DNS-sidecar adoption and orphaned-network reaping) on this bridge. Disable only when another process owns the runtime's startup maintenance.")
+    @ArgumentParser.Flag(
+        name: .long, inversion: .prefixedNo,
+        help:
+            "Run startup housekeeping (DNS-sidecar adoption and orphaned-network reaping) on this bridge. Disable only when another process owns the runtime's startup maintenance."
+    )
     var startupHousekeeping: Bool = true
 
     @ArgumentParser.Option(
@@ -46,6 +53,10 @@ let options = CLIOptions.parseOrExit()
 if options.version {
     print("socktainer: \(getBuildVersion()) (git commit: \(getBuildGitCommit()))")
     exit(0)
+}
+
+if options.autoStart {
+    await AppleContainerBootstrap.ensureRunning()
 }
 
 if options.checkCompatibility {

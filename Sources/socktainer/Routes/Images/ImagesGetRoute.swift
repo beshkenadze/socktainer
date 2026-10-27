@@ -64,6 +64,8 @@ struct ImagesGetRoute: RouteCollection {
                 throw Abort(.notFound, reason: message)
             case .digestReferenceNotAllowed(let repo):
                 throw Abort(.badRequest, reason: "cannot reference \(repo) by digest")
+            case .conflict(let id):
+                throw Abort(.conflict, reason: id)
             }
         }
         let tempDir = tarballPath.deletingLastPathComponent()

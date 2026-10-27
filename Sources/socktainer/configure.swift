@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerNetworkClient
 import ContainerPersistence
 import ContainerizationError
 import Vapor
@@ -44,13 +45,14 @@ func configure(
     await RestartPolicyOverrideStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
     await ContainerExitCodeStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
     ContainerRunHistory.configure(storageDirectory: appleContainerAppSupportUrl)
+    await PreStartInjectionStore.shared.configure(storageDirectory: appleContainerAppSupportUrl, logger: app.logger)
     let imageClient = ClientImageService(containerSystemConfig: systemConfig)
     let healthCheckClient = ClientHealthCheckService()
     let networkClient = ClientNetworkService()
     let volumeClient = ClientVolumeService()
     let registryClient = ClientRegistryService()
     let archiveClient = ClientArchiveService(appSupportPath: appleContainerAppSupportUrl)
-    let builderClient = ClientBuilderService(appSupportURL: appleContainerAppSupportUrl, containerSystemConfig: systemConfig)
+    let builderClient = ClientBuilderService(containerSystemConfig: systemConfig)
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)
@@ -202,6 +204,8 @@ func configure(
     // Initialize broadcaster
     let broadcaster = EventBroadcaster()
     app.storage[EventBroadcasterKey.self] = broadcaster
+    let externalEventWatcher = ExternalEventWatcher(broadcaster: broadcaster, imageClient: imageClient, logger: app.logger)
+    Task { await externalEventWatcher.run() }
     app.storage[AppleContainerAppSupportUrlKey.self] = appleContainerAppSupportUrl
 
     // Initialize inter-container DNS infrastructure.
@@ -211,6 +215,21 @@ func configure(
         ProcessInfo.processInfo.environment["SOCKTAINER_DNS_PORT"]
         .flatMap(Int.init) ?? 2054
     let dnsServer = SocktainerDNSServer()
+    // Forward non-container names to the vmnet gateway resolver (as `default`-network
+    // containers do) so host-only names — VPN split DNS, /etc/resolver — resolve too.
+    // Bounded: a wedged XPC call must not keep the DNS server (and the API socket) from coming up.
+    let logger = app.logger
+    let gatewayLookupFinished = await StartupHousekeeping.runBounded(timeout: .seconds(5)) {
+        do {
+            dnsServer.upstreamHost = try await NetworkClient().get(id: "default").status.ipv4Gateway.description
+            logger.notice("DNS upstream: \(dnsServer.upstreamHost)")
+        } catch {
+            logger.warning("Could not read default network gateway (\(error)) — DNS upstream falls back to \(dnsServer.upstreamHost)")
+        }
+    }
+    if !gatewayLookupFinished {
+        logger.warning("Default network gateway lookup timed out — DNS upstream falls back to \(dnsServer.upstreamHost)")
+    }
     guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
         app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
         return

@@ -18,7 +18,7 @@ struct ContainerAliasCleanupTests {
     private static let rawLabels = [
         ContainerAliasCleanup.dnsNamesLabel: "project-web-1,web",
         "com.docker.compose.service": "web",
-        "com.docker.compose.project": "project"
+        "com.docker.compose.project": "project",
     ]
 
     @Test("The recorded names are read from raw labels")
@@ -55,8 +55,25 @@ struct ContainerAliasCleanupTests {
         #expect(dnsServer.listEntries().isEmpty, "leftovers keep answering for a container that is gone")
     }
 
-    @Test("Without a confirmed IP nothing is touched, so a live peer's alias is never yanked")
-    func unknownIPLeavesEverythingAlone() {
+    @Test("removes a multi-homed container's addresses on every network")
+    func unregistersEveryNetworkOfMultiHomedContainer() {
+        let dnsServer = SocktainerDNSServer()
+        dnsServer.register(hostname: "web-1", ips: ["10.0.0.5/24", "10.0.1.5/24"])
+        dnsServer.register(hostname: "web", ips: ["10.0.0.5/24", "10.0.1.5/24"])
+
+        ContainerAliasCleanup.unregisterAllAliases(
+            nativeId: "web-1",
+            dnsNames: [],
+            labels: ["com.docker.compose.service": "web"],
+            cachedIP: "10.0.0.5",
+            dnsServer: dnsServer
+        )
+
+        #expect(dnsServer.listEntries().isEmpty, "no address on the second network may be left behind")
+    }
+
+    @Test("does not touch any alias when cachedIP is nil — ownership can't be confirmed")
+    func skipsAllAliasesWhenCachedIPIsNil() {
         let dnsServer = SocktainerDNSServer()
         dnsServer.register(hostname: "web", ip: "192.168.64.9")
 
@@ -71,7 +88,6 @@ struct ContainerAliasCleanupTests {
         #expect(dnsServer.listEntries()["web"] == "192.168.64.9")
     }
 }
-
 
 /// The helper above is only correct if the routes hand it the *raw* labels. This exercises the
 /// delete route end to end, so passing it a restored label set — which no longer carries the
@@ -91,7 +107,7 @@ struct ContainerDeleteAliasCleanupTests {
                 // tell whether the recorded names were read at all.
                 ContainerAliasCleanup.dnsNamesLabel: "\(nativeId),extra-alias",
                 "com.docker.compose.service": "web",
-                "com.docker.compose.project": "myapp"
+                "com.docker.compose.project": "myapp",
             ]
         )
         let dnsServer = SocktainerDNSServer()

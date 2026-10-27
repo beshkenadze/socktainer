@@ -97,6 +97,19 @@ struct DistributionJsonRouteTests {
         }
     }
 
+    @Test("refused credential exchange returns bad gateway")
+    func insecureCredentialExchange() async throws {
+        let registryError = RegistryClient.Error.insecureCredentialExchange(message: "refusing to send credentials over an insecure connection")
+        try await withDistributionApp(FakeDistributionProvider(result: nil, error: registryError)) { app in
+            try await app.testing().test(.GET, "/v1.51/distribution/private/json") { res async throws in
+                #expect(res.status == .badGateway)
+                struct Body: Vapor.Content { let reason: String }
+                let body = try res.content.decode(Body.self)
+                #expect(body.reason.contains("refusing to send credentials over an insecure connection"))
+            }
+        }
+    }
+
     @Test("provider-thrown 400s pass through untouched")
     func invalidReference() async throws {
         let parseError = Abort(.badRequest, reason: "invalid reference: UPPER!!bad")

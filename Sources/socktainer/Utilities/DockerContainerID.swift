@@ -19,6 +19,10 @@ import Foundation
 /// label, so the derived form remains as a fallback. It includes the creation date, which preserves
 /// Docker's semantics that a container recreated under the same name is a different container.
 enum DockerContainerID {
+    /// The native ID a container was created under, set when a rename rebuilds
+    /// it under a new one, so its Docker ID survives the rename.
+    static let idSeedLabel = "io.github.socktainer.id-seed"
+
     /// Label carrying the container's Docker ID. Stripped from client-visible labels by
     /// `LabelNormalization.restore`, and rejected on create so a client cannot forge an identity.
     static let idLabel = "socktainer.docker-id"
@@ -36,7 +40,11 @@ enum DockerContainerID {
         if let stored = container.configuration.labels[idLabel], isWellFormed(stored) {
             return stored
         }
-        return hexId(nativeId: container.id, createdAt: AppleContainerTimestampResolver.containerCreationDate(container))
+        // No stored ID: derived, from the native ID the container was created under when a
+        // rebuild has moved it to another one.
+        return hexId(
+            nativeId: container.configuration.labels[idSeedLabel] ?? container.id,
+            createdAt: AppleContainerTimestampResolver.containerCreationDate(container))
     }
 
     static func hexId(nativeId: String, createdAt: Date?) -> String {

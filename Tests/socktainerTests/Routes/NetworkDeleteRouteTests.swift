@@ -103,6 +103,7 @@ private final class HangingNetworkClient: ClientNetworkProtocol, @unchecked Send
         name: String,
         labels: [String: String],
         ipv4Subnet: String?,
+        mode: NetworkMode,
         logger: Logger
     ) async throws -> RESTNetworkCreate {
         RESTNetworkCreate(Id: name, Warning: "")
@@ -117,6 +118,7 @@ private final class PendingOperationNetworkClient: ClientNetworkProtocol, @unche
         name: String,
         labels: [String: String],
         ipv4Subnet: String?,
+        mode: NetworkMode,
         logger: Logger
     ) async throws -> RESTNetworkCreate {
         RESTNetworkCreate(Id: name, Warning: "")
@@ -131,6 +133,7 @@ private final class NotFoundNetworkClient: ClientNetworkProtocol, @unchecked Sen
         name: String,
         labels: [String: String],
         ipv4Subnet: String?,
+        mode: NetworkMode,
         logger: Logger
     ) async throws -> RESTNetworkCreate {
         RESTNetworkCreate(Id: name, Warning: "")
@@ -146,6 +149,7 @@ private final class WorkingNetworkClient: ClientNetworkProtocol, @unchecked Send
         name: String,
         labels: [String: String],
         ipv4Subnet: String?,
+        mode: NetworkMode,
         logger: Logger
     ) async throws -> RESTNetworkCreate {
         RESTNetworkCreate(Id: name, Warning: "")

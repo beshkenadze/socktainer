@@ -37,23 +37,6 @@ extension ContainerStartRoute {
                 throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
             }
 
-            // A start that already failed inside POST /attach reports here. docker's
-            // CLI attaches before it starts (docker/cli cli/command/container/run.go)
-            // and discards any attach answer that is not 101 unread (moby
-            // client/hijack.go), so /start is the only request whose error body an
-            // attached `docker run` can still render. Replaying the recorded failure
-            // also avoids re-bootstrapping a container whose first bootstrap already
-            // failed (issue #19).
-            if let failedContainer = preStartSnapshot,
-                let failure = await StartFailureLedger.shared.take(id: failedContainer.id)
-            {
-                await ContainerStartRoute.cleanupFailedAutoRemove(
-                    container: failedContainer,
-                    client: client,
-                    req: req
-                )
-                throw Abort(failure.status, reason: failure.message)
-            }
             let runEpoch: Int
             do {
                 guard let container = preStartSnapshot else {
@@ -120,22 +103,6 @@ extension ContainerStartRoute {
                 healthManager: req.application.storage[HealthCheckManagerKey.self],
                 logger: req.logger
             )
-
-            // Writes made while the container was only created were held: it had no filesystem to
-            // take them, and booting it then would have made it look like it had run (#9). It is up
-            // now, so they go in through the guest before this response returns — buildx copies its
-            // builder's configuration in that window and expects it there when BuildKit reads it.
-            if let started = startedSnapshot ?? preStartSnapshot,
-                await PendingArchiveStore.shared.hasPending(id: started.id),
-                let appSupport = req.application.storage[AppleContainerAppSupportUrlKey.self]
-            {
-                do {
-                    try await ClientArchiveService(appSupportPath: appSupport).applyPendingArchives(container: started)
-                } catch {
-                    req.logger.error("could not replay the archives held for \(started.id): \(error)")
-                    throw Abort(.internalServerError, reason: "Failed to write held archives into \(started.id): \(error)")
-                }
-            }
 
             let metadataSnapshot = startedSnapshot ?? preStartSnapshot
             // Derive the canonical 64-char Docker ID once here so the cache and all
@@ -473,20 +440,22 @@ extension ContainerStartRoute {
             let snapshot = startedSnapshot,
             !ClientContainerService.isDNSSidecar(snapshot)
         {
-            // Register only on a network that has a DNS forwarder sidecar — same reserved set
+            // Register on every network that has a DNS forwarder sidecar — same reserved set
             // as sidecarNetwork. On reserved networks (default/bridge/host/none) there is no
             // forwarder so any registration would be unreachable; skip entirely if none of the
             // container's attachments qualify, rather than falling back to the first attachment.
-            if let ip = ContainerStartRoute.dnsAttachmentIP(in: snapshot) {
+            let cidrs = ContainerStartRoute.dnsAttachmentCIDRs(in: snapshot)
+            if !cidrs.isEmpty {
+                let addresses = cidrs.joined(separator: ", ")
                 if !snapshot.id.isEmpty {
-                    dnsServer.register(hostname: snapshot.id, ip: ip)
-                    logger.info("[dns] registered container name '\(snapshot.id)' → \(ip)")
+                    dnsServer.register(hostname: snapshot.id, ips: cidrs)
+                    logger.info("[dns] registered container name '\(snapshot.id)' → \(addresses)")
                 }
 
                 // Names stored at create time (Compose service aliases via socktainer.dns.names)
                 if let namesLabel = snapshot.configuration.labels[ContainerAliasCleanup.dnsNamesLabel] {
                     for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
-                        dnsServer.register(hostname: name, ip: ip)
+                        dnsServer.register(hostname: name, ips: cidrs)
                     }
                 }
 
@@ -499,14 +468,14 @@ extension ContainerStartRoute {
                 if let serviceName = snapshot.configuration.labels["com.docker.compose.service"],
                     !serviceName.isEmpty
                 {
-                    dnsServer.register(hostname: serviceName, ip: ip)
+                    dnsServer.register(hostname: serviceName, ips: cidrs)
                     if let projectName = snapshot.configuration.labels["com.docker.compose.project"],
                         !projectName.isEmpty
                     {
-                        dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: ip)
-                        logger.info("[dns] registered compose aliases '\(serviceName)' and '\(serviceName).\(projectName)' → \(ip)")
+                        dnsServer.register(hostname: "\(serviceName).\(projectName)", ips: cidrs)
+                        logger.info("[dns] registered compose aliases '\(serviceName)' and '\(serviceName).\(projectName)' → \(addresses)")
                     } else {
-                        logger.info("[dns] registered compose alias '\(serviceName)' → \(ip)")
+                        logger.info("[dns] registered compose alias '\(serviceName)' → \(addresses)")
                     }
                 }
             }
@@ -552,38 +521,49 @@ extension ContainerStartRoute {
         return configuredNetworks.first { !$0.isEmpty && !reserved.contains($0) }
     }
 
-    /// The IP DNS aliases are registered under — the first non-reserved network
-    /// attachment. Every cache/cleanup site (ContainerInfoCache.ip, ContainerDeleteRoute)
-    /// must derive its IP the same way, or unregisterIfOwned's ownership check silently
-    /// fails to match on multi-network containers.
+    /// The address that owns a container's DNS registrations — the first non-reserved
+    /// network attachment, i.e. the first of `dnsAttachmentCIDRs`. Every cache/cleanup site
+    /// (ContainerInfoCache.ip, ContainerDeleteRoute) must derive its IP the same way, or
+    /// unregisterIfOwned's ownership check silently fails to match.
     static func dnsAttachmentIP(in snapshot: ContainerSnapshot?) -> String? {
         let reservedNetworks: Set<String> = ["default", "bridge", "host", "none"]
         return snapshot?.networks.first { !$0.network.isEmpty && !reservedNetworks.contains($0.network) }?
             .ipv4Address.address.description
     }
 
+    /// Every non-reserved attachment as "address/prefix", in `dnsAttachmentIP` order. The
+    /// prefix lets SocktainerDNSServer answer a multi-homed container's name with the
+    /// address on the querying peer's own network.
+    static func dnsAttachmentCIDRs(in snapshot: ContainerSnapshot?) -> [String] {
+        let reservedNetworks: Set<String> = ["default", "bridge", "host", "none"]
+        return (snapshot?.networks ?? [])
+            .filter { !$0.network.isEmpty && !reservedNetworks.contains($0.network) }
+            .map { $0.ipv4Address.description }
+    }
+
     /// Re-registers a resumed container's DNS aliases (name, `socktainer.dns.names`,
     /// Compose service/project) — called once per still-running container when
     /// Socktainer starts, since SocktainerDNSServer's registry is in-memory and lost
-    /// across daemon restarts. Uses dnsAttachmentIP so a container whose first network
-    /// attachment happens to be reserved (e.g. bridge) still gets re-registered on its
+    /// across daemon restarts. Uses dnsAttachmentCIDRs so a container whose first network
+    /// attachment happens to be reserved (e.g. bridge) still gets re-registered on each
     /// named network, instead of being skipped entirely.
     static func registerDNSAliasesOnResume(container: ContainerSnapshot, dnsServer: SocktainerDNSServer, logger: Logger) {
-        guard let ip = ContainerStartRoute.dnsAttachmentIP(in: container) else { return }
+        let cidrs = ContainerStartRoute.dnsAttachmentCIDRs(in: container)
+        guard !cidrs.isEmpty else { return }
 
-        dnsServer.register(hostname: container.id, ip: ip)
+        dnsServer.register(hostname: container.id, ips: cidrs)
         if let namesLabel = container.configuration.labels[ContainerAliasCleanup.dnsNamesLabel] {
             for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
-                dnsServer.register(hostname: name, ip: ip)
+                dnsServer.register(hostname: name, ips: cidrs)
             }
         }
         if let serviceName = container.configuration.labels["com.docker.compose.service"], !serviceName.isEmpty {
-            dnsServer.register(hostname: serviceName, ip: ip)
+            dnsServer.register(hostname: serviceName, ips: cidrs)
             if let projectName = container.configuration.labels["com.docker.compose.project"], !projectName.isEmpty {
-                dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: ip)
+                dnsServer.register(hostname: "\(serviceName).\(projectName)", ips: cidrs)
             }
         }
-        logger.info("[dns] re-registered '\(container.id)' → \(ip) on resume")
+        logger.info("[dns] re-registered '\(container.id)' → \(cidrs.joined(separator: ", ")) on resume")
     }
 
     /// Removes a `--rm` container whose start failed.

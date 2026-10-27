@@ -12,16 +12,23 @@ struct ContainerDeleteRoute: RouteCollection {
 
 struct ContainerDeleteQuery: Content {
     var force: Bool?
+    var v: Bool?
 }
 
 extension ContainerDeleteRoute {
-    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> HTTPStatus {
+    static func handler(
+        client: ClientContainerProtocol,
+        removeVolumes: @escaping @Sendable ([String], Logger) async -> Void = { names, logger in
+            await ContainerAnonymousVolumes.remove(names: names, logger: logger)
+        }
+    ) -> @Sendable (Request) async throws -> HTTPStatus {
         { req in
             guard let id = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
 
-            let force = try req.query.decode(ContainerDeleteQuery.self).force ?? false
+            let query = try req.query.decode(ContainerDeleteQuery.self)
+            let force = query.force ?? false
 
             let snapshot = try? await client.getContainer(id: id)
             let cached = await ContainerInfoCache.shared.get(id: id)
@@ -46,9 +53,6 @@ extension ContainerDeleteRoute {
                 // container later recreated under the same name.
                 await ContainerExitCodeStore.shared.remove(id: eventName)
                 await ContainerExitCodeStore.shared.remove(id: eventId)
-                // A container removed before it ever started takes its held writes with it: nothing
-                // will replay them, and the tar sitting in the temporary directory would leak.
-                await PendingArchiveStore.shared.discard(id: eventName)
                 // Releases this container's die-event bookkeeping and refuses later claims: an
                 // exit monitor still resolving the exit of a container that is now gone would
                 // otherwise find no record of the run and emit a `die` for it a second time.
@@ -105,6 +109,10 @@ extension ContainerDeleteRoute {
                     try await client.stop(id: id, signal: nil, timeout: nil)
                 }
                 try await client.delete(id: id)
+                if query.v == true {
+                    await removeVolumes(
+                        ContainerAnonymousVolumes.names(labels: container?.configuration.labels ?? eventLabels), req.logger)
+                }
             } catch ClientContainerError.notFound {
                 if snapshot != nil || cached != nil {
                     await broadcastRemove()
