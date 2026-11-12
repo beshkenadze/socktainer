@@ -98,7 +98,7 @@ enum LabelNormalization {
             DockerContainerID.idLabel,
             HealthCheckManager.healthcheckLabel,
             RestartPolicyManager.label,
-            ContainerAliasCleanup.dnsNamesLabel
+            ContainerAliasCleanup.dnsNamesLabel,
         ]
     }
 

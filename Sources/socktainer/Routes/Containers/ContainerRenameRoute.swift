@@ -32,10 +32,11 @@ struct ContainerRenameRoute: RouteCollection {
         recreate: Recreate? = nil
     ) {
         self.client = client
-        self.recreate = recreate ?? { configuration in
-            let kernel = try await ClientKernel.getDefaultKernel(for: .current)
-            try await ContainerClient().create(configuration: configuration, options: .default, kernel: kernel)
-        }
+        self.recreate =
+            recreate ?? { configuration in
+                let kernel = try await ClientKernel.getDefaultKernel(for: .current)
+                try await ContainerClient().create(configuration: configuration, options: .default, kernel: kernel)
+            }
     }
 
     func boot(routes: RoutesBuilder) throws {
@@ -132,7 +133,8 @@ struct ContainerRenameRoute: RouteCollection {
             }
 
             let renamed = try? await client.getContainer(id: newName)
-            let renamedHexId = renamed.map(DockerContainerID.hexId(for:))
+            let renamedHexId =
+                renamed.map(DockerContainerID.hexId(for:))
                 ?? DockerContainerID.hexId(nativeId: newName, createdAt: nil)
             // A container carrying its own Docker ID keeps it through the recreate, so there is
             // nothing to redirect. Comparing the ids rather than looking for the label also covers a
