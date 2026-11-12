@@ -30,6 +30,7 @@ actor ContainerExitCodeStore {
 
     private var records: [String: ExitRecord] = [:]
     private var waiters: [String: [CheckedContinuation<Int32, Never>]] = [:]
+    private var cancellableWaiters: [String: [UUID: CheckedContinuation<Int32, Error>]] = [:]
     private var fileURL: URL?
     private let log = Logger(label: "socktainer.container-exit-codes")
 
@@ -64,6 +65,33 @@ actor ContainerExitCodeStore {
         if let pending = waiters.removeValue(forKey: id) {
             for continuation in pending { continuation.resume(returning: code) }
         }
+        if let pending = cancellableWaiters.removeValue(forKey: id) {
+            for continuation in pending.values { continuation.resume(returning: code) }
+        }
+    }
+
+    /// A wait owned by an HTTP request must release its continuation on cancellation.
+    func waitForCodeCancellable(id: String) async throws -> Int32 {
+        try Task.checkCancellation()
+        if let code = records[id]?.code { return code }
+        let token = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    cancellableWaiters[id, default: [:]][token] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id: id, token: token) }
+        }
+    }
+
+    private func cancelWaiter(id: String, token: UUID) {
+        let waiter = cancellableWaiters[id]?.removeValue(forKey: token)
+        if cancellableWaiters[id]?.isEmpty == true { cancellableWaiters.removeValue(forKey: id) }
+        waiter?.resume(throwing: CancellationError())
     }
 
     func get(id: String) -> Int32? {
@@ -475,6 +503,7 @@ struct ClientContainerService: ClientContainerProtocol {
     // code recorded by the background waiter started in start() (or by the
     // stdin-attach bootstrap path).
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait {
+        try Task.checkCancellation()
         guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
@@ -482,6 +511,23 @@ struct ClientContainerService: ClientContainerProtocol {
         // or a truncated prefix of one.
         let id = container.id
 
+        return try await Self.waitForExit(id: id, condition: condition) { id in
+            do {
+                // get(id:) sends an ID filter to the server before snapshots are encoded.
+                return try await containerClient.withClient { try await $0.get(id: id) }
+            } catch let error as ContainerizationError where error.code == .notFound {
+                return nil
+            }
+        }
+    }
+
+    /// Wait using an already resolved native ID; the lookup is kept separate from reference resolution.
+    static func waitForExit(
+        id: String,
+        condition: ContainerWaitCondition,
+        pollIntervalNs: UInt64 = 1_000_000_000,
+        lookup: @escaping @Sendable (String) async throws -> ContainerSnapshot?
+    ) async throws -> RESTContainerWait {
         // `docker run` issues /wait BEFORE /start, so the container is still in
         // `.created` state when we arrive here — we must NOT treat "not running"
         // as "exited". Instead poll until the init process actually finishes and
@@ -500,28 +546,42 @@ struct ClientContainerService: ClientContainerProtocol {
             // `--rm` the container can be deleted the instant it exits (racing
             // the recorder), so also stop once it's gone, then grace-poll the
             // store below.
-            while await ContainerExitCodeStore.shared.get(id: id) == nil {
-                let current = try await containerClient.withClient { try await $0.list() }.filter { $0.id == id }.first
-                if current == nil {
-                    var graceTries = 0
-                    while await ContainerExitCodeStore.shared.get(id: id) == nil && graceTries < 30 {
-                        try await Task.sleep(nanoseconds: 100_000_000)  // 100ms
-                        graceTries += 1
+            // The store wakes this phase immediately when the recorder publishes a code.
+            // Only disappearance detection needs a periodic runtime lookup. Keep removal
+            // itself as the polling phase below, including when no exit code is available.
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                defer { group.cancelAll() }
+                group.addTask { _ = try await ContainerExitCodeStore.shared.waitForCodeCancellable(id: id) }
+                group.addTask {
+                    while await ContainerExitCodeStore.shared.get(id: id) == nil {
+                        try Task.checkCancellation()
+                        let current = try await lookup(id)
+                        if current == nil {
+                            var graceTries = 0
+                            while await ContainerExitCodeStore.shared.get(id: id) == nil && graceTries < 30 {
+                                try await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                                graceTries += 1
+                            }
+                            break
+                        }
+                        try await Task.sleep(nanoseconds: pollIntervalNs)  // Snapshot fallback; exit-store notification is immediate.
                     }
-                    break
                 }
-                try await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                _ = try await group.next()
             }
 
             // `removed` must block until the container is actually gone, not just
             // exited — otherwise the requested condition was never satisfied.
             if condition == .removed {
-                while (try await containerClient.withClient { try await $0.list() }.filter { $0.id == id }.first) != nil {
-                    try await Task.sleep(nanoseconds: 200_000_000)  // 200ms
+                while true {
+                    try Task.checkCancellation()
+                    guard try await lookup(id) != nil else { break }
+                    try await Task.sleep(nanoseconds: pollIntervalNs)
                 }
             }
         }
 
+        try Task.checkCancellation()
         let code = await ContainerExitCodeStore.shared.get(id: id) ?? 0
         return RESTContainerWait(statusCode: Int64(code))
     }

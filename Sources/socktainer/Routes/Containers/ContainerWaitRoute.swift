@@ -50,47 +50,51 @@ struct ContainerWaitRoute: RouteCollection {
 
             // Flush the response head before the body so docker run can issue /start
             // without waiting for the container to exit first.
-            let body = Response.Body(asyncStream: { writer in
-                _ = try? await writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
+            let body = Response.Body(managedAsyncStream: { writer in
+                try await writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
 
                 let result: RESTContainerWait
                 do {
-                    if condition == .healthy {
-                        var statusCode: Int64 = 0
-                        if let manager = req.application.storage[HealthCheckManagerKey.self] {
-                            while true {
-                                let health = await manager.currentHealth(for: containerId)
-                                if health?.Status == "healthy" { break }
-                                if health == nil {
-                                    statusCode = 1
-                                    break
+                    result = try await withDisconnectCancellation(writer: writer) {
+                        if condition == .healthy {
+                            var statusCode: Int64 = 0
+                            if let manager = req.application.storage[HealthCheckManagerKey.self] {
+                                while true {
+                                    let health = await manager.currentHealth(for: containerId)
+                                    if health?.Status == "healthy" { break }
+                                    if health == nil {
+                                        statusCode = 1
+                                        break
+                                    }
+                                    guard let container = try? await client.getContainer(id: containerId),
+                                        container.status == .running
+                                    else {
+                                        let code = await ContainerExitCodeStore.shared.get(id: containerId) ?? 1
+                                        statusCode = Int64(code)
+                                        break
+                                    }
+                                    try await Task.sleep(nanoseconds: ContainerWaitCondition.healthyPollIntervalNs)
                                 }
-                                guard let container = try? await client.getContainer(id: containerId),
-                                    container.status == .running
-                                else {
-                                    let code = await ContainerExitCodeStore.shared.get(id: containerId) ?? 1
-                                    statusCode = Int64(code)
-                                    break
-                                }
-                                try await Task.sleep(nanoseconds: ContainerWaitCondition.healthyPollIntervalNs)
+                            } else {
+                                statusCode = 1
                             }
+                            return RESTContainerWait(statusCode: statusCode)
+                        } else if condition == .removed {
+                            return try await client.wait(id: containerId, condition: condition)
                         } else {
-                            statusCode = 1
+                            // Subscribe before returning so a die event fired during the wait is
+                            // never missed by this listener.
+                            let events = await req.application.storage[EventBroadcasterKey.self]?.stream()
+                            return await resolveNotRunning(
+                                containerId: containerId,
+                                client: client,
+                                condition: condition,
+                                events: events
+                            )
                         }
-                        result = RESTContainerWait(statusCode: statusCode)
-                    } else if condition == .removed {
-                        result = try await client.wait(id: containerId, condition: condition)
-                    } else {
-                        // Subscribe before returning so a die event fired during the wait is
-                        // never missed by this listener.
-                        let events = await req.application.storage[EventBroadcasterKey.self]?.stream()
-                        result = await resolveNotRunning(
-                            containerId: containerId,
-                            client: client,
-                            condition: condition,
-                            events: events
-                        )
                     }
+                } catch is CancellationError {
+                    throw CancellationError()
                 } catch {
                     result = RESTContainerWait(statusCode: 0)
                 }
@@ -98,9 +102,8 @@ struct ContainerWaitRoute: RouteCollection {
                 if let data = try? JSONEncoder().encode(result) {
                     var buf = sharedAllocator.buffer(capacity: data.count)
                     buf.writeBytes(data)
-                    _ = try? await writer.write(.buffer(buf))
+                    try await writer.write(.buffer(buf))
                 }
-                _ = try? await writer.write(.end)
             })
 
             return Response(status: .ok, headers: headers, body: body)
@@ -109,6 +112,30 @@ struct ContainerWaitRoute: RouteCollection {
 }
 
 extension ContainerWaitRoute {
+    static func withDisconnectCancellation(
+        writer: AsyncBodyStreamWriter,
+        operation: @escaping @Sendable () async throws -> RESTContainerWait
+    ) async throws -> RESTContainerWait {
+        // Vapor launches async response bodies in an unstructured Task and exposes no
+        // channel-close notification on its writer. NIO pauses reads while a response
+        // is pending, so peer EOF may not be observed either. A JSON whitespace byte
+        // forces a transport write and discovers a departed peer without completing
+        // the JSON value. Empty writes cannot detect this while reads are paused.
+        try await withThrowingTaskGroup(of: RESTContainerWait.self) { group in
+            defer { group.cancelAll() }
+            group.addTask { try await operation() }
+            group.addTask {
+                while true {
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                    try await writer.write(.buffer(sharedAllocator.buffer(string: " ")))
+                }
+            }
+            let result = try await group.next()!
+            try Task.checkCancellation()
+            return result
+        }
+    }
+
     /// Poll interval shared by the exit-code and stopped-state watchers.
     static let waitPollIntervalNs: UInt64 = 100_000_000
     /// How long the stopped-state watcher gives the recorder to publish an exit code.
@@ -201,9 +228,10 @@ extension ContainerWaitRoute {
 
         for await event in events {
             guard event.Type == "container", event.Action == "die" else { continue }
-            guard event.Actor.ID == containerId
-                || event.Actor.ID.hasPrefix(containerId)
-                || event.Actor.Attributes["name"] == containerId
+            guard
+                event.Actor.ID == containerId
+                    || event.Actor.ID.hasPrefix(containerId)
+                    || event.Actor.Attributes["name"] == containerId
             else { continue }
 
             if let exitCode = event.Actor.Attributes["exitCode"], let code = Int64(exitCode) {
