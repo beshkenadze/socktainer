@@ -23,7 +23,7 @@ struct DockerReferenceTests {
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000",
             // A bare hex identifier: what `docker inspect` gets after `docker ps -q`.
             "9f5f5b2b0d6a",
-            "0000000000000000000000000000000000000000000000000000000000000000"
+            "0000000000000000000000000000000000000000000000000000000000000000",
         ])
     func acceptsValidReferences(reference: String) {
         #expect(DockerReference.invalidReason(for: reference) == nil, "rejected a valid reference: \(reference)")
@@ -41,7 +41,7 @@ struct DockerReferenceTests {
             "alpine@sha256:short",  // digest length is part of the grammar
             "alpine@notadigest",
             "-alpine",
-            "alpine:-tag"
+            "alpine:-tag",
         ])
     func rejectsMalformedReferences(reference: String) {
         #expect(DockerReference.invalidReason(for: reference) != nil, "accepted a malformed reference: \(reference)")

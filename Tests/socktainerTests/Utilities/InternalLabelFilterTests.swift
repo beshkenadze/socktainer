@@ -13,7 +13,7 @@ struct InternalLabelFilterTests {
     private static let stored = [
         DockerContainerID.idLabel: String(repeating: "ab12", count: 16),
         LabelNormalization.mappingKey: "{\"com.example.app\":\"com.example.App\"}",
-        "com.example.app": "demo"
+        "com.example.app": "demo",
     ]
 
     @Test("A key-only filter never matches an internal label")

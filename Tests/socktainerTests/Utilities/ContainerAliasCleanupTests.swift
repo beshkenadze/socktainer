@@ -18,7 +18,7 @@ struct ContainerAliasCleanupTests {
     private static let rawLabels = [
         ContainerAliasCleanup.dnsNamesLabel: "project-web-1,web",
         "com.docker.compose.service": "web",
-        "com.docker.compose.project": "project"
+        "com.docker.compose.project": "project",
     ]
 
     @Test("The recorded names are read from raw labels")
@@ -72,7 +72,6 @@ struct ContainerAliasCleanupTests {
     }
 }
 
-
 /// The helper above is only correct if the routes hand it the *raw* labels. This exercises the
 /// delete route end to end, so passing it a restored label set — which no longer carries the
 /// recorded names — fails here instead of leaking silently in production.
@@ -91,7 +90,7 @@ struct ContainerDeleteAliasCleanupTests {
                 // tell whether the recorded names were read at all.
                 ContainerAliasCleanup.dnsNamesLabel: "\(nativeId),extra-alias",
                 "com.docker.compose.service": "web",
-                "com.docker.compose.project": "myapp"
+                "com.docker.compose.project": "myapp",
             ]
         )
         let dnsServer = SocktainerDNSServer()
