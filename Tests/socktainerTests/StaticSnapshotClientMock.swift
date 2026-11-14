@@ -8,13 +8,20 @@ import ContainerResource
 /// stale exit code so a test's own `ContainerExitCodeStore.shared.set(...)` starts fresh.
 actor StaticSnapshotClientMock: ClientContainerProtocol {
     private let snapshot: ContainerSnapshot
+    private(set) var getCalls = 0
+    private var removed = false
+
+    func removeSnapshot() { removed = true }
 
     init(snapshot: ContainerSnapshot) {
         self.snapshot = snapshot
     }
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { [snapshot] }
-    func getContainer(id: String) async throws -> ContainerSnapshot? { snapshot }
+    func getContainer(id: String) async throws -> ContainerSnapshot? {
+        getCalls += 1
+        return removed ? nil : snapshot
+    }
     nonisolated func enforceContainerRunning(container: ContainerSnapshot) throws {}
     func start(id: String, detachKeys: String?) async throws {
         await ContainerExitCodeStore.shared.remove(id: id)
