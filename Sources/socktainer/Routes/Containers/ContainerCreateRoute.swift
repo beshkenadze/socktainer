@@ -228,8 +228,6 @@ extension ContainerCreateRoute {
             let rawImageConfig = try await ImageVolumeConfiguration.read(image: img, platform: requestedPlatform)
             let imageVolumes = rawImageConfig?.Volumes
 
-            let workingDirectory = imageConfig?.workingDir ?? "/"
-
             let imageConfigEnvironment = imageConfig?.env ?? []
             let requestedEnvironment = body.Env ?? []
             // merge environment variables, with request taking precedence
@@ -296,57 +294,31 @@ extension ContainerCreateRoute {
                 throw Abort(.internalServerError, reason: "Failed to allocate ports: \(error)")
             }
 
-            // Handle Entrypoint and Cmd from request, following Docker semantics
-            var commandLine: [String] = []
-
-            // Determine the entrypoint to use
-            let entrypoint: [String]
-            if let requestEntrypoint = body.Entrypoint {
-                // If entrypoint is explicitly provided (even if empty), use it
-                entrypoint = requestEntrypoint
-            } else if let imageEntrypoint = imageConfig?.entrypoint {
-                // Otherwise use image's entrypoint
-                entrypoint = imageEntrypoint
-            } else {
-                // No entrypoint specified
-                entrypoint = []
+            let commandLine: (executable: String, arguments: [String])
+            do {
+                commandLine = try ContainerCreateRoute.resolveCommandLine(
+                    requestEntrypoint: body.Entrypoint,
+                    requestCmd: body.Cmd,
+                    imageEntrypoint: imageConfig?.entrypoint,
+                    imageCmd: imageConfig?.cmd
+                )
+            } catch {
+                req.logger.error("No executable specified for container")
+                throw error
             }
 
-            // Determine the command to use
-            let command: [String]
-            if let requestCmd = body.Cmd {
-                // If cmd is explicitly provided but empty, use image's cmd
-                command = requestCmd.isEmpty ? (imageConfig?.cmd ?? []) : requestCmd
-            } else if body.Entrypoint != nil {
-                // If entrypoint was explicitly overridden, don't use image's cmd
-                command = []
-            } else {
-                // Use image's cmd
-                command = imageConfig?.cmd ?? []
-            }
-
-            // Build final command line
-            commandLine.append(contentsOf: entrypoint)
-            commandLine.append(contentsOf: command)
-
-            // Use working directory from request if provided and not empty, otherwise from image config
-            let finalWorkingDirectory = (body.WorkingDir?.isEmpty == false) ? body.WorkingDir! : workingDirectory
+            let finalWorkingDirectory = ContainerCreateRoute.resolveWorkingDirectory(
+                requestWorkingDir: body.WorkingDir, imageWorkingDir: imageConfig?.workingDir)
 
             let finalUser = ContainerCreateRoute.resolveUser(requestUser: body.User, imageUser: imageConfig?.user)
-
-            // Ensure we have a valid executable
-            guard let executable = commandLine.first, !executable.isEmpty else {
-                req.logger.error("No executable specified for container")
-                throw Abort(.badRequest, reason: "No executable specified for container. Image must specify ENTRYPOINT or CMD, or request must provide Entrypoint or Cmd.")
-            }
 
             // For Apple Container compatibility, we ignore attach flags during creation
             // Containers are always created in detached mode and can be attached to later
             // TODO: Store attach flags (AttachStdin, AttachStdout, AttachStderr) in container metadata
             // for use when container is started via /start endpoint
             let processConfig = ProcessConfiguration(
-                executable: executable,
-                arguments: commandLine.dropFirst().map { String($0) },
+                executable: commandLine.executable,
+                arguments: commandLine.arguments,
                 environment: finalEnv,
                 workingDirectory: finalWorkingDirectory,
                 terminal: body.Tty ?? false,
@@ -862,6 +834,49 @@ extension ContainerCreateRoute {
             return Abort(.notFound, reason: "No such image: \(image)")
         }
         return error
+    }
+
+    /// Docker's entrypoint and command merge: a request `Entrypoint` (even an empty one)
+    /// replaces the image's and drops the image's `Cmd`; a request `Cmd` replaces the image's
+    /// unless it is empty. Throws 400 when the merged command line has no executable.
+    static func resolveCommandLine(
+        requestEntrypoint: [String]?,
+        requestCmd: [String]?,
+        imageEntrypoint: [String]?,
+        imageCmd: [String]?
+    ) throws -> (executable: String, arguments: [String]) {
+        var commandLine: [String] = []
+
+        let entrypoint: [String]
+        if let requestEntrypoint {
+            entrypoint = requestEntrypoint
+        } else if let imageEntrypoint {
+            entrypoint = imageEntrypoint
+        } else {
+            entrypoint = []
+        }
+
+        let command: [String]
+        if let requestCmd {
+            command = requestCmd.isEmpty ? (imageCmd ?? []) : requestCmd
+        } else if requestEntrypoint != nil {
+            command = []
+        } else {
+            command = imageCmd ?? []
+        }
+
+        commandLine.append(contentsOf: entrypoint)
+        commandLine.append(contentsOf: command)
+
+        guard let executable = commandLine.first, !executable.isEmpty else {
+            throw Abort(.badRequest, reason: "No executable specified for container. Image must specify ENTRYPOINT or CMD, or request must provide Entrypoint or Cmd.")
+        }
+        return (executable, commandLine.dropFirst().map { String($0) })
+    }
+
+    /// The request's `WorkingDir` when it is not empty, else the image's, else `/`.
+    static func resolveWorkingDirectory(requestWorkingDir: String?, imageWorkingDir: String?) -> String {
+        (requestWorkingDir?.isEmpty == false) ? requestWorkingDir! : (imageWorkingDir ?? "/")
     }
 
     /// Resolves the process user, preferring an explicit request override over the image
