@@ -66,6 +66,10 @@ let package = Package(
                 .product(name: "SocktainerDNSImage", package: "dns-forwarder"),
                 .product(name: "VaporTesting", package: "vapor"),
             ],
+            resources: [
+                .copy("Resources/runtime-groups.v1.json"),
+                .copy("Resources/docker-cli-28.5.2-run-i-rm.json"),
+            ],
         ),
         .target(
             name: "BuildInfo",
