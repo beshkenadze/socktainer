@@ -1,3 +1,5 @@
+import CSSessionBinary
+import CryptoKit
 import Foundation
 
 /// Gives the bytes of the `cs-session` launcher, a static Linux arm64 binary (spec §3.3).
@@ -11,11 +13,12 @@ enum SharedRuntimeLauncher {
     static let fileName = "cs-session"
 
     enum Failure: Error, Equatable, CustomStringConvertible {
-        case missing
+        case checksumMismatch(expected: String, actual: String)
 
         var description: String {
             switch self {
-            case .missing: "this build of socktainer has no cs-session launcher"
+            case .checksumMismatch(let expected, let actual):
+                "the cs-session launcher in this build is damaged: SHA-256 \(actual), expected \(expected)"
             }
         }
     }
@@ -51,7 +54,18 @@ enum SharedRuntimeLauncher {
     }
 }
 
-/// The source for a build that does not carry the launcher: shared containers cannot start.
-struct MissingLauncherSource: SharedRuntimeLauncherSource {
-    func launcherBytes() throws -> Data { throw SharedRuntimeLauncher.Failure.missing }
+/// The launcher of the `cs-session` package, compiled into socktainer. Its bytes are checked
+/// against the SHA-256 that the package publishes before they are installed.
+struct PackagedLauncherSource: SharedRuntimeLauncherSource {
+    var bytes: @Sendable () -> Data = { CSSessionBinary.data }
+    var expectedSHA256: String = CSSessionBinary.sha256
+
+    func launcherBytes() throws -> Data {
+        let data = bytes()
+        let actual = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard actual == expectedSHA256.lowercased() else {
+            throw SharedRuntimeLauncher.Failure.checksumMismatch(expected: expectedSHA256, actual: actual)
+        }
+        return data
+    }
 }

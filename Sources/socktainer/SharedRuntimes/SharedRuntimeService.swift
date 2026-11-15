@@ -59,7 +59,7 @@ actor SharedRuntimeService {
     /// The service of a bridge on Apple Container.
     static func live(appSupport: URL, socketPath: String, logger: Logger) -> SharedRuntimeService {
         let launcherDirectory = SharedRuntimeLauncher.directory(appSupport: appSupport)
-        let source: SharedRuntimeLauncherSource = MissingLauncherSource()
+        let source = PackagedLauncherSource()
         let idleMinute =
             ProcessInfo.processInfo.environment["SOCKTAINER_SHARED_RUNTIMES_IDLE_MINUTE_SECONDS"]
             .flatMap(Int.init).map { Duration.seconds($0) } ?? .seconds(60)

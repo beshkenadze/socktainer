@@ -1,3 +1,4 @@
+import CSSessionBinary
 import Foundation
 import Testing
 
@@ -45,11 +46,17 @@ import Testing
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["cs-session"])
     }
 
-    @Test func aBuildWithoutTheLauncherSaysSo() {
+    @Test func theBuildCarriesTheReleasedLauncher() throws {
+        let bytes = try PackagedLauncherSource().launcherBytes()
+        #expect(bytes.count == 462_872)
+        #expect(Array(bytes.prefix(4)) == [0x7F, 0x45, 0x4C, 0x46])
+        #expect(CSSessionBinary.sha256 == "7990b4d98b6b37d9d57c3450eafe0e6ee508e6f3e514e2cf1ad5907774bb16a5")
+    }
+
+    @Test func damagedBytesAreNotInstalled() {
         defer { cleanup() }
-        #expect(throws: SharedRuntimeLauncher.Failure.missing) {
-            try SharedRuntimeLauncher.install(from: MissingLauncherSource(), into: directory)
-        }
-        #expect(SharedRuntimeLauncher.Failure.missing.description == "this build of socktainer has no cs-session launcher")
+        let source = PackagedLauncherSource(bytes: { Data("not the launcher".utf8) })
+        #expect(throws: SharedRuntimeLauncher.Failure.self) { try SharedRuntimeLauncher.install(from: source, into: directory) }
+        #expect(!FileManager.default.fileExists(atPath: file.path))
     }
 }
