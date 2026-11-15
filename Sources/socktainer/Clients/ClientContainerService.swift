@@ -571,11 +571,17 @@ struct ClientContainerService: ClientContainerProtocol {
             throw ClientContainerError.notFound(id: id)
         }
 
+        try await Self.withExplicitStop(id: container.id) {
+            try await self.stopInternal(container: container, signal: signal, timeout: timeout)
+        }
+    }
+
+    static func withExplicitStop(id: String, operation: @Sendable () async throws -> Void) async throws {
         // Mark before issuing the request: a stop that throws because the VM already died
         // on its own should still suppress restart-policy auto-restart for that exit.
-        await ContainerRestartState.shared.markExplicitlyStopped(id: container.id)
+        await ContainerRestartState.shared.markExplicitlyStopped(id: id)
         try await VMLifecycleAdmission.shared.withSlot {
-            try await self.stopInternal(container: container, signal: signal, timeout: timeout)
+            try await operation()
         }
     }
 
@@ -608,7 +614,7 @@ struct ClientContainerService: ClientContainerProtocol {
             try await stop()
             return
         }
-        try await withThrowingTaskGroup(of: Void.self) { group in
+        await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 _ = try await waitForExit()
             }
@@ -619,7 +625,7 @@ struct ClientContainerService: ClientContainerProtocol {
                     try await Task.sleep(for: .seconds(1))
                 }
             }
-            _ = try await group.next()
+            _ = try? await group.next()
             group.cancelAll()
         }
         try await stop()

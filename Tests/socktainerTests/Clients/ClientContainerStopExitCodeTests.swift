@@ -3,6 +3,23 @@ import Testing
 @testable import socktainer
 
 struct ClientContainerStopExitCodeTests {
+    @Test("a failed or cancelled exit wait still allows cleanup", arguments: [false, true])
+    func waitFailureStillAllowsCleanup(cancelled: Bool) async throws {
+        let runtime = StopRuntime(code: 0)
+        try await ClientContainerService.stopPreservingExitCode(
+            signal: "SIGTERM",
+            timeout: .seconds(5),
+            sendSignal: { await runtime.signal($0) },
+            waitForExit: {
+                if cancelled { throw CancellationError() }
+                throw WaitUnavailable()
+            },
+            stop: { await runtime.stop() }
+        )
+        #expect(await runtime.stopped)
+        #expect(await runtime.signals == ["SIGTERM"])
+    }
+
     @Test("a signal that races with process exit still allows cleanup", arguments: ["SIGTERM", "SIGKILL"])
     func signalFailureStillAllowsCleanup(failedSignal: String) async throws {
         let runtime = StopRuntime(code: 0)
