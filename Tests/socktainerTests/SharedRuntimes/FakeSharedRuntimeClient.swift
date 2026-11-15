@@ -11,6 +11,7 @@ actor FakeSharedRuntimeClient: SharedRuntimeClient {
         var removed: [String] = []
         var createsInFlight = 0
         var removesInFlight = 0
+        var removeAttempts = 0
         var signals: [(containerID: String, processID: String, signal: String)] = []
     }
 
@@ -22,6 +23,8 @@ actor FakeSharedRuntimeClient: SharedRuntimeClient {
     var holdRemoves = false
     var failCreates = false
     var failList = false
+    /// The number of next removals that fail.
+    var failRemoves = 0
     /// When set, `listContainers` never returns.
     var listNeverReturns = false
 
@@ -46,6 +49,12 @@ actor FakeSharedRuntimeClient: SharedRuntimeClient {
         changed()
         if holdRemoves { await withCheckedContinuation { heldRemoves.append($0) } }
         state.removesInFlight -= 1
+        state.removeAttempts += 1
+        if failRemoves > 0 {
+            failRemoves -= 1
+            changed()
+            throw Failure.injected
+        }
         state.removed.append(nativeID)
         records.removeAll { $0.nativeID == nativeID }
         changed()
