@@ -666,6 +666,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
     /// Extract a tar archive into a container's filesystem at the specified path
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws {
+        try ArchiveUtility.completeFinalTarBlock(at: tarPath)
         // Normalize the destination path
         let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
 

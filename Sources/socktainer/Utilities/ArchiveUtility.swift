@@ -1,3 +1,4 @@
+import CArchive
 import ContainerizationArchive
 import ContainerizationEXT4
 import Foundation
@@ -13,6 +14,42 @@ enum ArchiveUtilityError: Error {
 }
 
 struct ArchiveUtility {
+
+    static func completeFinalTarBlock(at tarPath: URL) throws {
+        let file = try FileHandle(forUpdating: tarPath)
+        defer { try? file.close() }
+        let fileSize = try file.seekToEnd()
+        guard fileSize % 512 != 0 else { return }
+        try file.seek(toOffset: 0)
+
+        guard let reader = archive_read_new() else { return }
+        defer { archive_read_free(reader) }
+        guard archive_read_support_format_tar(reader) == ARCHIVE_OK,
+            archive_read_support_filter_none(reader) == ARCHIVE_OK,
+            archive_read_open_fd(reader, file.fileDescriptor, 4096) == ARCHIVE_OK
+        else { return }
+
+        var entry: OpaquePointer?
+        while true {
+            let result = archive_read_next_header(reader, &entry)
+            guard result == ARCHIVE_OK || result == ARCHIVE_WARN else { return }
+            let offset = archive_filter_bytes(reader, 0)
+            let size = archive_entry_size(entry)
+            guard offset >= 0, size >= 0, UInt64(offset) <= fileSize else { return }
+            let available = fileSize - UInt64(offset)
+            let padding = (512 - UInt64(size) % 512) % 512
+            if archive_entry_filetype(entry) == UInt32(S_IFREG),
+                archive_entry_sparse_count(entry) == 0,
+                UInt64(size) <= available, available - UInt64(size) < padding
+            {
+                // An unclosed tar writer can omit final padding. Add it only after
+                // libarchive confirms the full file body is present.
+                try file.seekToEnd()
+                try file.write(contentsOf: Data(count: Int(512 - fileSize % 512)))
+                return
+            }
+        }
+    }
 
     static func extract(tarPath: URL, to destination: URL) throws {
         let fileManager = FileManager.default
