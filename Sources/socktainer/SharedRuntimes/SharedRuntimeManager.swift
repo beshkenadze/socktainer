@@ -62,6 +62,13 @@ actor SharedRuntimeManager {
     private var stopping: Set<String> = []
     private(set) var joinsInProgress = 0
 
+    /// Sessions by Docker ID (`SharedRuntimeManager+Sessions.swift`).
+    var sessions: [String: SharedSession] = [:]
+    let onEvent: @Sendable (DockerEvent) async -> Void
+    let attachTimeout: Duration
+    let sessionSleep: @Sendable (Duration) async throws -> Void
+    var sessionClient: SharedRuntimeClient { client }
+
     /// - Parameter idleMinute: the length of one minute of `idleMinutes`; tests and the live check
     ///   make it shorter.
     init(
@@ -70,8 +77,13 @@ actor SharedRuntimeManager {
         launcherDirectory: @escaping @Sendable () async throws -> URL,
         idleMinute: Duration = .seconds(60),
         sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
-        makeSuffix: @escaping @Sendable () -> String = { String(UUID().uuidString.lowercased().prefix(8)) }
+        makeSuffix: @escaping @Sendable () -> String = { String(UUID().uuidString.lowercased().prefix(8)) },
+        attachTimeout: Duration = .seconds(10),
+        onEvent: @escaping @Sendable (DockerEvent) async -> Void = { _ in }
     ) {
+        self.attachTimeout = attachTimeout
+        self.onEvent = onEvent
+        self.sessionSleep = sleep
         self.client = client
         self.socketPath = socketPath
         self.launcherDirectory = launcherDirectory
@@ -203,6 +215,26 @@ actor SharedRuntimeManager {
             }
             await self.stopFinished(id, removed: removed)
         }
+    }
+
+    /// Removes the slot of a container that ended outside the manager, so the next join creates a
+    /// new one. A newer container of the same key is not affected. Returns the sessions that were
+    /// in the container.
+    func evict(nativeID: String) -> Set<String> {
+        for (slot, entry) in slots {
+            guard case .running(let running) = entry, running.container.nativeID == nativeID else { continue }
+            slots[slot] = nil
+            running.idleTimer?.cancel()
+            for id in running.sessions { sessionSlots[id] = nil }
+            stopping.insert(nativeID)
+            let client = self.client
+            Task {
+                try? await client.removeSharedContainer(nativeID: nativeID)
+                await self.stopFinished(nativeID, removed: true)
+            }
+            return running.sessions
+        }
+        return []
     }
 
     static let removalAttempts = 3

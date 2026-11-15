@@ -49,4 +49,19 @@ protocol SharedRuntimeClient: Sendable {
     func listContainers() async throws -> [SharedRuntimeContainerRecord]
     /// Sends `signal`, a Linux signal name or number, to one process of a container.
     func signalProcess(containerID: String, processID: String, signal: String) async throws
+    /// Starts `cs-session run --tmp <tmpDirectory> -- <program>` with the effective configuration
+    /// of the session. `stdio` follows `ContainerClient.createProcess`: the runtime owns and closes
+    /// the handles that it gets, also when this call fails.
+    func startSession(
+        containerID: String, sessionID: String, process: SharedRuntimeProcess, tmpDirectory: String, stdio: [FileHandle?]
+    ) async throws -> SharedRuntimeSessionProcess
+    /// False only when the runtime says that the container does not exist or does not run. A
+    /// query that fails says true: only a known end evicts a container.
+    func isRunning(nativeID: String) async -> Bool
+}
+
+/// A session process in the runtime.
+protocol SharedRuntimeSessionProcess: Sendable {
+    /// The exit code of the launcher, which is the exit code of the program (spec §3.3).
+    func wait() async throws -> Int32
 }

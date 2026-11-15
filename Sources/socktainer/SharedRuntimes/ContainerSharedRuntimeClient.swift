@@ -76,7 +76,44 @@ struct ContainerSharedRuntimeClient: SharedRuntimeClient {
         try await ContainerClient().list().map { SharedRuntimeContainerRecord(nativeID: $0.id, labels: $0.configuration.labels) }
     }
 
+    func startSession(
+        containerID: String, sessionID: String, process: SharedRuntimeProcess, tmpDirectory: String, stdio: [FileHandle?]
+    ) async throws -> SharedRuntimeSessionProcess {
+        let configuration = ProcessConfiguration(
+            executable: Self.launcherGuestPath,
+            arguments: ["run", "--tmp", tmpDirectory, "--", process.executable] + process.arguments,
+            environment: process.environment,
+            workingDirectory: process.workingDirectory,
+            terminal: false,
+            user: process.user)
+        // createProcess closes each handle when it adds it to the XPC request
+        // (XPCMessage.set(key:value: FileHandle)), before it sends the request. So it owns the
+        // handles also when it fails, and they must not be closed again here.
+        let started = try await ContainerClient().createProcess(
+            containerId: containerID, processId: sessionID, configuration: configuration, stdio: stdio)
+        try await started.start()
+        return ClientSessionProcess(process: started)
+    }
+
+    func isRunning(nativeID: String) async -> Bool {
+        do {
+            return try await ContainerClient().get(id: nativeID).status == .running
+        } catch let error as ContainerizationError where error.code == .notFound {
+            return false
+        } catch {
+            // A query that fails does not show that the container is gone: evicting it would end
+            // the sessions that still run in it.
+            return true
+        }
+    }
+
     func signalProcess(containerID: String, processID: String, signal: String) async throws {
         try await SharedRuntimeSignal.send(containerID: containerID, processID: processID, signal: signal)
     }
+}
+
+private struct ClientSessionProcess: SharedRuntimeSessionProcess {
+    let process: ClientProcess
+
+    func wait() async throws -> Int32 { try await process.wait() }
 }
