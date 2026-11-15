@@ -12,6 +12,7 @@ actor FakeSharedRuntimeClient: SharedRuntimeClient {
         var createsInFlight = 0
         var removesInFlight = 0
         var removeAttempts = 0
+        var listCalls = 0
         var signals: [(containerID: String, processID: String, signal: String)] = []
     }
 
@@ -61,6 +62,8 @@ actor FakeSharedRuntimeClient: SharedRuntimeClient {
     }
 
     func listContainers() async throws -> [SharedRuntimeContainerRecord] {
+        state.listCalls += 1
+        changed()
         if listNeverReturns {
             await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
         }

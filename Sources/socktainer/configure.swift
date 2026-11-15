@@ -13,7 +13,8 @@ struct AppleContainerAppSupportUrlKey: StorageKey {
 func configure(
     _ app: Application,
     location: RuntimeLocation? = nil,
-    performsStartupHousekeeping: Bool = true
+    performsStartupHousekeeping: Bool = true,
+    sharedRuntimes: Bool = false
 ) async throws {
 
     // Docker container-create payloads (large env / config — e.g. Supabase's
@@ -207,6 +208,14 @@ func configure(
     let externalEventWatcher = ExternalEventWatcher(broadcaster: broadcaster, imageClient: imageClient, logger: app.logger)
     Task { await externalEventWatcher.run() }
     app.storage[AppleContainerAppSupportUrlKey.self] = appleContainerAppSupportUrl
+
+    // Shared runtime groups exist only with `--shared-runtimes`; without it nothing is installed.
+    await SharedRuntimeService.install(on: app, enabled: sharedRuntimes) {
+        SharedRuntimeService.live(
+            appSupport: appleContainerAppSupportUrl,
+            socketPath: location?.socketPath ?? RuntimeLocation.defaultSocketPath(),
+            logger: app.logger)
+    }
 
     // Initialize inter-container DNS infrastructure.
     // Port is read from SOCKTAINER_DNS_PORT (default 2054). If the preferred port

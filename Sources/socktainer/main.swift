@@ -25,6 +25,13 @@ struct CLIOptions: ParsableArguments {
     )
     var startupHousekeeping: Bool = true
 
+    @ArgumentParser.Flag(
+        name: .long,
+        help:
+            "Run eligible `docker run -i --rm` requests of the groups in ~/.containerstack/runtime-groups.json as sessions in shared containers. Off by default."
+    )
+    var sharedRuntimes: Bool = false
+
     @ArgumentParser.Option(
         name: .long,
         help:
@@ -87,7 +94,9 @@ if options.dockerContext, !runtimeLocation.hasCustomSocket,
     DockerContextSetup.install(homeDirectory: homeDir)
 }
 app.storage[VolumeSyncModeKey.self] = Filesystem.SyncMode.resolve(from: options.volumeSync)
-try await configure(app, location: runtimeLocation, performsStartupHousekeeping: options.startupHousekeeping)
+try await configure(
+    app, location: runtimeLocation, performsStartupHousekeeping: options.startupHousekeeping,
+    sharedRuntimes: options.sharedRuntimes)
 
 // Start the app
 try await app.startup()
