@@ -12,6 +12,42 @@ import Testing
 @Suite("ClientArchiveService.putArchive — damaged archives")
 struct ClientArchiveServicePutTests {
 
+    @Test("a stopped container rejects a tar cut inside an entry", arguments: [1, 13, 512])
+    func stoppedContainerRejectsCutFileData(missingBytes: Int) async throws {
+        let fixture = try PutFixture()
+        defer { fixture.cleanUp() }
+        let rootfs = try fixture.writeEmptyRootfs(containerId: "web")
+        let snapshot = try makeContainerSnapshot(nativeId: "web", networks: [], labels: [:])
+        let tarPath = try fixture.unterminatedTar()
+        var tar = try Data(contentsOf: tarPath)
+        tar.removeLast(512 - Data("before the damaged header\n".utf8).count + missingBytes)
+        try tar.write(to: tarPath)
+
+        await #expect(throws: (any Error).self) {
+            try await fixture.service.putArchive(container: snapshot, path: "/", tarPath: tarPath, noOverwriteDirNonDir: false)
+        }
+        #expect(try !EXT4.EXT4Reader(blockDevice: FilePath(rootfs.path)).exists(FilePath("/before.txt")))
+    }
+
+    @Test("a stopped container accepts a tar without end blocks", arguments: [false, true])
+    func stoppedContainerAcceptsMissingEndBlocks(omitPadding: Bool) async throws {
+        let fixture = try PutFixture()
+        defer { fixture.cleanUp() }
+        let rootfs = try fixture.writeEmptyRootfs(containerId: "web")
+        let snapshot = try makeContainerSnapshot(nativeId: "web", networks: [], labels: [:])
+        let tarPath = try fixture.unterminatedTar()
+        if omitPadding {
+            var tar = try Data(contentsOf: tarPath)
+            tar.removeLast(512 - Data("before the damaged header\n".utf8).count)
+            try tar.write(to: tarPath)
+        }
+
+        try await fixture.service.putArchive(container: snapshot, path: "/", tarPath: tarPath, noOverwriteDirNonDir: false)
+
+        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfs.path))
+        #expect(try reader.readFile(at: FilePath("/before.txt")) == Data("before the damaged header\n".utf8))
+    }
+
     @Test("a stopped container keeps its filesystem when the archive has a damaged header")
     func stoppedContainerRejectsDamagedArchive() async throws {
         let fixture = try PutFixture()
@@ -65,6 +101,14 @@ private struct PutFixture {
 
     /// One valid entry, then a block that is not a tar header.
     func damagedTar() throws -> URL {
+        let tarPath = try unterminatedTar()
+        var tar = try Data(contentsOf: tarPath)
+        tar += Data(repeating: 0x58, count: 512)
+        try tar.write(to: tarPath)
+        return tarPath
+    }
+
+    func unterminatedTar() throws -> URL {
         let source = root.appendingPathComponent("source")
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
         try Data("before the damaged header\n".utf8).write(to: source.appendingPathComponent("before.txt"))
@@ -76,7 +120,6 @@ private struct PutFixture {
         while tar.count >= 512, tar.suffix(512) == zeroBlock {
             tar.removeLast(512)
         }
-        tar += Data(repeating: 0x58, count: 512)
         try tar.write(to: tarPath)
         return tarPath
     }

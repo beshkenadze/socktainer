@@ -571,18 +571,64 @@ struct ClientContainerService: ClientContainerProtocol {
             throw ClientContainerError.notFound(id: id)
         }
 
+        try await Self.withExplicitStop(id: container.id) {
+            try await self.stopInternal(container: container, signal: signal, timeout: timeout)
+        }
+    }
+
+    static func withExplicitStop(id: String, operation: @Sendable () async throws -> Void) async throws {
         // Mark before issuing the request: a stop that throws because the VM already died
         // on its own should still suppress restart-policy auto-restart for that exit.
-        await ContainerRestartState.shared.markExplicitlyStopped(id: container.id)
+        await ContainerRestartState.shared.markExplicitlyStopped(id: id)
         try await VMLifecycleAdmission.shared.withSlot {
-            try await self.stopInternal(container: container, signal: signal, timeout: timeout)
+            try await operation()
         }
     }
 
     private func stopInternal(container: ContainerSnapshot, signal: String?, timeout: Int?) async throws {
         let signal = signal ?? "SIGTERM"
         let options = ContainerStopOptions(timeoutInSeconds: Int32(timeout ?? 5), signal: signal)
-        try await containerClient.withClient { try await $0.stop(id: container.id, opts: options) }
+        try await Self.stopPreservingExitCode(
+            signal: signal,
+            timeout: .seconds(timeout ?? 5),
+            sendSignal: { signal in
+                try await self.containerClient.withClient { try await $0.kill(id: container.id, signal: signal) }
+            },
+            waitForExit: { try await ContainerExitCodeStore.shared.waitForCodeCancellable(id: container.id) },
+            stop: { try await containerClient.withClient { try await $0.stop(id: container.id, opts: options) } }
+        )
+    }
+
+    static func stopPreservingExitCode(
+        signal: String,
+        timeout: Duration,
+        sendSignal: @escaping @Sendable (String) async throws -> Void,
+        waitForExit: @escaping @Sendable () async throws -> Int32,
+        stop: @Sendable () async throws -> Void
+    ) async throws {
+        // Apple's stop API removes the wait endpoint during VM cleanup.
+        // Let the exit recorder finish before that endpoint is removed.
+        do {
+            try await sendSignal(signal)
+        } catch {
+            try await stop()
+            return
+        }
+        await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                _ = try await waitForExit()
+            }
+            if timeout >= .zero {
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    try? await sendSignal("SIGKILL")
+                    try await Task.sleep(for: .seconds(1))
+                }
+            }
+            _ = try? await group.next()
+            group.cancelAll()
+        }
+        try await stop()
     }
 
     func kill(id: String, signal: String?) async throws {

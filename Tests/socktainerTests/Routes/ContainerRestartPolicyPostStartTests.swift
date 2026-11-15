@@ -15,6 +15,50 @@ import VaporTesting
 /// through the same `ContainerStartRoute.performPostStartSetup` the HTTP handler uses.
 @Suite("ContainerStartRoute — post-start setup on automatic restart")
 struct ContainerRestartPolicyPostStartTests {
+    @Test("an API stop suppresses restart between the signal and native cleanup", arguments: ["always", "unless-stopped"])
+    func apiStopSuppressesRestartBeforeCleanup(policy: String) async throws {
+        let nativeId = "stop-window-\(UUID().uuidString.lowercased())"
+        let mock = RestartMock(snapshot: try makeSnapshot(nativeId: nativeId, ip: "192.168.65.90", network: "test", restartPolicyName: policy))
+        let dnsServer = SocktainerDNSServer()
+
+        try await withApp(configure: { _ in }) { app in
+            let router = app.regexRouter(with: app.logger)
+            app.setRegexRouter(router)
+            router.installMiddleware(on: app)
+            app.storage[SocktainerDNSServerKey.self] = dnsServer
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerStartRoute(client: mock))
+            try await app.testing().test(.POST, "/v1.51/containers/\(nativeId)/start") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+        #expect(dnsServer.listEntries()[nativeId] != nil)
+
+        try await ClientContainerService.withExplicitStop(id: nativeId) {
+            try await ClientContainerService.stopPreservingExitCode(
+                signal: "SIGTERM",
+                timeout: .seconds(5),
+                sendSignal: { _ in
+                    await ContainerExitCodeStore.shared.set(id: nativeId, code: 143)
+                    let observerFinished = try await pollUntil(timeoutSeconds: 2) {
+                        dnsServer.listEntries()[nativeId] == nil
+                    }
+                    #expect(observerFinished)
+                    #expect(await mock.startCallCount() == 1)
+                    #expect(await mock.stopCallCount() == 0)
+                    #expect(await ContainerRestartState.shared.count(id: nativeId) == 0)
+                    #expect(await !ContainerRestartState.shared.isPendingRestart(id: nativeId))
+                },
+                waitForExit: { 143 },
+                stop: { try await mock.stop(id: nativeId, signal: "SIGTERM", timeout: 5) }
+            )
+        }
+        #expect(await mock.stopCallCount() == 1)
+        #expect(await mock.startCallCount() == 1)
+        await ContainerRestartState.shared.reset(id: nativeId)
+        await ContainerExitCodeStore.shared.set(id: nativeId, code: 143)
+        await ContainerExitCodeStore.shared.remove(id: nativeId)
+    }
 
     @Test("An automatic restart re-registers DNS with the container's new IP")
     func automaticRestartRefreshesDNS() async throws {
@@ -397,6 +441,7 @@ private func makeSnapshot(nativeId: String, ip: String, network: String, restart
 private actor RestartMock: ClientContainerProtocol {
     private var snapshot: ContainerSnapshot
     private var startCalls = 0
+    private var stopCalls = 0
 
     init(snapshot: ContainerSnapshot) {
         self.snapshot = snapshot
@@ -407,6 +452,7 @@ private actor RestartMock: ClientContainerProtocol {
     }
 
     func startCallCount() -> Int { startCalls }
+    func stopCallCount() -> Int { stopCalls }
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { [snapshot] }
     func getContainer(id: String) async throws -> ContainerSnapshot? { snapshot }
@@ -417,7 +463,7 @@ private actor RestartMock: ClientContainerProtocol {
         // the previous run so the newly-armed observer awaits the *next* exit, not a stale one.
         await ContainerExitCodeStore.shared.remove(id: id)
     }
-    func stop(id: String, signal: String?, timeout: Int?) async throws {}
+    func stop(id: String, signal: String?, timeout: Int?) async throws { stopCalls += 1 }
     func restart(id: String, signal: String?, timeout: Int?) async throws {
         // Mirrors ClientContainerService.restart(), which marks a running container
         // explicitly-stopped as part of its internal stop-then-start sequence.
