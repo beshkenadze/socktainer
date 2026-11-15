@@ -78,6 +78,28 @@ enum SharedRuntimeDecision: Equatable, Sendable {
         return .dedicated
     }
 
+    /// The decision when it does not depend on the image, else nil: the image must be read and
+    /// `decide` called. When it is not nil, it is what `decide` gives for any image.
+    static func decideWithoutImage(request: SharedRuntimeCreateRequest, groups: RuntimeGroupsDocument) -> SharedRuntimeDecision? {
+        let reason = SharedRuntimeEligibility.finalReason(for: request)
+        if let label = request.body.Labels?[SharedRuntimeLabels.group] {
+            if label == SharedRuntimeLabels.noGroup { return .dedicated }
+            guard let group = groups.group(named: label) else { return .rejected(group: label, reason: .unknownGroup) }
+            guard group.isActive else { return .rejected(group: label, reason: .disabledGroup) }
+            return reason.map { .rejected(group: label, reason: $0) }
+        }
+        for rule in groups.rules where groups.group(named: rule.group)?.isActive == true {
+            switch rule {
+            case .image(let group, let pattern):
+                guard SharedRuntimeSelection.imageMatches(pattern: pattern, image: request.body.Image) else { continue }
+                return reason.map { .skipped(group: group, reason: $0) }
+            case .stdioSession:
+                guard reason != nil else { return nil }
+            }
+        }
+        return .dedicated
+    }
+
     /// The value of `containerstack.group.skipped` for a skipped run.
     var skippedLabelValue: String? {
         guard case .skipped(let group, let reason) = self else { return nil }

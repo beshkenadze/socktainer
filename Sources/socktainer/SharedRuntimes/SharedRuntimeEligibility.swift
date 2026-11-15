@@ -41,6 +41,14 @@ enum SharedRuntimeEligibility {
     static let hostConfigKeys = declaredKeys(of: HostConfig.self, decodedFrom: "{}")
     static let networkingConfigKeys = declaredKeys(of: ContainerNetworkSettings.self, decodedFrom: "{}")
 
+    /// The reason from the request alone, when no image can change it. The image adds only
+    /// volumes, which give `mount`; a reason that comes before `mount` in the order, or is `mount`,
+    /// is final. Nil when the image must be read.
+    static func finalReason(for request: SharedRuntimeCreateRequest) -> SharedRuntimeReason? {
+        guard let reason = reason(for: request, imageVolumes: nil) else { return nil }
+        return [.noStdin, .noAutoremove, .tty, .mount].contains(reason) ? reason : nil
+    }
+
     /// Nil when the run is eligible, else the first reason in the order of the contract.
     static func reason(for request: SharedRuntimeCreateRequest, imageVolumes: [String: [String: String]]?) -> SharedRuntimeReason? {
         let top = request.raw

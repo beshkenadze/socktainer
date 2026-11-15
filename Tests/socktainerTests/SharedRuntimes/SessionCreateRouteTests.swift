@@ -12,7 +12,10 @@ import VaporTesting
     typealias H = SessionRouteHarness
 
     private func create(_ app: Application, query: String = "", _ edit: @escaping (inout [String: Any]) -> Void) async throws -> (HTTPStatus, String) {
-        let body = try SharedRuntimeFixtures.body(edit)
+        let body = try SharedRuntimeFixtures.body {
+            $0["Image"] = SharedRuntimeFixtures.absentImage
+            edit(&$0)
+        }
         var answer: (HTTPStatus, String) = (.ok, "")
         try await app.testing().test(
             .POST, "/containers/create\(query)",
@@ -30,7 +33,7 @@ import VaporTesting
 
     @Test func withoutTheFlagAnEligibleMcpRunGoesTheDedicatedWay() async throws {
         try await H.withApp(sharedRuntimes: false) { app, _ in
-            let (status, _) = try await create(app) { $0["Image"] = "mcp/time" }
+            let (status, _) = try await create(app) { $0["Image"] = SharedRuntimeFixtures.absentImage }
             #expect(isDedicated(status))
         }
     }
@@ -38,7 +41,7 @@ import VaporTesting
     @Test func withTheFlagTheSameRunIsASessionAndNoContainer() async throws {
         let client = FakeSharedRuntimeClient()
         try await H.withApp(client: client) { app, service in
-            let (status, body) = try await create(app) { $0["Image"] = "mcp/time" }
+            let (status, body) = try await create(app) { $0["Image"] = SharedRuntimeFixtures.absentImage }
             #expect(status == .created, "\(body)")
             #expect(await service?.manager.allSessions().count == 1)
             #expect(await client.state.created.isEmpty, "create starts nothing")
@@ -50,20 +53,20 @@ import VaporTesting
     @Test func aRuleSelectedRunThatIsNotEligibleGoesTheDedicatedWayWithTheSkippedLabel() async throws {
         try await H.withApp { app, service in
             let (status, _) = try await create(app) {
-                $0["Image"] = "mcp/time"
+                $0["Image"] = SharedRuntimeFixtures.absentImage
                 $0["Tty"] = true
             }
             #expect(isDedicated(status))
             #expect(await service?.manager.allSessions().isEmpty == true)
             let outcome = try await service?.decideCreate(
                 data: try SharedRuntimeFixtures.body {
-                    $0["Image"] = "mcp/time"
+                    $0["Image"] = SharedRuntimeFixtures.absentImage
                     $0["Tty"] = true
                 },
                 body: try JSONDecoder().decode(
                     CreateContainerRequest.self,
                     from: try SharedRuntimeFixtures.body {
-                        $0["Image"] = "mcp/time"
+                        $0["Image"] = SharedRuntimeFixtures.absentImage
                         $0["Tty"] = true
                     }),
                 name: "x", explicitName: false, platform: .current, containers: H.NoContainers())
@@ -74,7 +77,7 @@ import VaporTesting
     @Test func aLabelSelectedRunThatIsNotEligibleFailsWithTheReason() async throws {
         try await H.withApp { app, _ in
             let (status, body) = try await create(app) {
-                $0["Image"] = "mcp/time"
+                $0["Image"] = SharedRuntimeFixtures.absentImage
                 $0["Labels"] = ["containerstack.group": "mcp-catalog"]
                 var host = $0["HostConfig"] as! [String: Any]
                 host["Privileged"] = true
@@ -103,10 +106,42 @@ import VaporTesting
         }
     }
 
+    @Test func aRunThatCanNeverBeASessionReadsNoImage() async throws {
+        try await H.withApp(facts: FakeImageFacts(mustNotBeCalled: true)) { app, service in
+            let service = try #require(service)
+            func decide(_ edit: @escaping (inout [String: Any]) -> Void) async throws -> SharedRuntimeService.CreateOutcome {
+                let data = try SharedRuntimeFixtures.body(edit)
+                return try await service.decideCreate(
+                    data: data, body: try JSONDecoder().decode(CreateContainerRequest.self, from: data), name: "x",
+                    explicitName: false, platform: .current, containers: H.NoContainers())
+            }
+            #expect(
+                try await decide {
+                    $0["Image"] = SharedRuntimeFixtures.absentOtherImage
+                    $0["OpenStdin"] = false
+                } == .dedicated(skipped: nil))
+            #expect(
+                try await decide {
+                    $0["Image"] = SharedRuntimeFixtures.absentImage
+                    $0["OpenStdin"] = false
+                } == .dedicated(skipped: "mcp-catalog:no-stdin"))
+            #expect(
+                try await decide {
+                    $0["Image"] = SharedRuntimeFixtures.absentImage
+                    $0["Tty"] = true
+                } == .dedicated(skipped: "mcp-catalog:tty"))
+            let labelled = try await create(app) {
+                $0["Labels"] = ["containerstack.group": "mcp-catalog"]
+                $0["OpenStdin"] = false
+            }
+            #expect(labelled.0 == .badRequest && labelled.1.contains("no-stdin"))
+        }
+    }
+
     @Test func labelNoneReadsNoImage() async throws {
         try await H.withApp(facts: FakeImageFacts(failure: FakeSharedRuntimeClient.Failure.injected)) { app, _ in
             let (status, _) = try await create(app) {
-                $0["Image"] = "mcp/time"
+                $0["Image"] = SharedRuntimeFixtures.absentImage
                 $0["Labels"] = ["containerstack.group": "none"]
             }
             #expect(isDedicated(status))
@@ -117,14 +152,14 @@ import VaporTesting
         try await H.withApp(facts: FakeImageFacts(failure: FakeSharedRuntimeClient.Failure.injected)) { app, _ in
             let labelled = try await create(app) { $0["Labels"] = ["containerstack.group": "mcp-catalog"] }
             #expect(labelled.0 == .internalServerError && labelled.1.contains("mcp-catalog"))
-            let ruled = try await create(app) { $0["Image"] = "mcp/time" }
+            let ruled = try await create(app) { $0["Image"] = SharedRuntimeFixtures.absentImage }
             #expect(isDedicated(ruled.0))
         }
     }
 
     @Test func anImageThatIsNotInTheStoreGoesOnToTheRoute404() async throws {
         try await H.withApp(facts: FakeImageFacts(image: nil)) { app, _ in
-            let (status, _) = try await create(app) { $0["Image"] = "mcp/time" }
+            let (status, _) = try await create(app) { $0["Image"] = SharedRuntimeFixtures.absentImage }
             #expect(isDedicated(status))
         }
     }
@@ -142,7 +177,7 @@ import VaporTesting
             manager: SharedRuntimeManagerTests.manager(client), file: RuntimeGroupsFile(path: path.path),
             imageFacts: FakeImageFacts(), timerSleep: { try await timer.sleep($0) })
         await service.startCleanup()
-        let data = try SharedRuntimeFixtures.body { $0["Image"] = "mcp/time" }
+        let data = try SharedRuntimeFixtures.body { $0["Image"] = SharedRuntimeFixtures.absentImage }
         let decision = Task {
             try await service.decideCreate(
                 data: data, body: try JSONDecoder().decode(CreateContainerRequest.self, from: data), name: "x", explicitName: false,
@@ -159,9 +194,9 @@ import VaporTesting
     @Test func aNameIsUniqueAcrossSessionsAndContainers() async throws {
         try await H.withApp { app, _ in
             _ = try await H.createSession(app, name: "taken")
-            let again = try await create(app, query: "?name=taken") { $0["Image"] = "mcp/time" }
+            let again = try await create(app, query: "?name=taken") { $0["Image"] = SharedRuntimeFixtures.absentImage }
             #expect(again.0 == .conflict)
-            let dedicated = try await create(app, query: "?name=taken") { $0["Image"] = "busybox" }
+            let dedicated = try await create(app, query: "?name=taken") { $0["Image"] = SharedRuntimeFixtures.absentOtherImage }
             #expect(dedicated.0 == .conflict, "a dedicated create cannot take the name of a session")
         }
     }

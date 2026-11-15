@@ -27,17 +27,21 @@ extension SharedRuntimeService {
             }
         }
         guard case .on(let document) = await admission() else { return .dedicated(skipped: nil) }
-        // A label that names no active group fails before the image is read, also for an image
-        // that is not in the store yet.
-        if let label {
-            guard let group = document.group(named: label) else { throw Self.rejection(group: label, reason: .unknownGroup) }
-            guard group.isActive else { throw Self.rejection(group: label, reason: .disabledGroup) }
-        }
 
         let request: SharedRuntimeCreateRequest
-        let facts: SharedRuntimeImageFactsResult?
         do {
             request = try SharedRuntimeCreateRequest(data: data)
+        } catch {
+            guard let label else { return .dedicated(skipped: nil) }
+            throw Abort(.internalServerError, reason: "cannot read the request for shared runtime group \"\(label)\": \(error)")
+        }
+        // A run that can never be a session (no stdin, a TTY, a label with no active group) is
+        // decided without the image; most runs that are not sessions stop here.
+        if let decision = SharedRuntimeDecision.decideWithoutImage(request: request, groups: document) {
+            return try Self.outcome(decision)
+        }
+        let facts: SharedRuntimeImageFactsResult?
+        do {
             facts = try await imageFacts.facts(reference: body.Image, platform: platform)
         } catch {
             guard let label else { return .dedicated(skipped: nil) }
@@ -45,13 +49,10 @@ extension SharedRuntimeService {
         }
         guard let facts else { return .dedicated(skipped: nil) }
 
-        switch try SharedRuntimeDecision.decide(request: request, image: facts.image, groups: document) {
-        case .dedicated:
-            return .dedicated(skipped: nil)
-        case .skipped(let group, let reason):
-            return .dedicated(skipped: "\(group):\(reason.code)")
-        case .rejected(let group, let reason):
-            throw Self.rejection(group: group, reason: reason)
+        let decision = try SharedRuntimeDecision.decide(request: request, image: facts.image, groups: document)
+        switch decision {
+        case .dedicated, .skipped, .rejected:
+            return try Self.outcome(decision)
         case .session(let groupName, let key, let process):
             guard let group = document.group(named: groupName) else { return .dedicated(skipped: nil) }
             if let existing = try? await containers.getContainer(id: name) {
@@ -69,6 +70,15 @@ extension SharedRuntimeService {
             }
             await manager.onEvent(manager.sessionEvent(session, "create"))
             return .session(id: spec.id)
+        }
+    }
+
+    /// The outcome of a decision that is not a session.
+    private static func outcome(_ decision: SharedRuntimeDecision) throws -> CreateOutcome {
+        switch decision {
+        case .skipped(let group, let reason): return .dedicated(skipped: "\(group):\(reason.code)")
+        case .rejected(let group, let reason): throw rejection(group: group, reason: reason)
+        case .dedicated, .session: return .dedicated(skipped: nil)
         }
     }
 
