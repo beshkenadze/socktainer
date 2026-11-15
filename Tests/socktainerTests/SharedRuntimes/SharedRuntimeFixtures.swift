@@ -23,6 +23,11 @@ enum SharedRuntimeFixtures {
         return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
+    /// Images that are never in a local store. A route test that sends a create uses them, so a
+    /// create that goes the dedicated way stops at the image check and never reaches the runtime.
+    static let absentImage = "mcp/socktainer-test-never-pulled"
+    static let absentOtherImage = "socktainer-test-never-pulled"
+
     static func request(_ edit: (inout [String: Any]) -> Void = { _ in }) throws -> SharedRuntimeCreateRequest {
         try SharedRuntimeCreateRequest(data: body(edit))
     }

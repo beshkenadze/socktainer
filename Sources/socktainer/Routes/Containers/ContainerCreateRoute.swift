@@ -163,6 +163,22 @@ extension ContainerCreateRoute {
             // Validate the requested platform only if provided
             var requestedPlatform = try Platform(from: containerPlatform)
 
+            // With --shared-runtimes, a run of a group becomes a session: no container is created.
+            var sharedRuntimeSkipped: String?
+            if let sharedRuntimes = req.application.storage[SharedRuntimeServiceKey.self] {
+                switch try await sharedRuntimes.decideCreate(
+                    data: data, body: body, name: id, explicitName: containerName != nil, platform: requestedPlatform,
+                    containers: client)
+                {
+                case .dedicated(let skipped):
+                    sharedRuntimeSkipped = skipped
+                case .session(let sessionID):
+                    let response = try await RESTContainerCreate(Id: sessionID, Warnings: []).encodeResponse(for: req)
+                    response.status = .created
+                    return response
+                }
+            }
+
             // Check if image exists locally; resolve an image ID to its reference
             let imageReference: String
             do {
@@ -431,6 +447,7 @@ extension ContainerCreateRoute {
             // along in the configuration a rename copies, so renaming preserves the ID as Docker
             // does instead of deriving a new one from the new name.
             containerLabels[DockerContainerID.idLabel] = DockerContainerID.mint()
+            if let sharedRuntimeSkipped { containerLabels[SharedRuntimeLabels.groupSkipped] = sharedRuntimeSkipped }
 
             // Persist the effective healthcheck (request merged over the image's
             // HEALTHCHECK) across create → start so the

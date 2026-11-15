@@ -81,9 +81,9 @@ import VaporTesting
             try app.register(
                 collection: ContainerCreateRoute(client: containers, systemConfig: ContainerSystemConfig(), controlSocketPath: "/tmp/test.sock"))
 
-            await SharedRuntimeService.install(on: app, enabled: sharedRuntimes) {
+            await SharedRuntimeService.install(on: app, enabled: sharedRuntimes, containers: SessionRouteHarness.NoContainers()) {
                 SharedRuntimeService(
-                    manager: SharedRuntimeManagerTests.manager(client), file: RuntimeGroupsFile(path: Self.groupsPath))
+                    manager: SharedRuntimeManagerTests.manager(client), file: RuntimeGroupsFile(path: Self.groupsPath), imageFacts: FakeImageFacts())
             }
             _ = await app.storage[SharedRuntimeServiceKey.self]?.admission()
 
@@ -133,7 +133,7 @@ import VaporTesting
     }
 
     @Test func withTheFlagInfoHasTheLabelAndTheOtherRoutesAnswerAsWithout() async throws {
-        let createBody = try SharedRuntimeFixtures.body { $0["Image"] = "mcp/time" }
+        let createBody = try SharedRuntimeFixtures.body { $0["Image"] = SharedRuntimeFixtures.absentImage }
         let requests: [(HTTPMethod, String, Data?)] = [
             (.GET, "/info", nil),
             (.GET, "/containers/json?all=1", nil),

@@ -158,6 +158,11 @@ extension ContainerListRoute {
                 )
                 summaries.append(summary)
             }
+            if let sharedRuntimes = req.application.storage[SharedRuntimeServiceKey.self] {
+                return SharedRuntimeRouter.listing(
+                    summaries, sessions: await sharedRuntimes.manager.allSessions(), showAll: showAll, filters: parsedFilters,
+                    limit: limit)
+            }
             return summaries
         }
     }

@@ -1,3 +1,4 @@
+import ContainerPersistence
 import Foundation
 import Logging
 import Vapor
@@ -20,7 +21,8 @@ actor SharedRuntimeService {
     static let infoLabelKey = "containerstack.shared-runtimes"
 
     let manager: SharedRuntimeManager
-    private let file: RuntimeGroupsFile
+    let file: RuntimeGroupsFile
+    let imageFacts: SharedRuntimeImageFacts
     private let cleanupTimeout: Duration
     /// Runs the cleanup with a time limit and returns whether it finished in time.
     typealias Bounded = @Sendable (Duration, @escaping @Sendable () async -> Void) async -> Bool
@@ -37,27 +39,36 @@ actor SharedRuntimeService {
     init(
         manager: SharedRuntimeManager,
         file: RuntimeGroupsFile,
+        imageFacts: SharedRuntimeImageFacts,
         cleanupTimeout: Duration = .seconds(30),
         timerSleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
         bounded: Bounded? = nil
     ) {
         self.manager = manager
         self.file = file
+        self.imageFacts = imageFacts
         self.cleanupTimeout = cleanupTimeout
         self.bounded = bounded ?? { timeout, work in await StartupHousekeeping.runBounded(timeout: timeout, sleep: timerSleep, work) }
     }
 
     /// Installs the service when `enabled` and starts the cleanup at start. Without the flag it
     /// does nothing.
-    static func install(on app: Application, enabled: Bool, make: () -> SharedRuntimeService) async {
+    static func install(
+        on app: Application, enabled: Bool, containers: ClientContainerProtocol, make: () -> SharedRuntimeService
+    ) async {
         guard enabled else { return }
         let service = make()
         app.storage[SharedRuntimeServiceKey.self] = service
+        app.regexRouter.interceptor = { req, method, pattern in
+            try await SharedRuntimeRouter.intercept(req, method: method, pattern: pattern, service: service, containers: containers)
+        }
         await service.startCleanup()
     }
 
     /// The service of a bridge on Apple Container.
-    static func live(appSupport: URL, socketPath: String, logger: Logger) -> SharedRuntimeService {
+    static func live(
+        appSupport: URL, socketPath: String, logger: Logger, systemConfig: ContainerSystemConfig, events: EventBroadcaster
+    ) -> SharedRuntimeService {
         let launcherDirectory = SharedRuntimeLauncher.directory(appSupport: appSupport)
         let source = PackagedLauncherSource()
         let idleMinute =
@@ -67,8 +78,9 @@ actor SharedRuntimeService {
             client: ContainerSharedRuntimeClient(logger: logger),
             socketPath: socketPath,
             launcherDirectory: { try SharedRuntimeLauncher.install(from: source, into: launcherDirectory) },
-            idleMinute: idleMinute)
-        return SharedRuntimeService(manager: manager, file: RuntimeGroupsFile())
+            idleMinute: idleMinute,
+            onEvent: { await events.broadcast($0) })
+        return SharedRuntimeService(manager: manager, file: RuntimeGroupsFile(), imageFacts: LocalImageFacts(systemConfig: systemConfig))
     }
 
     func startCleanup() {

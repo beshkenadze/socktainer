@@ -210,11 +210,11 @@ func configure(
     app.storage[AppleContainerAppSupportUrlKey.self] = appleContainerAppSupportUrl
 
     // Shared runtime groups exist only with `--shared-runtimes`; without it nothing is installed.
-    await SharedRuntimeService.install(on: app, enabled: sharedRuntimes) {
+    await SharedRuntimeService.install(on: app, enabled: sharedRuntimes, containers: containerClient) {
         SharedRuntimeService.live(
             appSupport: appleContainerAppSupportUrl,
             socketPath: location?.socketPath ?? RuntimeLocation.defaultSocketPath(),
-            logger: app.logger)
+            logger: app.logger, systemConfig: systemConfig, events: broadcaster)
     }
 
     // Initialize inter-container DNS infrastructure.

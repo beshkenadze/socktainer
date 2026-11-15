@@ -118,19 +118,21 @@ final class SharedSessionIO: @unchecked Sendable {
         lock.withLock { logs.select(stdout: stdout, stderr: stderr, tail: tail) }
     }
 
-    /// The records written from now on, until the session ends.
-    func follow() -> AsyncStream<SessionLogBuffer.Record> {
+    /// The selected records, and with `follow` the records written after them until the session
+    /// ends. Both are taken under one lock, so no record is lost or repeated between them.
+    func logRecords(stdout: Bool, stderr: Bool, tail: Int?, follow: Bool) -> ([SessionLogBuffer.Record], AsyncStream<SessionLogBuffer.Record>?) {
+        guard follow else { return (logRecords(stdout: stdout, stderr: stderr, tail: tail), nil) }
         let (stream, continuation) = AsyncStream<SessionLogBuffer.Record>.makeStream()
         let id = UUID()
-        let alreadyEnded: Bool = lock.withLock {
+        let (records, alreadyEnded): ([SessionLogBuffer.Record], Bool) = lock.withLock {
             if !ended { followers[id] = continuation }
-            return ended
+            return (logs.select(stdout: stdout, stderr: stderr, tail: tail), ended)
         }
         if alreadyEnded { continuation.finish() }
         continuation.onTermination = { [weak self] _ in
             self?.lock.withLock { _ = self?.followers.removeValue(forKey: id) }
         }
-        return stream
+        return (records, stream)
     }
 
     /// Flushes and closes the attached stream, and ends the followers.

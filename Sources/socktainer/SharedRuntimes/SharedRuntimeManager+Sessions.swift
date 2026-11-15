@@ -20,12 +20,16 @@ extension SharedRuntimeManager {
     }
 
     /// A session by full ID, by name (with or without `/`), or by a unique ID prefix.
-    func session(_ reference: String) -> SharedSession? {
-        if let session = sessions[reference] { return session }
+    func session(_ reference: String) -> SharedSession? { sessionMatch(reference)?.session }
+
+    /// `byPrefix` is true when only a prefix of the session ID matched: a dedicated container
+    /// with that name or ID comes first, as in Docker.
+    func sessionMatch(_ reference: String) -> (session: SharedSession, byPrefix: Bool)? {
+        if let session = sessions[reference] { return (session, false) }
         let name = reference.hasPrefix("/") ? String(reference.dropFirst()) : reference
-        if let session = sessions.values.first(where: { $0.spec.name == name }) { return session }
+        if let session = sessions.values.first(where: { $0.spec.name == name }) { return (session, false) }
         let matches = sessions.values.filter { $0.spec.id.hasPrefix(reference) }
-        return matches.count == 1 ? matches.first : nil
+        return matches.count == 1 ? (matches[0], true) : nil
     }
 
     func allSessions() -> [SharedSession] { Array(sessions.values) }
@@ -313,7 +317,7 @@ extension SharedRuntimeManager {
         }
     }
 
-    func sessionEvent(_ session: SharedSession, _ action: String, _ extra: [String: String] = [:]) -> DockerEvent {
+    nonisolated func sessionEvent(_ session: SharedSession, _ action: String, _ extra: [String: String] = [:]) -> DockerEvent {
         DockerEvent.simpleEvent(
             id: session.spec.id, type: "container", status: action, image: session.spec.imageName,
             name: session.spec.name, labels: session.spec.labels, extraAttributes: extra)

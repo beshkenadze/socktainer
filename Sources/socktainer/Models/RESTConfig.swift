@@ -135,7 +135,8 @@ struct HostConfig: Content {
         dnsSearch: [String]? = nil,
         dnsOptions: [String]? = nil,
         maskedPaths: [String]? = nil,
-        readonlyPaths: [String]? = nil
+        readonlyPaths: [String]? = nil,
+        autoRemove: Bool? = nil
     ) {
         self.Binds = binds
         self.BlkioWeight = nil
@@ -177,7 +178,7 @@ struct HostConfig: Content {
         self.NetworkMode = networkMode
         self.OomKillDisable = nil
         self.Init = nil
-        self.AutoRemove = nil
+        self.AutoRemove = autoRemove
         self.OomScoreAdj = nil
         self.PortBindings = portBindings
         self.Privileged = nil
