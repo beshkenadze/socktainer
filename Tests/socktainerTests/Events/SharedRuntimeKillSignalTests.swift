@@ -17,22 +17,21 @@ struct SharedRuntimeKillSignalTests {
     func eventUsesDockerSignal(signal: String?, expected: String, delivered: String) async throws {
         let client = FakeSharedRuntimeClient()
         let events = EventBroadcaster()
-        let sleeper = ManualSleeper()
         let manager = SharedRuntimeManager(
             client: client, socketPath: SharedRuntimeManagerTests.socket,
             launcherDirectory: { URL(fileURLWithPath: "/tmp/launcher") },
-            sleep: { try await sleeper.sleep($0) },
             onEvent: { await events.broadcast($0) })
-        let session = try await manager.addSession(SharedRuntimeSessionTests.spec())
-        try await manager.start(session)
-        let program = await client.waitForProgram(session.spec.id)
+        // The kill event needs a running session, not a program or its I/O tasks.
+        let session = SharedSession(spec: SharedRuntimeSessionTests.spec())
+        session.phase = .running
+        session.container = .init(
+            nativeID: "shared-kill-test", dockerID: session.spec.id,
+            group: session.spec.group.name, key: session.spec.key)
         try await manager.kill(session, signal: signal)
         #expect(await client.state.signals.map(\.signal) == [delivered])
         let history = await events.backlog(since: Date(timeIntervalSince1970: 0), until: nil)
         let kills = history.filter { $0.Action == "kill" }
         #expect(kills.count == 1)
         #expect(kills.first?.Actor.Attributes["signal"] == expected)
-        program.exit(0)
-        #expect(await session.ended.wait(limit: .seconds(10)) == 0)
     }
 }
