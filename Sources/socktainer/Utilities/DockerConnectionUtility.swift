@@ -51,6 +51,11 @@ struct ProcessPipe: @unchecked Sendable {
     static func make() -> ProcessPipe? {
         var fds: [Int32] = [0, 0]
         guard Darwin.pipe(&fds) == 0 else { return nil }
+        guard fcntl(fds[1], F_SETNOSIGPIPE, 1) != -1 else {
+            Darwin.close(fds[0])
+            Darwin.close(fds[1])
+            return nil
+        }
         return ProcessPipe(
             read: FileHandle(fileDescriptor: fds[0], closeOnDealloc: false),
             write: FileHandle(fileDescriptor: fds[1], closeOnDealloc: false)
@@ -316,7 +321,7 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
     // Guarantees: (1) FIFO across concurrent callers, (2) no byte-interleaving
     // for writes > PIPE_BUF, (3) close always follows all pending writes.
     private let writeQueue = DispatchQueue(label: "DockerTCPHandler.stdin", qos: .userInteractive)
-    private var stdinWriter: FileHandle?
+    private var stdinWriter: StdinForwarder?
     // Buffers stdin bytes arriving before setStdinWriter is called.
     // Once it reaches 1 MiB, socket reads are paused (autoRead off) until
     // setStdinWriter resumes them — data is never dropped.
@@ -334,14 +339,13 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
     }
 
     deinit {
-        // Defensive cleanup for exceptional teardown paths where channelInactive
-        // never fires. deinit only runs when the stream handler Task has released
-        // its reference, so writeQueue is idle — direct close is safe.
+        // Queued writes retain their forwarder, not this handler. Teardown must
+        // enqueue the close after them, just like channelInactive.
         lock.lock()
         let writer = stdinWriter
         stdinWriter = nil
         lock.unlock()
-        try? writer?.close()
+        if let writer { writeQueue.async { writer.close() } }
     }
 
     public func handlerAdded(context: ChannelHandlerContext) {
@@ -367,6 +371,10 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
     @discardableResult
     func writeToStdin(_ data: Data) -> Bool {
         lock.lock()
+        guard !didReceiveInputClosed, !isChannelInactive else {
+            lock.unlock()
+            return false
+        }
         let writer = stdinWriter
         if writer == nil {
             // Always buffer: NIO may deliver a few more reads after autoRead is
@@ -380,9 +388,7 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
         }
         lock.unlock()
 
-        writeQueue.async { [execId] in
-            do { try writer!.write(contentsOf: data) } catch { Self.logger.error("[\(execId)] stdin write failed: \(error)") }
-        }
+        writeQueue.async { writer?.write(data) }
         return false
     }
 
@@ -397,7 +403,7 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
             stdinWriter = nil
             lock.unlock()
             if let writer {
-                writeQueue.async { try? writer.close() }
+                writeQueue.async { writer.close() }
             }
         } else {
             context.fireUserInboundEventTriggered(event)
@@ -415,7 +421,7 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
         stdinWriter = nil
         lock.unlock()
         if let writer {
-            writeQueue.async { try? writer.close() }
+            writeQueue.async { writer.close() }
         }
     }
 
@@ -430,15 +436,16 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
         pendingData = []
         pendingDataSize = 0
         let shouldClose = didReceiveInputClosed || isChannelInactive
-        if let writer {
+        if let handle = writer {
+            var logger = Self.logger
+            logger[metadataKey: "process"] = .string(execId)
+            let writer = StdinForwarder(handle, logger: logger)
             if !shouldClose { stdinWriter = writer }
-            writeQueue.async { [execId] in
+            writeQueue.async {
                 for data in buffered {
-                    do { try writer.write(contentsOf: data) } catch {
-                        Self.logger.error("[\(execId)] stdin flush failed: \(error)")
-                    }
+                    if !writer.write(data) { break }
                 }
-                if shouldClose { try? writer.close() }
+                if shouldClose { writer.close() }
             }
         }
         // Resume socket reads after the flush is enqueued, so later reads are
@@ -453,6 +460,10 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
     }
 
     // MARK: - Test helpers
+
+    var stdinErrorForTesting: Error? {
+        writeQueue.sync { lock.withLock { stdinWriter?.error } }
+    }
 
     /// Returns the total bytes currently buffered in pendingData.
     var pendingDataSizeForTesting: Int {
@@ -482,7 +493,7 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
         stdinWriter = nil
         lock.unlock()
         if let writer {
-            writeQueue.async { try? writer.close() }
+            writeQueue.async { writer.close() }
         }
     }
 
@@ -494,7 +505,7 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
         stdinWriter = nil
         lock.unlock()
         if let writer {
-            writeQueue.async { try? writer.close() }
+            writeQueue.async { writer.close() }
         }
     }
 }

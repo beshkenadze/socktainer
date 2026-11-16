@@ -143,7 +143,9 @@ struct ClientRegistryService: ClientRegistryProtocol {
         try process.run()
 
         if let passwordData = "\(password)\n".data(using: .utf8) {
-            try stdinPipe.fileHandleForWriting.write(contentsOf: passwordData)
+            let forwarder = StdinForwarder(stdinPipe.fileHandleForWriting, logger: Logger(label: "socktainer.registry.stdin"))
+            forwarder.write(passwordData)
+            forwarder.close()
         }
         try stdinPipe.fileHandleForWriting.close()
 

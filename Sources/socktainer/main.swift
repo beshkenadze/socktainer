@@ -4,6 +4,9 @@ import ContainerResource
 import Foundation
 import Vapor
 
+// Do this before CLI parsing, tasks, or event loops can start.
+ignoreSIGPIPE()
+
 // CLI options
 struct CLIOptions: ParsableArguments {
     @ArgumentParser.Flag(name: .long, help: "Show version")

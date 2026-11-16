@@ -243,3 +243,63 @@ struct DockerTCPHandlerTests {
         return false
     }
 }
+
+extension DockerTCPHandlerTests {
+    @Test("broken stdin stops both pending flushes and later writes", arguments: [false, true])
+    func brokenStdin(buffered: Bool) throws {
+        let handler = DockerTCPHandler(execId: "broken", ttyEnabled: false)
+        let pipe = Pipe()
+        let fd = pipe.fileHandleForWriting.fileDescriptor
+        if buffered {
+            handler.writeToStdin(Data([1]))
+            handler.writeToStdin(Data([2]))
+        }
+        // Keep the reader alive until the production forwarder has protected the fd.
+        if buffered {
+            // Protect this test fd before closing its reader, so the pending flush is
+            // already broken when setStdinWriter dispatches it.
+            try #require(fcntl(fd, F_SETNOSIGPIPE, 1) == 0)
+            try pipe.fileHandleForReading.close()
+            handler.setStdinWriter(pipe.fileHandleForWriting)
+        } else {
+            handler.setStdinWriter(pipe.fileHandleForWriting)
+            handler.drainForTesting()
+            try #require(fcntl(fd, F_GETNOSIGPIPE) == 1)
+            try pipe.fileHandleForReading.close()
+        }
+        for _ in 0..<20 { handler.writeToStdin(Data([3])) }
+        handler.drainForTesting()
+        let error = try #require(handler.stdinErrorForTesting) as NSError
+        let posixCode = error.domain == NSPOSIXErrorDomain ? error.code : (error.userInfo[NSUnderlyingErrorKey] as? NSError)?.code
+        #expect(posixCode == Int(EPIPE))
+        #expect(stdinHandleIsClosed(pipe.fileHandleForWriting))
+        handler.writeToStdin(Data(repeating: 4, count: 1024))
+        handler.drainForTesting()
+        #expect(handler.pendingDataSizeForTesting == 0)
+        #expect((handler.stdinErrorForTesting as NSError?) == error)
+    }
+}
+
+extension DockerTCPHandlerTests {
+    @Test("teardown waits for queued stdin writes before closing their forwarder")
+    func teardownPreservesQueuedWrites() throws {
+        let pipe = Pipe()
+        defer { try? pipe.fileHandleForReading.close() }
+        var handler: DockerTCPHandler? = DockerTCPHandler(execId: "teardown", ttyEnabled: false)
+        handler?.setStdinWriter(pipe.fileHandleForWriting)
+        // No reader yet: the queue cannot finish this payload before handler teardown.
+        let data = Data(repeating: 0x41, count: 1024 * 1024)
+        handler?.writeToStdin(data)
+        handler?.writeToStdin(Data([0xFF]))
+        handler = nil
+        #expect(pipe.fileHandleForReading.readDataToEndOfFile() == data + Data([0xFF]))
+    }
+
+    @Test("late input after stdin EOF is not buffered again")
+    func lateInputAfterEOF() {
+        let handler = DockerTCPHandler(execId: "eof", ttyEnabled: false)
+        handler.simulateInputClosed()
+        handler.writeToStdin(Data([1]))
+        #expect(handler.pendingDataSizeForTesting == 0)
+    }
+}

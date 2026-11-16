@@ -69,18 +69,20 @@ extension ContainerAttachWSRoute {
             return
         }
 
+        let stdinForwarder = StdinForwarder(pipes.stdin!.write, logger: req.logger)
+
         // For non-interactive containers, pre-close the write end so the container
         // sees immediate stdin EOF. ws.onClose (registered below) calls close() on
         // the same FileHandle object — Foundation makes that second call a no-op.
         if !stdin {
-            try? pipes.stdin?.write.close()
+            stdinForwarder.close()
         }
 
         // ws.onClose is the sole owner for the interactive stdin write end.
         // For non-interactive, the pre-close above already happened — this is a
         // safe no-op second call on the same FileHandle object.
         ws.onClose.whenComplete { _ in
-            try? pipes.stdin?.write.close()
+            stdinForwarder.close()
         }
 
         // Docker holds the attach open until the container is started; `POST /start` boots it
@@ -111,12 +113,11 @@ extension ContainerAttachWSRoute {
         // Wire WS → stdin. Guard ws.isClosed so a late-arriving frame after
         // teardown doesn't write to a closed fd.
         if stdin {
-            let stdinWriter = pipes.stdin!.write
             ws.onBinary { ws, buf in
                 guard !ws.isClosed else { return }
                 var b = buf
                 if let data = b.readBytes(length: b.readableBytes) {
-                    try? stdinWriter.write(contentsOf: data)
+                    stdinForwarder.write(Data(data))
                 }
             }
         }

@@ -617,17 +617,16 @@ extension ContainerAttachRoute {
                         }
                     }
 
-                    let stdinWriter = pipes.stdin!.write
+                    let stdinWriter = StdinForwarder(pipes.stdin!.write, logger: req.logger)
                     group.addTask {
                         defer {
-                            try? stdinWriter.close()
+                            stdinWriter.close()
                         }
 
                         do {
                             for try await var buf in req.body {
                                 if let data = buf.readData(length: buf.readableBytes) {
-                                    try stdinWriter.write(contentsOf: data)
-                                    try stdinWriter.synchronize()
+                                    if !stdinWriter.write(data) { break }
                                 }
                             }
                         } catch {

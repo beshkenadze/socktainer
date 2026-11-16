@@ -980,17 +980,11 @@ struct ClientArchiveService: ClientArchiveProtocol {
         queue: DispatchQueue = stdinFeedQueue,
         completion: @escaping @Sendable (Error?) -> Void = { _ in }
     ) {
-        _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
+        let forwarder = StdinForwarder(writer, logger: Logger(label: "socktainer.archive.stdin"))
         queue.async {
-            let result: Error?
-            do {
-                try writer.write(contentsOf: data)
-                result = nil
-            } catch {
-                result = error
-            }
-            try? writer.close()
-            completion(result)
+            forwarder.write(data)
+            forwarder.close()
+            completion(forwarder.error)
         }
     }
 
