@@ -282,9 +282,8 @@ extension DockerTCPHandlerTests {
 
 extension DockerTCPHandlerTests {
     @Test("teardown waits for queued stdin writes before closing their forwarder")
-    func teardownPreservesQueuedWrites() throws {
+    func teardownPreservesQueuedWrites() async throws {
         let pipe = Pipe()
-        defer { try? pipe.fileHandleForReading.close() }
         var handler: DockerTCPHandler? = DockerTCPHandler(execId: "teardown", ttyEnabled: false)
         handler?.setStdinWriter(pipe.fileHandleForWriting)
         // No reader yet: the queue cannot finish this payload before handler teardown.
@@ -292,7 +291,15 @@ extension DockerTCPHandlerTests {
         handler?.writeToStdin(data)
         handler?.writeToStdin(Data([0xFF]))
         handler = nil
-        #expect(pipe.fileHandleForReading.readDataToEndOfFile() == data + Data([0xFF]))
+        let (chunks, continuation) = AsyncStream<Data>.makeStream()
+        let reader = Task {
+            await SessionOutputReader.read(pipe.fileHandleForReading) { continuation.yield($0) }
+            continuation.finish()
+        }
+        var received = Data()
+        for await chunk in chunks { received.append(chunk) }
+        await reader.value
+        #expect(received == data + Data([0xFF]))
     }
 
     @Test("late input after stdin EOF is not buffered again")

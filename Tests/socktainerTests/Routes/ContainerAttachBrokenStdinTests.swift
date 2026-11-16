@@ -14,7 +14,6 @@ struct ContainerAttachBrokenStdinTests {
     @Test func exitedReaderDoesNotEndAttachOutputOrWait() async throws {
         let id = "broken-stdin-\(UUID().uuidString)"
         let exit = SessionLatch<Int32>()
-        defer { exit.resolve(255) }
         let client = BrokenStdinContainer(id: id, exit: exit)
         try await withApp(configure: { _ in }) { app in
             let router = app.regexRouter(with: app.logger)
@@ -26,46 +25,86 @@ struct ContainerAttachBrokenStdinTests {
             // Only the route fixture listens here. No bridge configuration or runtime service.
             let path = "/tmp/attach-broken-\(UUID().uuidString.prefix(8)).sock"
             defer { try? FileManager.default.removeItem(atPath: path) }
-            try await app.server.start(address: .unixDomainSocket(path: path))
-            let attach = try await RawSocketClient.connect(path: path, group: app.eventLoopGroup)
-            try await attach.send(RawSocketClient.upgradeRequest(path: "/containers/\(id)/attach?stream=1&stdin=1&stdout=1&stderr=0"))
-            try #require(await attach.waitUntil { String(decoding: $0.received, as: UTF8.self).hasPrefix("HTTP/1.1 101") })
+            try await withAttachTestServer(app, path: path) {
+                // Resolve before the server and app shut down if any assertion throws.
+                defer { exit.resolve(255) }
+                let attach = try await RawSocketClient.connect(path: path, group: app.eventLoopGroup)
+                do {
+                    try await attach.send(RawSocketClient.upgradeRequest(path: "/containers/\(id)/attach?stream=1&stdin=1&stdout=1&stderr=0"))
+                    try #require(await attach.waitUntil { String(decoding: $0.received, as: UTF8.self).hasPrefix("HTTP/1.1 101") })
 
-            // Stand in for /start's bootstrap: take the exact pipes parked by the attach route.
-            let pipes = try #require(await PendingAttachStart.shared.claim(containerId: id))
-            defer { pipes.closeAll() }
-            let stdin = try #require(pipes.stdin)
-            let fd = stdin.write.fileDescriptor
-            // Fail safely if protection is removed, before triggering the broken pipe.
-            try #require(fcntl(fd, F_GETNOSIGPIPE) == 1)
-            await PendingAttachStart.shared.finish(containerId: id, result: .success(BrokenStdinProcess(id: id, exit: exit)))
-            try stdin.read.close()
-            // The client keeps sending after the program stops reading. Its output and wait
-            // are deliberately held open, so failure cannot be mistaken for normal teardown.
-            for _ in 0..<20 { try await attach.send([0x79, 0x0A]) }
-            var stdinClosed = false
-            for _ in 0..<500 {
-                if stdinHandleIsClosed(stdin.write) {
-                    stdinClosed = true
-                    break
+                    // Stand in for /start's bootstrap: take the exact pipes parked by the attach route.
+                    let pipes = try #require(await PendingAttachStart.shared.claim(containerId: id))
+                    defer {
+                        // The fake program owns these ends; the route owns the other ends.
+                        try? pipes.stdin?.read.close()
+                        try? pipes.stdout?.write.close()
+                    }
+                    let stdin = try #require(pipes.stdin)
+                    let fd = stdin.write.fileDescriptor
+                    await PendingAttachStart.shared.finish(containerId: id, result: .success(BrokenStdinProcess(id: id, exit: exit)))
+                    // Fail safely if protection is removed, before triggering the broken pipe.
+                    try #require(fcntl(fd, F_GETNOSIGPIPE) == 1)
+                    try stdin.read.close()
+                    // The client keeps sending after the program stops reading. Its output and wait
+                    // are deliberately held open, so failure cannot be mistaken for normal teardown.
+                    for _ in 0..<20 { try await attach.send([0x79, 0x0A]) }
+                    var stdinClosed = false
+                    for _ in 0..<500 {
+                        if stdinHandleIsClosed(stdin.write) {
+                            stdinClosed = true
+                            break
+                        }
+                        try await Task.sleep(for: .milliseconds(10))
+                    }
+                    #expect(stdinClosed, "the stdin forwarder must close its end after EPIPE")
+                    #expect(!attach.isClosed, "stdin failure must leave output and wait alive")
+                    try pipes.stdout?.write.write(contentsOf: Data("last output\n".utf8))
+                    try pipes.stdout?.write.close()
+                    try #require(await attach.waitUntil { String(decoding: $0.stream, as: UTF8.self).contains("last output\n") })
+                    exit.resolve(7)
+                    #expect(await attach.waitUntil { $0.isClosed })
+                    try await app.testing().test(.POST, "/containers/\(id)/wait?condition=removed") { response in
+                        #expect(response.status == .ok)
+                        #expect(response.body.string.contains("\"StatusCode\":7"))
+                    }
+                    try? await attach.close()
+                } catch {
+                    try? await attach.close()
+                    throw error
                 }
-                try await Task.sleep(for: .milliseconds(10))
             }
-            #expect(stdinClosed, "the stdin forwarder must close its end after EPIPE")
-            #expect(!attach.isClosed, "stdin failure must leave output and wait alive")
-            try pipes.stdout?.write.write(contentsOf: Data("last output\n".utf8))
-            try pipes.stdout?.write.close()
-            try #require(await attach.waitUntil { String(decoding: $0.stream, as: UTF8.self).contains("last output\n") })
-            exit.resolve(7)
-            #expect(await attach.waitUntil { $0.isClosed })
-            try await app.testing().test(.POST, "/containers/\(id)/wait?condition=removed") { response in
-                #expect(response.status == .ok)
-                #expect(response.body.string.contains("\"StatusCode\":7"))
+        }
+    }
+
+    @Test func fixtureShutsDownServerWhenBodyThrows() async throws {
+        try await withApp(configure: { _ in }) { app in
+            let path = "/tmp/attach-failure-\(UUID().uuidString.prefix(8)).sock"
+            defer { try? FileManager.default.removeItem(atPath: path) }
+            let server = try #require(app.server as? HTTPServer)
+            await #expect(throws: AttachFixtureFailure.self) {
+                try await withAttachTestServer(app, path: path) { throw AttachFixtureFailure() }
             }
-            try? await attach.close()
+            #expect(server.localAddress == nil, "a failed test must stop its HTTP server")
+            // Also keeps this regression safe when the error-path shutdown is removed.
             await app.server.shutdown()
         }
     }
+}
+
+private struct AttachFixtureFailure: Error {}
+
+private func withAttachTestServer(
+    _ app: Application, path: String, _ body: () async throws -> Void
+) async throws {
+    try await app.server.start(address: .unixDomainSocket(path: path))
+    do {
+        try await body()
+    } catch {
+        await app.server.shutdown()
+        throw error
+    }
+    await app.server.shutdown()
 }
 
 private struct BrokenStdinProcess: ClientProcess {
