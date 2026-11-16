@@ -539,14 +539,15 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
         let process: ClientProcess
         do {
-            process = try await ContainerClient().createProcess(
-                containerId: container.id,
-                processId: UUID().uuidString.lowercased(),
-                configuration: processConfig,
-                stdio: pipes.stdioArray
-            )
+            process = try await pipes.withHandoff(preparing: { _ = try JSONEncoder().encode(processConfig) }) { stdio in
+                try await ContainerClient().createProcess(
+                    containerId: container.id,
+                    processId: UUID().uuidString.lowercased(),
+                    configuration: processConfig,
+                    stdio: stdio
+                )
+            }
         } catch {
-            pipes.closeAll()
             throw ClientArchiveError.operationFailed(message: "no tar in \(container.id): \(error.localizedDescription)")
         }
         do {
@@ -1085,14 +1086,15 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
         let process: ClientProcess
         do {
-            process = try await ContainerClient().createProcess(
-                containerId: container.id,
-                processId: UUID().uuidString.lowercased(),
-                configuration: configuration,
-                stdio: pipes.stdioArray
-            )
+            process = try await pipes.withHandoff(preparing: { _ = try JSONEncoder().encode(configuration) }) { stdio in
+                try await ContainerClient().createProcess(
+                    containerId: container.id,
+                    processId: UUID().uuidString.lowercased(),
+                    configuration: configuration,
+                    stdio: stdio
+                )
+            }
         } catch {
-            pipes.closeAll()
             throw ClientArchiveError.operationFailed(message: "Failed to exec into running container: \(error.localizedDescription)")
         }
         do {

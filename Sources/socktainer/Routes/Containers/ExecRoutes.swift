@@ -445,14 +445,15 @@ struct ExecRoute: RouteCollection {
 
                     let process: ClientProcess
                     do {
-                        process = try await ContainerClient().createProcess(
-                            containerId: container.id,
-                            processId: UUID().uuidString.lowercased(),
-                            configuration: processConfig,
-                            stdio: pipes.stdioArray
-                        )
+                        process = try await pipes.withHandoff(preparing: { _ = try JSONEncoder().encode(processConfig) }) { stdio in
+                            try await ContainerClient().createProcess(
+                                containerId: container.id,
+                                processId: UUID().uuidString.lowercased(),
+                                configuration: processConfig,
+                                stdio: stdio
+                            )
+                        }
                     } catch {
-                        pipes.closeAll()
                         await ExecManager.shared.setExitCode(id: execId, code: -1)
                         throw error
                     }
@@ -628,14 +629,15 @@ struct ExecRoute: RouteCollection {
 
                 let process: ClientProcess
                 do {
-                    process = try await ContainerClient().createProcess(
-                        containerId: container.id,
-                        processId: UUID().uuidString.lowercased(),
-                        configuration: processConfig,
-                        stdio: pipes.stdioArray
-                    )
+                    process = try await pipes.withHandoff(preparing: { _ = try JSONEncoder().encode(processConfig) }) { stdio in
+                        try await ContainerClient().createProcess(
+                            containerId: container.id,
+                            processId: UUID().uuidString.lowercased(),
+                            configuration: processConfig,
+                            stdio: stdio
+                        )
+                    }
                 } catch {
-                    pipes.closeAll()
                     await ExecManager.shared.setExitCode(id: execId, code: -1)
                     throw error
                 }

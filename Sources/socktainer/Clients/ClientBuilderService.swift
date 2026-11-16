@@ -208,20 +208,16 @@ struct ClientBuilderService: ClientBuilderProtocol {
         guard let pipes = StdioPipes.make([.stdout, .stderr]) else {
             throw ContainerizationError(.internalError, message: "Failed to create I/O pipes")
         }
-        let process: ClientProcess
         let processConfigToSend = processConfig
-        do {
-            process = try await containerClient.withClient {
+        let process = try await pipes.withHandoff(preparing: { _ = try JSONEncoder().encode(processConfigToSend) }) { stdio in
+            try await containerClient.withClient(retryOnStaleConnection: false) {
                 try await $0.createProcess(
                     containerId: container.id,
                     processId: UUID().uuidString.lowercased(),
                     configuration: processConfigToSend,
-                    stdio: pipes.stdioArray
+                    stdio: stdio
                 )
             }
-        } catch {
-            pipes.closeAll()
-            throw error
         }
         do {
             try await process.start()

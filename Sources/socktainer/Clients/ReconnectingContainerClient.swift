@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 import ContainerizationError
+import Foundation
 
 /// Wraps a client whose underlying XPC connection can go stale.
 ///
@@ -31,6 +32,8 @@ import ContainerizationError
 /// evidence of a stale connection, replaces it with a freshly constructed one (a new
 /// XPC connection) and retries exactly once. Any other error — a real "not found", a bad
 /// argument, etc. — is rethrown immediately without reconnecting.
+/// Pass `retryOnStaleConnection: false` for operations that consume fds: a stale
+/// connection is refreshed for the next call, but the current operation is not replayed.
 actor ReconnectingContainerClient<Client: Sendable> {
     private var client: Client
     private let makeClient: @Sendable () -> Client
@@ -43,7 +46,7 @@ actor ReconnectingContainerClient<Client: Sendable> {
         self.client = makeClient()
     }
 
-    func withClient<T>(_ operation: @Sendable (Client) async throws -> T) async throws -> T {
+    func withClient<T>(retryOnStaleConnection: Bool = true, _ operation: @Sendable (Client) async throws -> T) async throws -> T {
         let currentCount = reconnectCount
         let currentClient = client
         do {
@@ -57,7 +60,29 @@ actor ReconnectingContainerClient<Client: Sendable> {
                 reconnectCount += 1
                 client = makeClient()
             }
+            // A consuming operation cannot replay its already-transferred fds.
+            // Refresh the connection for the next request, but return this failure.
+            if !retryOnStaleConnection { throw error }
             return try await operation(client)
+        }
+    }
+
+    /// Bootstrap consumes parked stdio before sending. Calls without parked pipes
+    /// retain the normal reconnect/retry behavior.
+    nonisolated func withBootstrapStdio<T: Sendable>(
+        _ pipes: StdioPipes?,
+        _ operation: @Sendable (Client, [FileHandle?]) async throws -> T
+    ) async throws -> T {
+        if let pipes {
+            // Unlike createProcess, bootstrap encodes its metadata after consuming stdio.
+            return try await pipes.withHandoff(preparing: {}) { stdio in
+                try await self.withClient(retryOnStaleConnection: false) { client in
+                    try await operation(client, stdio)
+                }
+            }
+        }
+        return try await withClient { client in
+            try await operation(client, [nil, nil, nil])
         }
     }
 
