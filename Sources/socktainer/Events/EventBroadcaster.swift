@@ -120,6 +120,11 @@ actor EventBroadcaster {
     /// When each (actor id, action) of container and image events was last broadcast, so `ExternalEventWatcher`
     /// can skip transitions socktainer's own routes already reported.
     private var recentEvents: [String: Date] = [:]
+    private let sleep: @Sendable (Duration) async throws -> Void
+
+    init(sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
+        self.sleep = sleep
+    }
 
     func stream() -> AsyncStream<DockerEvent> {
         // Live-only view of the atomic subscribe: nil/nil bounds select no backlog
@@ -137,12 +142,24 @@ actor EventBroadcaster {
     /// event broadcast after the read arrives on both arms at once. Actor isolation
     /// serializes `broadcast` against this whole method, so every event lands in
     /// exactly one arm — never neither, never both.
+    ///
+    /// A set `until` also ends the live stream at that moment: the `timeout` arm of
+    /// moby's getEvents select loop. The end is applied inside the actor, so every
+    /// event broadcast before it is already in the stream's buffer and is still read,
+    /// even by a reader that starts after the deadline.
     func subscribe(since: Date?, until: Date?) -> (backlog: [DockerEvent], live: AsyncStream<DockerEvent>) {
         let backlog = loadBufferedEvents(since: since, until: until)
         let id = UUID()
         let (live, continuation) = AsyncStream.makeStream(of: DockerEvent.self)
         continuations[id] = continuation
+        let deadline = until.map { until in
+            Task { [sleep] in
+                try await sleep(.seconds(until.timeIntervalSinceNow))
+                self.endSubscription(id: id)
+            }
+        }
         continuation.onTermination = { @Sendable _ in
+            deadline?.cancel()
             Task { await self.removeContinuation(id: id) }
         }
         return (backlog, live)
@@ -210,5 +227,9 @@ actor EventBroadcaster {
 
     private func removeContinuation(id: UUID) {
         continuations.removeValue(forKey: id)
+    }
+
+    private func endSubscription(id: UUID) {
+        continuations.removeValue(forKey: id)?.finish()
     }
 }

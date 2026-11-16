@@ -172,4 +172,48 @@ struct EventBroadcasterHistoryTests {
 
         #expect(seen == ["after"], "stream() delivers only post-subscription events, got \(seen)")
     }
+
+    /// The route used to end the stream with its own timer, which raced the task that
+    /// forwarded live events: when the reader started after `until`, an event the
+    /// subscription had already received was dropped. The broadcaster now ends the
+    /// subscription inside the actor, so the order of the end and the broadcasts is fixed.
+    @Test("until ends the live stream after every event broadcast before it, even for a late reader")
+    func untilEndsLiveStreamAfterEarlierEvents() async throws {
+        let sleeper = ManualSleeper()
+        let broadcaster = EventBroadcaster(sleep: { try await sleeper.sleep($0) })
+        let base = EventHistoryFixture.base
+
+        let (_, live) = await broadcaster.subscribe(since: nil, until: Date().addingTimeInterval(60))
+        let armed = try await pollUntil(timeoutSeconds: 10) { sleeper.snapshot.pending.count == 1 }
+        try #require(armed, "subscribe(until:) must arm the deadline")
+        await broadcaster.broadcast(EventHistoryFixture.event("die", at: base))
+
+        sleeper.fireAll()
+        let ended = try await pollUntil(timeoutSeconds: 10) { await broadcaster.subscriberCount == 0 }
+        try #require(ended, "the until deadline must end the subscription")
+        await broadcaster.broadcast(EventHistoryFixture.event("late", at: base + 1_000_000))
+
+        var seen: [String] = []
+        for await event in live { seen.append(event.Action) }
+        #expect(seen == ["die"], "read after the deadline: the earlier event stays, the later one is not sent")
+    }
+
+    @Test("a released bounded subscription cancels its deadline")
+    func releasedSubscriptionCancelsDeadline() async throws {
+        let sleeper = ManualSleeper()
+        let broadcaster = EventBroadcaster(sleep: { try await sleeper.sleep($0) })
+
+        var subscription: AsyncStream<DockerEvent>? = await broadcaster.subscribe(
+            since: nil, until: Date().addingTimeInterval(60)
+        ).live
+        let armed = try await pollUntil(timeoutSeconds: 10) { sleeper.snapshot.pending.count == 1 }
+        try #require(armed, "subscribe(until:) must arm the deadline")
+        #expect(subscription != nil)
+        subscription = nil
+
+        let cancelled = try await pollUntil(timeoutSeconds: 10) { sleeper.snapshot.cancelled == 1 }
+        #expect(cancelled, "the deadline task must not outlive its subscription")
+        let removed = try await pollUntil(timeoutSeconds: 10) { await broadcaster.subscriberCount == 0 }
+        #expect(removed)
+    }
 }

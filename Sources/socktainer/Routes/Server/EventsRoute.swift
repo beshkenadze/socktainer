@@ -76,9 +76,10 @@ extension EventsRoute {
             // moby's order. `until` is in the future here and still bounds the backlog:
             // measured against dockerd on the OrbStack socket (2026-08-15),
             // `?until=<future>` with no `since` replays the whole buffer, exactly what
-            // loadBufferedEvents produces with a zero lower bound.
+            // loadBufferedEvents produces with a zero lower bound. The broadcaster also
+            // ends `live` at `until`, after every event broadcast before it, so a body
+            // that starts late still writes them.
             let (backlog, live) = await broadcaster.subscribe(since: since, until: until)
-            let deadline = until
 
             let response = Response(status: .ok)
             response.headers.add(name: .contentType, value: "application/json")
@@ -103,7 +104,7 @@ extension EventsRoute {
                     let clientStillThere = await writeJSONL(event, to: writer, logger: req.logger)
                     if !clientStillThere { break }
                 }
-                for await event in EventsRoute.deadlineBounded(live, until: deadline) {
+                for await event in live {
                     let clientStillThere = await writeJSONL(event, to: writer, logger: req.logger)
                     if !clientStillThere { break }
                 }
@@ -144,44 +145,6 @@ extension EventsRoute {
         } catch {
             logger.warning("\(event) raised '\(error)'")
             return true
-        }
-    }
-
-    /// Races the live event stream against the `until` deadline, the way moby's
-    /// getEvents select-loop closes its `timeout` channel at the deadline even when
-    /// no event ever arrives (api/server/router/system/system_routes.go). A plain
-    /// `for await` would only ever check the clock when an event happens to be
-    /// delivered, so `?until=<future>` never terminated on an idle daemon.
-    private static func deadlineBounded(
-        _ stream: AsyncStream<DockerEvent>, until deadline: Date?
-    ) -> AsyncStream<DockerEvent> {
-        AsyncStream { (continuation: AsyncStream<DockerEvent>.Continuation) in
-            let producer = Task {
-                for await event in stream {
-                    continuation.yield(event)
-                }
-                continuation.finish()
-            }
-            let timer = deadlineTimer(deadline, continuation: continuation)
-            continuation.onTermination = { _ in
-                producer.cancel()
-                timer?.cancel()
-            }
-        }
-    }
-
-    /// The `timeout` arm of moby's getEvents select loop: a task that finishes the
-    /// consumer's continuation when the `until` deadline passes, independent of event
-    /// traffic. Nil when the stream is unbounded.
-    private static func deadlineTimer(
-        _ deadline: Date?,
-        continuation: AsyncStream<DockerEvent>.Continuation
-    ) -> Task<Void, Never>? {
-        guard let deadline else { return nil }
-        let deadlineInstant = ContinuousClock.now + .seconds(deadline.timeIntervalSinceNow)
-        return Task {
-            try? await Task.sleep(until: deadlineInstant, clock: .continuous)
-            continuation.finish()
         }
     }
 

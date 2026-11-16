@@ -18,10 +18,11 @@ private struct MockHealthCheckClient: ClientHealthCheckProtocol {
 struct EventsHistoryRouteTests {
 
     private func withRoute(
+        broadcaster: EventBroadcaster = EventBroadcaster(),
         _ test: @escaping (Application, EventBroadcaster) async throws -> Void
     ) async throws {
         try await withApp(configure: { app in
-            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            app.storage[EventBroadcasterKey.self] = broadcaster
         }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
@@ -126,37 +127,39 @@ struct EventsHistoryRouteTests {
     // MARK: - Following requests: backlog then live, atomically
 
     /// A following request must deliver the backlog and the live stream as one
-    /// continuous sequence. The third event is broadcast while the request is in
-    /// flight — inside the window a split subscribe would either lose it (snapshot
-    /// taken, registration pending) or duplicate it (registered first, snapshot
-    /// retaken after). Whichever arm it lands in, the response must carry it exactly
-    /// once, after the backlog, and the `until` deadline must still close the stream.
+    /// continuous sequence. The third event is broadcast after the route subscribed —
+    /// inside the window a split subscribe would either lose it (snapshot taken,
+    /// registration pending) or duplicate it (registered first, snapshot retaken
+    /// after). The response must carry it exactly once, after the backlog, and the
+    /// `until` deadline must still close the stream. The deadline is a manual sleeper:
+    /// the test fires it after the broadcast, so a slow runner cannot move the
+    /// broadcast past `until`.
     @Test("following request gets backlog then live with no gap and no duplicate")
     func followingGetsBacklogThenLive() async throws {
         let base = EventHistoryFixture.base
-        try await withRoute { app, broadcaster in
+        let sleeper = ManualSleeper()
+        try await withRoute(broadcaster: EventBroadcaster(sleep: { try await sleeper.sleep($0) })) {
+            app, broadcaster in
             await broadcaster.broadcast(EventHistoryFixture.event("create", at: base))
             await broadcaster.broadcast(EventHistoryFixture.event("start", at: base + 1_000_000))
 
-            let until = Date().timeIntervalSince1970 + 1.2
-            let startedAt = Date()
+            let until = Date().timeIntervalSince1970 + 60
             let request = Task<TestingHTTPResponse?, Never> {
                 try? await app.testing().sendRequest(
                     .GET,
                     "/events?since=\(EventHistoryFixture.timestamp(base))&until=\(until)"
                 )
             }
-            // The route is now between subscribe and its first body read — the moment
-            // the third event must survive exactly once.
-            try? await Task.sleep(nanoseconds: 150_000_000)
+            let armed = try await pollUntil(timeoutSeconds: 10) { sleeper.snapshot.pending.count == 1 }
+            try #require(armed, "subscribe(until:) must arm the deadline")
+            #expect(await broadcaster.subscriberCount == 1, "the route follows: it subscribed and waits for the deadline")
+
             await broadcaster.broadcast(
                 DockerEvent.simpleEvent(id: "live-ctr", type: "container", status: "die"))
+            sleeper.fireAll()
 
             let res = await request.value
-            let elapsed = Date().timeIntervalSince(startedAt)
-
             #expect(res != nil, "response never completed — the until deadline must close it")
-            #expect(elapsed >= 1.0, "closed after \(elapsed)s, deadline was 1.2s — backlog must not shortcut the follow")
             let replayed = events(from: res?.body.string ?? "")
             #expect(replayed.map(\.Action) == ["create", "start", "die"], "backlog then live, each exactly once")
             #expect(replayed.filter { $0.Action == "die" }.count == 1, "the in-flight event arrived exactly once")
