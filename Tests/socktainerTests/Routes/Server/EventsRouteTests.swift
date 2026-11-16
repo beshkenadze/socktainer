@@ -148,7 +148,7 @@ struct EventsRouteTests {
     /// headers arrive *before* the first event, because it only surfaces the fully
     /// collected body.
     private final class RawHTTPClient: @unchecked Sendable {
-        private let fd: Int32
+        private var fd: Int32
 
         init(port: Int) throws {
             fd = socket(AF_INET, SOCK_STREAM, 0)
@@ -165,7 +165,7 @@ struct EventsRouteTests {
                 }
             }
             guard connected == 0 else {
-                close(fd)
+                Darwin.close(fd)
                 throw Abort(.internalServerError, reason: "connect() failed: \(errno)")
             }
         }
@@ -189,7 +189,13 @@ struct EventsRouteTests {
             return Data(buffer.prefix(received))
         }
 
-        deinit { close(fd) }
+        func close() {
+            guard fd >= 0 else { return }
+            Darwin.close(fd)
+            fd = -1
+        }
+
+        deinit { close() }
     }
 
     private func withLiveServer(
@@ -197,6 +203,7 @@ struct EventsRouteTests {
     ) async throws {
         try await withRoute { app, broadcaster in
             let port = 28_000 + Int.random(in: 0..<2_000)
+            app.http.server.configuration.shutdownTimeout = .milliseconds(100)
             try await app.server.start(address: .hostname("127.0.0.1", port: port))
             try await test(app, broadcaster, port)
             await app.server.shutdown()
@@ -212,7 +219,7 @@ struct EventsRouteTests {
             // No event has been broadcast and none is coming yet: bytes here can only
             // be the flushed head (status line + headers) — the behaviour #2 added and
             // this bounded rework must preserve.
-            let head = client.read(deadline: 3)
+            let head = try await blockingTestIO { client.read(deadline: 3) }
             #expect(head != nil, "head was not flushed within 3s of an idle stream")
             #expect(
                 String(data: head ?? Data(), encoding: .utf8)?.contains("200 OK") == true,
@@ -222,12 +229,22 @@ struct EventsRouteTests {
             await broadcaster.broadcast(
                 DockerEvent.simpleEvent(id: "live-ctr", type: "container", status: "start"))
 
-            let event = client.read(deadline: 3)
+            let event = try await blockingTestIO { client.read(deadline: 3) }
             let eventText = String(data: event ?? Data(), encoding: .utf8) ?? ""
             #expect(
                 eventText.contains("\"Action\":\"start\"") && eventText.contains("live-ctr"),
                 "live event was not streamed, got: \(eventText)"
             )
+
+            // The event handler discovers a disconnected peer on its next write.
+            // End the subscription before server shutdown, rather than waiting
+            // for Vapor's shutdown timeout with an idle, unbounded response.
+            client.close()
+            let ended = try await pollUntil(timeoutSeconds: 3) {
+                await broadcaster.broadcast(DockerEvent.simpleEvent(id: "live-ctr", type: "container", status: "stop"))
+                return await broadcaster.subscriberCount == 0
+            }
+            #expect(ended, "the disconnected event subscriber must be removed")
         }
     }
 
@@ -239,14 +256,14 @@ struct EventsRouteTests {
             let startedAt = Date()
             client.get("/events?until=\(Date().timeIntervalSince1970 + deadline)")
 
-            let head = client.read(deadline: 3)
+            let head = try await blockingTestIO { client.read(deadline: 3) }
             #expect(head != nil && !(head ?? Data()).isEmpty, "head was not flushed")
 
             // Drain to EOF. The chunked terminator arrives as a read of its own, so "the next read
             // is empty" fails against a stream that closes correctly; EOF is the empty read that
             // ends the drain. Closing at once would mean a future bound was treated as a past one,
             // never closing is the bug being fixed — the deadline has to be both reached and kept.
-            while let chunk = client.read(deadline: 3), !chunk.isEmpty {}
+            while let chunk = try await blockingTestIO({ client.read(deadline: 3) }), !chunk.isEmpty {}
             let elapsed = Date().timeIntervalSince(startedAt)
             #expect(elapsed >= deadline, "closed after \(elapsed)s, deadline was \(deadline)s")
             #expect(elapsed < 3, "connection did not close at the deadline")
@@ -288,13 +305,13 @@ struct EventsRouteHeadFlushTests {
                 try conn.send("GET /v1.51/events HTTP/1.1\r\nHost: localhost\r\n\r\n")
 
                 // No event has been broadcast yet.
-                let head = try await Task.detached { try conn.read(until: "\r\n\r\n", timeout: 3) }.value
+                let head = try await blockingTestIO { try conn.read(until: "\r\n\r\n", timeout: 3) }
                 #expect(head.hasPrefix("HTTP/1.1 200"))
                 #expect(head.lowercased().contains("content-type: application/json"))
 
                 // The early flush must not have ended the stream.
                 await broadcaster.broadcast(Self.event("start"))
-                let body = try await Task.detached { try conn.read(until: "}\n", timeout: 3) }.value
+                let body = try await blockingTestIO { try conn.read(until: "}\n", timeout: 3) }
                 #expect(body.contains(#""Action":"start""#))
                 outcome = .success(())
             } catch {

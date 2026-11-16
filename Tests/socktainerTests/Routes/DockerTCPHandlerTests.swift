@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import NIOCore
 import NIOPosix
@@ -13,30 +14,29 @@ import Testing
 /// EmbeddedChannel (which has significant build overhead; see PR #231).
 ///
 /// Async writes go through DockerTCPHandler.writeQueue (a serial
-/// DispatchQueue). Tests that inspect pipe state after async writes call
-/// drainForTesting() to synchronise, or use readDataToEndOfFile() which
-/// naturally blocks until the write end is closed.
+/// DispatchQueue). Blocking reads and queue drains run on dedicated threads;
+/// the test task suspends so writers and close tasks can keep making progress.
 @Suite("DockerTCPHandler — stdin coordination")
 struct DockerTCPHandlerTests {
 
     // MARK: - writeToStdin before setStdinWriter (pending buffer)
 
     @Test("data written before setStdinWriter is buffered and flushed on set")
-    func pendingDataFlushedOnSetStdinWriter() throws {
+    func pendingDataFlushedOnSetStdinWriter() async throws {
         let handler = DockerTCPHandler(execId: "test", ttyEnabled: false)
         let pipe = Pipe()
 
         handler.writeToStdin(Data("hello".utf8))
         handler.setStdinWriter(pipe.fileHandleForWriting)
-        handler.drainForTesting()
+        try await blockingTestIO { handler.drainForTesting() }
         try pipe.fileHandleForWriting.close()
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let data = try await blockingTestIO { pipe.fileHandleForReading.readDataToEndOfFile() }
         #expect(String(data: data, encoding: .utf8) == "hello")
     }
 
     @Test("multiple buffered chunks flushed in order")
-    func multipleChunksFlushedInOrder() throws {
+    func multipleChunksFlushedInOrder() async throws {
         let handler = DockerTCPHandler(execId: "test", ttyEnabled: false)
         let pipe = Pipe()
 
@@ -44,26 +44,26 @@ struct DockerTCPHandlerTests {
         handler.writeToStdin(Data("bar".utf8))
         handler.writeToStdin(Data("baz".utf8))
         handler.setStdinWriter(pipe.fileHandleForWriting)
-        handler.drainForTesting()
+        try await blockingTestIO { handler.drainForTesting() }
         try pipe.fileHandleForWriting.close()
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let data = try await blockingTestIO { pipe.fileHandleForReading.readDataToEndOfFile() }
         #expect(String(data: data, encoding: .utf8) == "foobarbaz")
     }
 
     // MARK: - writeToStdin after setStdinWriter (direct write)
 
     @Test("data written after setStdinWriter flows through writeQueue to the pipe")
-    func dataAfterSetWrittenDirectly() throws {
+    func dataAfterSetWrittenDirectly() async throws {
         let handler = DockerTCPHandler(execId: "test", ttyEnabled: false)
         let pipe = Pipe()
 
         handler.setStdinWriter(pipe.fileHandleForWriting)
         handler.writeToStdin(Data("direct".utf8))
-        handler.drainForTesting()
+        try await blockingTestIO { handler.drainForTesting() }
         try pipe.fileHandleForWriting.close()
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let data = try await blockingTestIO { pipe.fileHandleForReading.readDataToEndOfFile() }
         #expect(String(data: data, encoding: .utf8) == "direct")
     }
 
@@ -76,7 +76,7 @@ struct DockerTCPHandlerTests {
     }
 
     @Test("second setStdinWriter call replaces the writer — writes go to new pipe only")
-    func setStdinWriterCalledTwiceReplacesWriter() throws {
+    func setStdinWriterCalledTwiceReplacesWriter() async throws {
         let handler = DockerTCPHandler(execId: "test", ttyEnabled: false)
         let pipeA = Pipe()
         let pipeB = Pipe()
@@ -84,21 +84,21 @@ struct DockerTCPHandlerTests {
         handler.setStdinWriter(pipeA.fileHandleForWriting)
         handler.setStdinWriter(pipeB.fileHandleForWriting)
         handler.writeToStdin(Data("second".utf8))
-        handler.drainForTesting()
+        try await blockingTestIO { handler.drainForTesting() }
         try pipeB.fileHandleForWriting.close()
         try pipeA.fileHandleForWriting.close()
 
-        let dataB = pipeB.fileHandleForReading.readDataToEndOfFile()
+        let dataB = try await blockingTestIO { pipeB.fileHandleForReading.readDataToEndOfFile() }
         #expect(String(data: dataB, encoding: .utf8) == "second")
 
-        let dataA = pipeA.fileHandleForReading.readDataToEndOfFile()
+        let dataA = try await blockingTestIO { pipeA.fileHandleForReading.readDataToEndOfFile() }
         #expect(dataA.isEmpty)
     }
 
     // MARK: - inputClosed race condition
 
     @Test("inputClosed before setStdinWriter: buffered data flushed then write end closed")
-    func inputClosedBeforeSetStdinWriterFlushesAndCloses() throws {
+    func inputClosedBeforeSetStdinWriterFlushesAndCloses() async throws {
         // Without didReceiveInputClosed this test would hang because the
         // write end would never be closed and readDataToEndOfFile() blocks.
         let handler = DockerTCPHandler(execId: "test", ttyEnabled: false)
@@ -108,19 +108,19 @@ struct DockerTCPHandlerTests {
         handler.simulateInputClosed()
         handler.setStdinWriter(pipe.fileHandleForWriting)
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let data = try await blockingTestIO { pipe.fileHandleForReading.readDataToEndOfFile() }
         #expect(String(data: data, encoding: .utf8) == "piped")
     }
 
     @Test("inputClosed before setStdinWriter with no pending data closes write end")
-    func inputClosedBeforeSetStdinWriterNoDataClosesWriter() throws {
+    func inputClosedBeforeSetStdinWriterNoDataClosesWriter() async throws {
         let handler = DockerTCPHandler(execId: "test", ttyEnabled: false)
         let pipe = Pipe()
 
         handler.simulateInputClosed()
         handler.setStdinWriter(pipe.fileHandleForWriting)
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let data = try await blockingTestIO { pipe.fileHandleForReading.readDataToEndOfFile() }
         #expect(data.isEmpty)
     }
 
@@ -140,19 +140,16 @@ struct DockerTCPHandlerTests {
         handler.writeToStdin(abovePipeBuffer)
         handler.writeToStdin(sentinel)
 
-        // Flush in background — will block when the pipe buffer fills
-        let flushTask = Task.detached { handler.setStdinWriter(pipe.fileHandleForWriting) }
-        // Reader runs concurrently, draining the pipe so flush can progress
-        let readTask = Task.detached { pipe.fileHandleForReading.readDataToEndOfFile() }
-
-        // Give the flush time to block
-        try await Task.sleep(nanoseconds: 10_000_000)
-
-        // Inject close while flush is in progress
+        handler.setStdinWriter(pipe.fileHandleForWriting)
+        // Nothing reads yet. Once bytes reach the pipe, the oversized flush
+        // cannot finish until the reader starts; no scheduling sleep is needed.
+        try #require(
+            try await pollUntil(timeoutSeconds: 5) {
+                var descriptor = pollfd(fd: pipe.fileHandleForReading.fileDescriptor, events: Int16(POLLIN), revents: 0)
+                return poll(&descriptor, 1, 0) > 0
+            })
         handler.simulateInputClosed()
-
-        await flushTask.value
-        let received = await readTask.value
+        let received = try await blockingTestIO { pipe.fileHandleForReading.readDataToEndOfFile() }
 
         #expect(received.count == abovePipeBuffer.count + sentinel.count)
         #expect(received.last == 0xFF)
@@ -161,14 +158,14 @@ struct DockerTCPHandlerTests {
     // MARK: - channelInactive race
 
     @Test("setStdinWriter called after channelInactive immediately closes the writer")
-    func setStdinWriterAfterChannelInactiveClosesWriter() throws {
+    func setStdinWriterAfterChannelInactiveClosesWriter() async throws {
         let handler = DockerTCPHandler(execId: "test", ttyEnabled: false)
         let pipe = Pipe()
 
         handler.simulateChannelInactive()
         handler.setStdinWriter(pipe.fileHandleForWriting)
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let data = try await blockingTestIO { pipe.fileHandleForReading.readDataToEndOfFile() }
         #expect(data.isEmpty)
     }
 
@@ -187,12 +184,12 @@ struct DockerTCPHandlerTests {
         #expect(handler.readPausedForTesting)
         #expect(handler.pendingDataSizeForTesting == 3 * chunkSize)
 
-        let readTask = Task.detached { pipe.fileHandleForReading.readDataToEndOfFile() }
+        let readTask = Task { try await blockingTestIO { pipe.fileHandleForReading.readDataToEndOfFile() } }
         handler.setStdinWriter(pipe.fileHandleForWriting)
         #expect(handler.readPausedForTesting == false)
         handler.simulateInputClosed()
 
-        let received = await readTask.value
+        let received = try await readTask.value
         #expect(received == chunks.reduce(Data(), +))
     }
 
@@ -221,13 +218,13 @@ struct DockerTCPHandlerTests {
         #expect(handler.pendingDataSizeForTesting < 4 * chunkSize)
 
         let pipe = Pipe()
-        let reader = Task.detached { pipe.fileHandleForReading.readDataToEndOfFile() }
+        let reader = Task { try await blockingTestIO { pipe.fileHandleForReading.readDataToEndOfFile() } }
         handler.setStdinWriter(pipe.fileHandleForWriting)
         try #require(await waitUntil { try await child.getOption(ChannelOptions.autoRead).get() })
 
         try await client.writeAndFlush(ByteBuffer(bytes: [0xFF])).get()
         try await client.close(mode: .output).get()
-        let received = await reader.value
+        let received = try await reader.value
         #expect(received == chunks.reduce(Data(), +) + Data([0xFF]))
 
         try await client.close()

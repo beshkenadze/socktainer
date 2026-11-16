@@ -133,9 +133,8 @@ struct ClientArchiveServicePrepScriptTests {
         #expect(eof, "stdin write end must be closed after the payload so the reader sees EOF (\(detail))")
     }
 
-    /// Not async: the waits below block this thread on semaphores.
     @Test("a payload larger than the pipe buffer reaches the reader followed by EOF")
-    func feedStdinDeliversLargePayloadAndEOF() throws {
+    func feedStdinDeliversLargePayloadAndEOF() async throws {
         let pipes = try #require(StdioPipes.make([.stdin]))
         let stdin = try #require(pipes.stdin)
         let payload = Data((0..<(512 * 1024)).map { UInt8(truncatingIfNeeded: $0 &* 31) })
@@ -151,8 +150,8 @@ struct ClientArchiveServicePrepScriptTests {
             writeResult.set(error)
             completed.signal()
         }
-        let writeFinished = completed.wait(timeout: .now() + Self.watchdog) == .success
-        let readerFinished = readerDone.wait(timeout: .now() + Self.watchdog) == .success
+        let writeFinished = try await blockingTestIO { completed.wait(timeout: .now() + Self.watchdog) } == .success
+        let readerFinished = try await blockingTestIO { readerDone.wait(timeout: .now() + Self.watchdog) } == .success
 
         try #require(writeFinished, "feedStdin must report completion once the payload is read")
         try #require(readerFinished, "the reader must receive the whole payload")
@@ -165,9 +164,8 @@ struct ClientArchiveServicePrepScriptTests {
         #expect(eof, "stdin write end must be closed after the payload so the reader sees EOF (\(detail))")
     }
 
-    /// Not async: the waits below block this thread on semaphores.
     @Test("feeding a payload nobody reads yet returns to the caller before it is consumed")
-    func feedStdinDoesNotBlockTheCaller() throws {
+    func feedStdinDoesNotBlockTheCaller() async throws {
         let pipes = try #require(StdioPipes.make([.stdin]))
         let stdin = try #require(pipes.stdin)
         let reader = stdin.read
@@ -205,8 +203,8 @@ struct ClientArchiveServicePrepScriptTests {
         let finishedBeforeRead = writeResult.finished
         returned.signal()
 
-        let readerFinished = readerDone.wait(timeout: .now() + Self.watchdog) == .success
-        let writeFinished = completed.wait(timeout: .now() + Self.watchdog) == .success
+        let readerFinished = try await blockingTestIO { readerDone.wait(timeout: .now() + Self.watchdog) } == .success
+        let writeFinished = try await blockingTestIO { completed.wait(timeout: .now() + Self.watchdog) } == .success
 
         #expect(readerState.gateOpened, "feedStdin must return before the payload is read")
         #expect(!finishedBeforeRead, "the write cannot complete before the payload is read")
@@ -218,7 +216,7 @@ struct ClientArchiveServicePrepScriptTests {
     }
 
     @Test("the write and the close run on the given dispatch queue, not on a Swift task")
-    func feedStdinRunsOnTheGivenQueue() throws {
+    func feedStdinRunsOnTheGivenQueue() async throws {
         let pipes = try #require(StdioPipes.make([.stdin]))
         let stdin = try #require(pipes.stdin)
         let reader = stdin.read
@@ -236,16 +234,15 @@ struct ClientArchiveServicePrepScriptTests {
             completed.signal()
         }
 
-        let finished = completed.wait(timeout: .now() + Self.watchdog) == .success
+        let finished = try await blockingTestIO { completed.wait(timeout: .now() + Self.watchdog) } == .success
         #expect(finished, "the queued write must complete")
         #expect(ranOn.label == "rv-feed-stdin-test", "the write must run on the queue passed to feedStdin")
         #expect(ranOn.error == nil)
         try expectPayloadThenEOF(payload, from: reader)
     }
 
-    /// Not async: the waits below block this thread on semaphores.
     @Test("stuck stdin writes on the default queue do not hold up another upload's write")
-    func feedStdinDefaultQueueIsConcurrent() throws {
+    func feedStdinDefaultQueueIsConcurrent() async throws {
         // A few writes blocked on pipes nobody reads, like guests that stopped
         // reading their preparation script. Kept small: GCD grows its pool for
         // threads blocked in syscalls, so this does not depend on core count.
@@ -253,57 +250,61 @@ struct ClientArchiveServicePrepScriptTests {
         let payload = Data(repeating: 0x41, count: 1024 * 1024)
         var stuckReaders: [FileHandle] = []
         let stuck = DispatchGroup()
-        defer {
-            // Release the blocked writes (EPIPE) whatever the outcome.
-            for reader in stuckReaders { try? reader.close() }
-            _ = stuck.wait(timeout: .now() + Self.watchdog)
-        }
-        // feedStdin is called off this thread, and only its return is awaited
-        // (with the watchdog), so a feedStdin that wrote inline fails the test
-        // instead of blocking it before the readers below can be closed.
-        let queued = DispatchSemaphore(value: 0)
-        for _ in 0..<stuckCount {
+        var failure: (any Error)?
+        do {
+            // feedStdin is called off this thread, and only its return is awaited
+            // (with the watchdog), so a feedStdin that wrote inline fails the test
+            // instead of blocking it before the readers below can be closed.
+            let queued = DispatchSemaphore(value: 0)
+            for _ in 0..<stuckCount {
+                let pipes = try #require(StdioPipes.make([.stdin]))
+                let stdin = try #require(pipes.stdin)
+                let writer = stdin.write
+                stuckReaders.append(stdin.read)
+                stuck.enter()
+                DispatchQueue.global().async {
+                    ClientArchiveService.feedStdin(writer: writer, data: payload) { _ in stuck.leave() }
+                    queued.signal()
+                }
+            }
+            let queuedDeadline = DispatchTime.now() + Self.watchdog
+            var allQueued = true
+            for _ in 0..<stuckCount where try await blockingTestIO({ queued.wait(timeout: queuedDeadline) }) != .success {
+                allQueued = false
+            }
+            try #require(allQueued, "feedStdin must return without waiting for the write")
+
+            // Another upload whose guest does read must still get its script.
             let pipes = try #require(StdioPipes.make([.stdin]))
             let stdin = try #require(pipes.stdin)
-            let writer = stdin.write
-            stuckReaders.append(stdin.read)
-            stuck.enter()
-            DispatchQueue.global().async {
-                ClientArchiveService.feedStdin(writer: writer, data: payload) { _ in stuck.leave() }
-                queued.signal()
+            let reader = stdin.read
+            defer { try? reader.close() }
+            let small = Data("mkdir -p y\n".utf8)
+            let completed = DispatchSemaphore(value: 0)
+            let result = WriteResult()
+            ClientArchiveService.feedStdin(writer: stdin.write, data: small) { error in
+                result.set(error)
+                completed.signal()
             }
-        }
-        let queuedDeadline = DispatchTime.now() + Self.watchdog
-        var allQueued = true
-        for _ in 0..<stuckCount where queued.wait(timeout: queuedDeadline) != .success {
-            allQueued = false
-        }
-        try #require(allQueued, "feedStdin must return without waiting for the write")
+            let finished = try await blockingTestIO { completed.wait(timeout: .now() + Self.watchdog) } == .success
 
-        // Another upload whose guest does read must still get its script.
-        let pipes = try #require(StdioPipes.make([.stdin]))
-        let stdin = try #require(pipes.stdin)
-        let reader = stdin.read
-        defer { try? reader.close() }
-        let small = Data("mkdir -p y\n".utf8)
-        let completed = DispatchSemaphore(value: 0)
-        let result = WriteResult()
-        ClientArchiveService.feedStdin(writer: stdin.write, data: small) { error in
-            result.set(error)
-            completed.signal()
+            #expect(finished, "a write must not queue behind writes stuck on other pipes")
+            #expect(result.error == nil)
+            if finished {
+                try expectPayloadThenEOF(small, from: reader)
+            }
+        } catch {
+            failure = error
         }
-        let finished = completed.wait(timeout: .now() + Self.watchdog) == .success
-
-        #expect(finished, "a write must not queue behind writes stuck on other pipes")
-        #expect(result.error == nil)
-        if finished {
-            try expectPayloadThenEOF(small, from: reader)
-        }
+        // Release and join the blocked writes even when an assertion throws.
+        for reader in stuckReaders { try? reader.close() }
+        let drained = try await blockingTestIO { stuck.wait(timeout: .now() + Self.watchdog) }
+        #expect(drained == .success, "the blocked fixture writes must finish after cleanup")
+        if let failure { throw failure }
     }
 
-    /// Not async: the waits below block this thread on semaphores.
     @Test("a reader that goes away early makes the write fail with EPIPE, not SIGPIPE")
-    func feedStdinSurvivesEarlyReaderExit() throws {
+    func feedStdinSurvivesEarlyReaderExit() async throws {
         let pipes = try #require(StdioPipes.make([.stdin]))
         let stdin = try #require(pipes.stdin)
         // Far larger than the pipe buffer, so the write is still blocked when
@@ -325,7 +326,7 @@ struct ClientArchiveServicePrepScriptTests {
             }
             returned.signal()
         }
-        let returnedInTime = returned.wait(timeout: .now() + Self.watchdog) == .success
+        let returnedInTime = try await blockingTestIO { returned.wait(timeout: .now() + Self.watchdog) } == .success
         #expect(returnedInTime, "feedStdin must return without waiting for the write")
 
         // Only checked if feedStdin returned in time: nothing reads, so the
@@ -342,7 +343,7 @@ struct ClientArchiveServicePrepScriptTests {
         // Closed unconditionally: it is also what unblocks an inline write.
         try reader.close()
 
-        let finished = completed.wait(timeout: .now() + Self.watchdog) == .success
+        let finished = try await blockingTestIO { completed.wait(timeout: .now() + Self.watchdog) } == .success
         try #require(finished, "the write must complete once the reader is gone")
         guard let error = writeResult.error else {
             Issue.record("writing to a pipe whose reader is gone must fail")

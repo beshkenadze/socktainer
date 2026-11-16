@@ -122,6 +122,12 @@ jobs:
       - name: Execute test
         run: make test
 
+      - name: Execute tests with one cooperative thread
+        timeout-minutes: 3
+        env:
+          LIBDISPATCH_COOPERATIVE_POOL_STRICT: '1'
+        run: make test
+
   integration-test:
     name: integration test
     needs: build
