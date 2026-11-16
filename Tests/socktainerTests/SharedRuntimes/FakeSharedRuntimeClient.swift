@@ -12,6 +12,8 @@ actor FakeSharedRuntimeClient: SharedRuntimeClient {
         var createsInFlight = 0
         var removesInFlight = 0
         var removeAttempts = 0
+        /// Containers deleted at once, at the shutdown of the bridge.
+        var deletedNow: [String] = []
         var listCalls = 0
         var signals: [(containerID: String, processID: String, signal: String)] = []
     }
@@ -43,6 +45,16 @@ actor FakeSharedRuntimeClient: SharedRuntimeClient {
         state.createsInFlight -= 1
         changed()
         if failCreates { throw Failure.injected }
+    }
+
+    func deleteSharedContainerNow(nativeID: String) async throws {
+        state.removesInFlight += 1
+        changed()
+        if holdRemoves { await withCheckedContinuation { heldRemoves.append($0) } }
+        state.removesInFlight -= 1
+        state.deletedNow.append(nativeID)
+        records.removeAll { $0.nativeID == nativeID }
+        changed()
     }
 
     func removeSharedContainer(nativeID: String) async throws {

@@ -23,10 +23,12 @@ actor SharedRuntimeManager {
 
     enum Failure: Error, Equatable, CustomStringConvertible {
         case cleanupFailed([String])
+        case shuttingDown
 
         var description: String {
             switch self {
             case .cleanupFailed(let ids): "could not remove shared containers of a previous run: \(ids.joined(separator: ", "))"
+            case .shuttingDown: "the bridge is shutting down"
             }
         }
     }
@@ -60,6 +62,7 @@ actor SharedRuntimeManager {
     private var slots: [Slot: Entry] = [:]
     private var sessionSlots: [String: Slot] = [:]
     private var stopping: Set<String> = []
+    private var shuttingDown = false
     private(set) var joinsInProgress = 0
 
     /// Sessions by Docker ID (`SharedRuntimeManager+Sessions.swift`).
@@ -95,6 +98,7 @@ actor SharedRuntimeManager {
     /// Adds a session to the container of `group` and `key`, and creates the container when there
     /// is none. Concurrent joins for one key wait for one creation.
     func join(sessionID: String, group: RuntimeGroup, key: SharingKey, image: Image) async throws -> SharedContainer {
+        guard !shuttingDown else { throw Failure.shuttingDown }
         joinsInProgress += 1
         defer { joinsInProgress -= 1 }
         let slot = Slot(group: group.name, key: key.hex)
@@ -235,6 +239,31 @@ actor SharedRuntimeManager {
             return running.sessions
         }
         return []
+    }
+
+    /// The shutdown of the bridge: no new shared container, and each shared container of this
+    /// bridge (running, or left in `stopping`) is deleted at once, with all its sessions.
+    /// Returns the number of containers.
+    @discardableResult
+    func shutdown() async -> Int {
+        shuttingDown = true
+        var ids = stopping
+        for case .running(let running) in slots.values {
+            running.idleTimer?.cancel()
+            ids.insert(running.container.nativeID)
+        }
+        let client = self.client
+        await withTaskGroup(of: Void.self) { group in
+            for id in ids { group.addTask { try? await client.deleteSharedContainerNow(nativeID: id) } }
+        }
+        return ids.count
+    }
+
+    var sharedContainerCount: Int {
+        slots.values.filter {
+            guard case .running = $0 else { return false }
+            return true
+        }.count + stopping.count
     }
 
     static let removalAttempts = 3

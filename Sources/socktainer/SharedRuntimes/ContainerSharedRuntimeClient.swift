@@ -72,6 +72,10 @@ struct ContainerSharedRuntimeClient: SharedRuntimeClient {
         }
     }
 
+    func deleteSharedContainerNow(nativeID: String) async throws {
+        try await ContainerClient().delete(id: nativeID, force: true)
+    }
+
     func listContainers() async throws -> [SharedRuntimeContainerRecord] {
         try await ContainerClient().list().map { SharedRuntimeContainerRecord(nativeID: $0.id, labels: $0.configuration.labels) }
     }

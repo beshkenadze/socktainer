@@ -65,6 +65,37 @@ actor SharedRuntimeService {
         await service.startCleanup()
     }
 
+    /// The limit of the cleanup at shutdown. ContainerStack sends SIGTERM and sends SIGKILL 500 ms
+    /// later: the bridge ends by itself before that.
+    static let shutdownLimit = Duration.milliseconds(400)
+
+    /// Deletes the shared containers of this bridge, waiting at most `shutdownLimit`. The delete
+    /// requests go out at once; what is left after a SIGKILL, the cleanup at the next start removes.
+    struct ShutdownReport: Sendable, CustomStringConvertible {
+        let containers: Int
+        /// False when the limit passed before every delete was answered.
+        let completed: Bool
+        let elapsed: Duration
+
+        var description: String {
+            let ms = elapsed.components.seconds * 1000 + elapsed.components.attoseconds / 1_000_000_000_000_000
+            return "deleted \(containers) shared container(s) in \(ms) ms\(completed ? "" : " (limit reached, deletes still pending)")"
+        }
+    }
+
+    func shutdown(limit: Duration = SharedRuntimeService.shutdownLimit) async -> ShutdownReport {
+        let start = ContinuousClock.now
+        let done = SessionLatch<Bool>()
+        let manager = self.manager
+        let containers = await manager.sharedContainerCount
+        Task {
+            await manager.shutdown()
+            done.resolve(true)
+        }
+        let completed = await done.wait(limit: limit) != nil
+        return ShutdownReport(containers: containers, completed: completed, elapsed: ContinuousClock.now - start)
+    }
+
     /// The service of a bridge on Apple Container.
     static func live(
         appSupport: URL, socketPath: String, logger: Logger, systemConfig: ContainerSystemConfig, events: EventBroadcaster

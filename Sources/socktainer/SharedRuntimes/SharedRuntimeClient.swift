@@ -46,6 +46,9 @@ protocol SharedRuntimeClient: Sendable {
     func createSharedContainer(_ spec: SharedContainerSpec) async throws
     /// Stops and deletes the container. A container that is already gone is not an error.
     func removeSharedContainer(nativeID: String) async throws
+    /// Deletes the container at once, also when it runs: the shutdown of the bridge has no time
+    /// for a graceful stop.
+    func deleteSharedContainerNow(nativeID: String) async throws
     func listContainers() async throws -> [SharedRuntimeContainerRecord]
     /// Sends `signal`, a Linux signal name or number, to one process of a container.
     func signalProcess(containerID: String, processID: String, signal: String) async throws

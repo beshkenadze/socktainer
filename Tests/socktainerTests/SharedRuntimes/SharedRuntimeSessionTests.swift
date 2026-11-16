@@ -320,6 +320,44 @@ import Testing
         program.exit(137)
     }
 
+    // MARK: shutdown of the bridge
+
+    @Test func theShutdownDeletesEverySharedContainerOfTheBridge() async throws {
+        let client = FakeSharedRuntimeClient()
+        let manager = M.manager(client)
+        let first = try await manager.addSession(Self.spec(Self.id(1), name: "one", env: "A=1"))
+        let second = try await manager.addSession(Self.spec(Self.id(2), name: "two", env: "A=2"))
+        try await manager.start(first)
+        try await manager.start(second)
+        let containers = Set(await client.state.created.map(\.name))
+        #expect(containers.count == 2)
+
+        let service = SharedRuntimeService(
+            manager: manager, file: RuntimeGroupsFile(path: "/nonexistent/runtime-groups.json"), imageFacts: FakeImageFacts())
+        let report = await service.shutdown()
+        #expect(report.completed && report.containers == 2)
+        #expect(Set(await client.state.deletedNow) == containers)
+        await #expect(throws: SharedRuntimeManager.Failure.shuttingDown) {
+            _ = try await manager.join(sessionID: "late", group: first.spec.group, key: first.spec.key, image: first.spec.image)
+        }
+    }
+
+    @Test func theShutdownEndsWithinItsLimitWhenTheRuntimeDoesNotAnswer() async throws {
+        let client = FakeSharedRuntimeClient()
+        let manager = M.manager(client)
+        let session = try await manager.addSession(Self.spec())
+        try await manager.start(session)
+        await client.configure { $0.holdRemoves = true }
+        let service = SharedRuntimeService(
+            manager: manager, file: RuntimeGroupsFile(path: "/nonexistent/runtime-groups.json"), imageFacts: FakeImageFacts())
+        let start = ContinuousClock.now
+        let report = await service.shutdown()
+        #expect(ContinuousClock.now - start < .seconds(2), "the shutdown cannot hang on the runtime")
+        #expect(!report.completed && report.containers == 1)
+        #expect(await client.state.removesInFlight == 1, "the delete request went out")
+        await client.releaseRemoves()
+    }
+
     // MARK: an end that arrives while the start launches
 
     enum EarlyEnd: String, CaseIterable, Sendable { case disconnect, kill, stop, removeForce }
