@@ -1,3 +1,4 @@
+import ContainerizationError
 import Darwin
 import Foundation
 import Testing
@@ -73,5 +74,53 @@ import Testing
             return error.domain == NSCocoaErrorDomain && error.code == NSFileWriteUnknownError
                 && error.userInfo[NSUnderlyingErrorKey] == nil
         }
+    }
+}
+
+extension StdioHandoffTests {
+    @Test("bootstrap never replays adopted pipes, but can retry without stdio", arguments: [false, true])
+    func bootstrapFailure(hasPipes: Bool) async throws {
+        let pipes: StdioPipes? = hasPipes ? try #require(StdioPipes.make(.all)) : nil
+        defer { pipes?.closeAll() }
+        if let pipes {
+            for handle in [pipes.stdin!.write, pipes.stdout!.write, pipes.stderr!.write] {
+                try #require(fcntl(handle.fileDescriptor, F_GETNOSIGPIPE) == 1)
+            }
+        }
+        let attempts = Counter()
+        let generations = Counter()
+        let client = ReconnectingContainerClient<Int>(makeClient: { generations.nextSync() })
+        let operation: @Sendable (Int, [FileHandle?]) async throws -> Int = { generation, stdio in
+            #expect(stdio.count == 3)
+            #expect(stdio[0] === pipes?.stdin?.read)
+            #expect(stdio[1] === pipes?.stdout?.write)
+            #expect(stdio[2] === pipes?.stderr?.write)
+            let attempt = attempts.nextSync()
+            if hasPipes || attempt == 1 {
+                throw ContainerizationError(.internalError, message: "bootstrap failed", cause: ContainerizationError(.interrupted, message: "reply lost"))
+            }
+            return generation
+        }
+        if let pipes {
+            await #expect(throws: ContainerizationError.self) {
+                try await client.withBootstrapStdio(pipes, operation)
+            }
+            #expect(attempts.countSync() == 1)
+            for handle in pipes.stdioArray.compactMap({ $0 }) {
+                let closed = isClosed(handle)
+                #expect(!closed, "bootstrap owns the supplied end, even after a failure")
+            }
+            for handle in [pipes.stdin!.write, pipes.stdout!.read, pipes.stderr!.read] {
+                let closed = isClosed(handle)
+                #expect(closed, "the failed bootstrap must release bridge ends")
+            }
+        } else {
+            let generation = try await client.withBootstrapStdio(nil, operation)
+            #expect(generation == 2)
+            #expect(attempts.countSync() == 2)
+        }
+        #expect(await client.reconnectCount == 1)
+        let nextGeneration = try await client.withClient { $0 }
+        #expect(nextGeneration == 2)
     }
 }

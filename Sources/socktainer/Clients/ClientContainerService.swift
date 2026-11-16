@@ -498,7 +498,6 @@ struct ClientContainerService: ClientContainerProtocol {
         // `docker compose up`) parked its pipes; boot with them so its stream gets the output.
         // Claimed before anything can fail, so every failure below reaches the waiting attach.
         let attached = await PendingAttachStart.shared.claim(containerId: container.id)
-        let stdio = attached?.stdioArray ?? [nil, nil, nil]
 
         do {
             try await prepareForStart(container: container)
@@ -512,10 +511,11 @@ struct ClientContainerService: ClientContainerProtocol {
 
         let process: ClientProcess
         do {
-            process = try await containerClient.withClient { try await $0.bootstrap(id: container.id, stdio: stdio) }
+            process = try await containerClient.withBootstrapStdio(attached) { client, stdio in
+                try await client.bootstrap(id: container.id, stdio: stdio)
+            }
         } catch {
-            if let attached {
-                attached.closeAll()
+            if attached != nil {
                 await PendingAttachStart.shared.finish(containerId: container.id, result: .failure(error))
             }
             // A container that is already booted was started by an earlier request.
