@@ -41,6 +41,15 @@ default document are off. A run selects a group with the label `containerstack.g
 A shared container is one trust domain: its sessions run as one user on one writable file
 system. A run that needs separation stays dedicated (`containerstack.group=none`).
 
+## Known limits
+
+- The cleanup at shutdown (SIGTERM or SIGINT) deletes only the shared containers that run or that
+  stop at that time. A shared container that is still in creation is not in it, and a delete that
+  is not complete after 400 ms can fail when the bridge ends. Such a container stays in the
+  runtime with the socket label of the bridge (`containerstack.shared.socket`).
+- The next start of the bridge with `--shared-runtimes` removes it. A start without the flag runs
+  no code of this feature and does not remove it: remove it with `docker rm -f <name>`.
+
 ## Live check
 
 Run the check on a second bridge with its own socket, not on the bridge that you use.
