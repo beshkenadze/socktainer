@@ -562,11 +562,12 @@ struct ExecRoute: RouteCollection {
                         // stdin handler — runs until cancelled, returns false
                         if let stdinWrite = pipes.stdin?.write {
                             group.addTask {
-                                defer { try? stdinWrite.close() }
+                                let forwarder = StdinForwarder(stdinWrite, logger: req.logger)
+                                defer { forwarder.close() }
                                 do {
                                     for try await var buf in req.body {
                                         if let data = buf.readData(length: buf.readableBytes) {
-                                            try stdinWrite.write(contentsOf: data)
+                                            if !forwarder.write(data) { break }
                                         }
                                     }
                                 } catch {}
