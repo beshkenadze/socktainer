@@ -107,3 +107,8 @@ do {
     throw error
 }
 try await app.running?.onStop.get()
+// A bridge that stops (SIGTERM, SIGINT) removes its shared containers.
+if let sharedRuntimes = app.storage[SharedRuntimeServiceKey.self] {
+    let report = await sharedRuntimes.shutdown()
+    app.logger.info("shared runtimes: shutdown: \(report)")
+}

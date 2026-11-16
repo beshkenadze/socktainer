@@ -23,6 +23,8 @@ struct RegexRoute {
 
 final class RegexRouter: @unchecked Sendable {
     fileprivate var routes: [RegexRoute] = []
+    /// Set at startup with `--shared-runtimes`: it answers a request first when it returns a response.
+    var interceptor: (@Sendable (Request, HTTPMethod, String) async throws -> Response?)?
     private var middlewareInstalled = false
     private let logger: Logger
 
@@ -49,7 +51,7 @@ final class RegexRouter: @unchecked Sendable {
         // Log registration details using instance logger
         logger.debug("RegexRouter: Registering \(method.rawValue) route - Pattern: '\(pattern)' -> Regex: '\(regexPattern)' with parameters: \(parameterNames)")
 
-        let handler: @Sendable (Request, [String]) async throws -> Response = { req, groups in
+        let handler: @Sendable (Request, [String]) async throws -> Response = { [weak self] req, groups in
             req.logger.debug("RegexRouter: Setting parameters from groups: \(groups) with names: \(parameterNames)")
 
             // Set parameters based on captured groups and their names
@@ -67,6 +69,9 @@ final class RegexRouter: @unchecked Sendable {
                         }
                     }
                 }
+            }
+            if let interceptor = self?.interceptor, let response = try await interceptor(req, method, pattern) {
+                return response
             }
             let result = try await closure(req)
             return try await result.encodeResponse(for: req)

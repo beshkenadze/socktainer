@@ -174,4 +174,66 @@ import Testing
         #expect(SharedRuntimeLabels.sessionContainer == "containerstack.session.container")
         #expect(SharedRuntimeLabels.groupSkipped == "containerstack.group.skipped")
     }
+
+    // MARK: the decision before the image is read
+
+    private static var requestEdits: [(String, (inout [String: Any]) -> Void)] {
+        [
+            ("eligible", { _ in }),
+            ("no stdin", { $0["OpenStdin"] = false }),
+            ("no autoremove", SharedRuntimeFixtures.setHostConfig("AutoRemove", false)),
+            ("tty", { $0["Tty"] = true }),
+            ("bind", SharedRuntimeFixtures.setHostConfig("Binds", ["/a:/b"])),
+            ("port", SharedRuntimeFixtures.setHostConfig("PortBindings", ["80/tcp": [["HostPort": "8080"]]])),
+            ("privileged", SharedRuntimeFixtures.setHostConfig("Privileged", true)),
+        ]
+    }
+
+    @Test func aDecisionWithoutTheImageIsTheDecisionWithAnyImage() throws {
+        var answered = 0
+        for (name, edit) in Self.requestEdits {
+            for image in ["mcp/time", "busybox"] {
+                for label in [nil, "mcp-catalog", "none", "nope", "stdio-sessions"] as [String?] {
+                    for groups in [try F.mcpEnabled(), try F.bothEnabled()] {
+                        let request = try F.request {
+                            $0["Image"] = image
+                            if let label { $0["Labels"] = [SharedRuntimeLabels.group: label] }
+                            edit(&$0)
+                        }
+                        guard let early = SharedRuntimeDecision.decideWithoutImage(request: request, groups: groups) else { continue }
+                        answered += 1
+                        for volumes in [nil, ["/data": [String: String]()]] as [[String: [String: String]]?] {
+                            let full = try SharedRuntimeDecision.decide(request: request, image: F.image(volumes: volumes), groups: groups)
+                            #expect(early == full, "\(name), \(image), \(label ?? "-")")
+                        }
+                    }
+                }
+            }
+        }
+        #expect(answered > 0)
+    }
+
+    @Test func aRunWithoutStdinIsDecidedWithoutTheImage() throws {
+        let noStdin = try F.request {
+            $0["Image"] = "mcp/time"
+            $0["OpenStdin"] = false
+        }
+        #expect(SharedRuntimeDecision.decideWithoutImage(request: noStdin, groups: try F.bothEnabled()) == .skipped(group: "mcp-catalog", reason: .noStdin))
+        let other = try F.request {
+            $0["Image"] = "busybox"
+            $0["OpenStdin"] = false
+        }
+        #expect(SharedRuntimeDecision.decideWithoutImage(request: other, groups: try F.bothEnabled()) == .dedicated)
+    }
+
+    @Test func aRunThatCanBeASessionNeedsTheImage() throws {
+        let eligible = try F.request { $0["Image"] = "mcp/time" }
+        #expect(SharedRuntimeDecision.decideWithoutImage(request: eligible, groups: try F.mcpEnabled()) == nil)
+        // A port comes after the mount check, and the image can declare a volume.
+        let port = try F.request {
+            $0["Image"] = "mcp/time"
+            SharedRuntimeFixtures.setHostConfig("PortBindings", ["80/tcp": [["HostPort": "8080"]]])(&$0)
+        }
+        #expect(SharedRuntimeDecision.decideWithoutImage(request: port, groups: try F.mcpEnabled()) == nil)
+    }
 }

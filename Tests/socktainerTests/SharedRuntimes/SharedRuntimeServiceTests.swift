@@ -15,6 +15,7 @@ import Testing
         SharedRuntimeService(
             manager: SharedRuntimeManagerTests.manager(client),
             file: RuntimeGroupsFile(path: filePath),
+            imageFacts: FakeImageFacts(),
             cleanupTimeout: timeout,
             timerSleep: { try await timer.sleep($0) })
     }
@@ -73,6 +74,7 @@ import Testing
         let service = SharedRuntimeService(
             manager: SharedRuntimeManagerTests.manager(FakeSharedRuntimeClient()),
             file: RuntimeGroupsFile(path: filePath),
+            imageFacts: FakeImageFacts(),
             bounded: { _, work in
                 await work()
                 return false
