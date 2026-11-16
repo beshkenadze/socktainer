@@ -243,7 +243,7 @@ struct DockerTCPHandlerTests {
 
 extension DockerTCPHandlerTests {
     @Test("broken stdin stops both pending flushes and later writes", arguments: [false, true])
-    func brokenStdin(buffered: Bool) throws {
+    func brokenStdin(buffered: Bool) async throws {
         let handler = DockerTCPHandler(execId: "broken", ttyEnabled: false)
         let pipe = Pipe()
         let fd = pipe.fileHandleForWriting.fileDescriptor
@@ -260,18 +260,18 @@ extension DockerTCPHandlerTests {
             handler.setStdinWriter(pipe.fileHandleForWriting)
         } else {
             handler.setStdinWriter(pipe.fileHandleForWriting)
-            handler.drainForTesting()
+            try await blockingTestIO { handler.drainForTesting() }
             try #require(fcntl(fd, F_GETNOSIGPIPE) == 1)
             try pipe.fileHandleForReading.close()
         }
         for _ in 0..<20 { handler.writeToStdin(Data([3])) }
-        handler.drainForTesting()
+        try await blockingTestIO { handler.drainForTesting() }
         let error = try #require(handler.stdinErrorForTesting) as NSError
         let posixCode = error.domain == NSPOSIXErrorDomain ? error.code : (error.userInfo[NSUnderlyingErrorKey] as? NSError)?.code
         #expect(posixCode == Int(EPIPE))
         #expect(stdinHandleIsClosed(pipe.fileHandleForWriting))
         handler.writeToStdin(Data(repeating: 4, count: 1024))
-        handler.drainForTesting()
+        try await blockingTestIO { handler.drainForTesting() }
         #expect(handler.pendingDataSizeForTesting == 0)
         #expect((handler.stdinErrorForTesting as NSError?) == error)
     }
