@@ -31,8 +31,14 @@ import Testing
             }
         }
         #expect(attempts == 1)
-        for handle in adopted { #expect(!isClosed(handle), "the callee owns this end after submission") }
-        for handle in retained { #expect(isClosed(handle), "the bridge must release its end on error") }
+        for handle in adopted {
+            let closed = try await isClosed(handle)
+            #expect(!closed, "the callee owns this end after submission")
+        }
+        for handle in retained {
+            let closed = try await isClosed(handle)
+            #expect(closed, "the bridge must release its end on error")
+        }
     }
 
     @Test("failure before handoff closes every end and never calls the operation")
@@ -48,7 +54,10 @@ import Testing
             }
         }
         #expect(!attempted)
-        for handle in all { #expect(isClosed(handle)) }
+        for handle in all {
+            let closed = try await isClosed(handle)
+            #expect(closed)
+        }
     }
 
     @Test("successful creation leaves bridge ends available for I/O and wait")
@@ -58,21 +67,26 @@ import Testing
         let result = try await pipes.withHandoff(preparing: {}) { _ in 42 }
         #expect(result == 42)
         for handle in [pipes.stdin!.write, pipes.stdout!.read, pipes.stderr!.read] {
-            #expect(!isClosed(handle))
+            let closed = try await isClosed(handle)
+            #expect(!closed)
         }
     }
 
     // The throwing FileHandle API checks its own closed state before writing.
     // An open pipe read end reports POSIX EBADF; an open protected write end
     // whose reader was released reports EPIPE. Neither is a closed FileHandle.
-    private func isClosed(_ handle: FileHandle) -> Bool {
-        do {
-            try handle.write(contentsOf: Data([0]))
-            return false
-        } catch {
-            let error = error as NSError
-            return error.domain == NSCocoaErrorDomain && error.code == NSFileWriteUnknownError
-                && error.userInfo[NSUnderlyingErrorKey] == nil
+    // Keep the I/O and Foundation error construction off the cooperative pool.
+    // Assertions remain in the calling test task.
+    private func isClosed(_ handle: FileHandle) async throws -> Bool {
+        try await blockingTestIO {
+            do {
+                try handle.write(contentsOf: Data([0]))
+                return false
+            } catch {
+                let error = error as NSError
+                return error.domain == NSCocoaErrorDomain && error.code == NSFileWriteUnknownError
+                    && error.userInfo[NSUnderlyingErrorKey] == nil
+            }
         }
     }
 }
@@ -107,11 +121,11 @@ extension StdioHandoffTests {
             }
             #expect(attempts.countSync() == 1)
             for handle in pipes.stdioArray.compactMap({ $0 }) {
-                let closed = isClosed(handle)
+                let closed = try await isClosed(handle)
                 #expect(!closed, "bootstrap owns the supplied end, even after a failure")
             }
             for handle in [pipes.stdin!.write, pipes.stdout!.read, pipes.stderr!.read] {
-                let closed = isClosed(handle)
+                let closed = try await isClosed(handle)
                 #expect(closed, "the failed bootstrap must release bridge ends")
             }
         } else {
