@@ -1,5 +1,5 @@
 {
-  "originHash" : "c8d9f02cd11859313093a16efd8443fb83a317de438ead736293e59fb9781918",
+  "originHash" : "5db809a06c88e2df83bc70b151f5dec75d287d5eab558a811576163123fcf84f",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -44,6 +44,15 @@
       "state" : {
         "revision" : "baf212e5a8e432e539beee325050aa26443a154d",
         "version" : "0.54.0"
+      }
+    },
+    {
+      "identity" : "cs-session",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/beshkenadze/cs-session.git",
+      "state" : {
+        "revision" : "1630c496f3eda163bec2002b8d2ab574333d2493",
+        "version" : "0.1.0"
       }
     },
     {

@@ -65,7 +65,7 @@ struct InfoRoute: RouteCollection {
 
             let health = try await systemHealthProvider()
 
-            let info = SystemInfo(
+            var info = SystemInfo(
                 Containers: allContainers.count,
                 ContainersRunning: allContainers.filter { $0.status == RuntimeStatus.running }.count,
                 // Apple container doesn't support pausing containers
@@ -94,6 +94,11 @@ struct InfoRoute: RouteCollection {
                     "NOTE: socktainer is still under active development and considered experimental!",
                 ],
             )
+            if let sharedRuntimes = req.application.storage[SharedRuntimeServiceKey.self] {
+                let entries = await sharedRuntimes.infoEntries()
+                info.Labels = (info.Labels ?? []) + [entries.label]
+                if let warning = entries.warning { info.Warnings.append(warning) }
+            }
             return try await info.encodeResponse(for: req)
         } catch is CancellationError {
             throw CancellationError()

@@ -34,6 +34,7 @@ let package = Package(
         .package(url: "https://github.com/mw99/DataCompression.git", from: "3.9.0"),
         .package(url: "https://github.com/facebook/zstd.git", exact: "1.5.7"),
         .package(url: "https://github.com/socktainer/dns-forwarder.git", exact: "0.2.0"),
+        .package(url: "https://github.com/beshkenadze/cs-session.git", exact: "0.1.0"),
     ],
     targets: [
         .executableTarget(
@@ -41,6 +42,7 @@ let package = Package(
             dependencies: [
                 .product(name: "ContainerBuild", package: "container"),
                 .product(name: "ContainerAPIClient", package: "container"),
+                .product(name: "ContainerXPC", package: "container"),
                 .product(name: "ContainerPersistence", package: "container"),
                 .product(name: "ContainerNetworkClient", package: "container"),
                 .product(name: "ContainerResource", package: "container"),
@@ -54,6 +56,7 @@ let package = Package(
                 .product(name: "DataCompression", package: "DataCompression"),
                 .product(name: "libzstd", package: "zstd"),
                 .product(name: "SocktainerDNSImage", package: "dns-forwarder"),
+                .product(name: "CSSessionBinary", package: "cs-session"),
                 "BuildInfo",
             ]
         ),
@@ -64,6 +67,7 @@ let package = Package(
                 .product(name: "ContainerAPIClient", package: "container"),
                 .product(name: "libzstd", package: "zstd"),
                 .product(name: "SocktainerDNSImage", package: "dns-forwarder"),
+                .product(name: "CSSessionBinary", package: "cs-session"),
                 .product(name: "VaporTesting", package: "vapor"),
             ],
             resources: [
