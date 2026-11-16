@@ -124,3 +124,26 @@ final class Counter: @unchecked Sendable {
         return value
     }
 }
+
+extension ReconnectingContainerClientTests {
+    @Test("a consuming operation reconnects for the next call without replaying its handles")
+    func consumingOperationIsNotRetried() async throws {
+        let generations = Counter()
+        let client = ReconnectingContainerClient<FakeConnection>(makeClient: {
+            FakeConnection(generation: generations.nextSync())
+        })
+        let attempts = Counter()
+        await #expect(throws: ContainerizationError.self) {
+            try await client.withClient(retryOnStaleConnection: false) { _ -> Int in
+                if attempts.nextSync() == 1 {
+                    throw ContainerizationError(.internalError, message: "request failed", cause: ContainerizationError(.interrupted, message: "reply lost"))
+                }
+                return 99
+            }
+        }
+        #expect(attempts.countSync() == 1)
+        #expect(await client.reconnectCount == 1)
+        let nextGeneration = try await client.withClient { $0.generation }
+        #expect(nextGeneration == 2)
+    }
+}

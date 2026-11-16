@@ -101,7 +101,7 @@ Tests are in `Tests/socktainerTests/`. The PR CI (`pr-check.yaml`) runs: format 
 
 **Never use Foundation's `Pipe()` when passing fds to `ContainerClient.createProcess(stdio:)` or `ContainerClient.bootstrap(id:stdio:)`.**
 
-These APIs dup the passed fds into the container and then **immediately close the parent copies**. `Pipe()` does not know about this external close — its `deinit` later calls `close()` again on the same fd, which may now be a recycled NIO socket. The double-close corrupts NIO's fd table, causing `writev`/`kevent` EBADF crashes under concurrent load (issue #107).
+These APIs add non-nil stdio handles to an XPC message and **close the supplied fd numbers before sending the request**. A send or reply failure does not return ownership to the bridge. `Pipe()` does not know about this external close — its `deinit` later calls `close()` again on the same fd, which may now be a recycled NIO socket. The double-close corrupts NIO's fd table, causing `writev`/`kevent` EBADF crashes under concurrent load (issue #107).
 
 **Use `StdioPipes`** (centralized allocation and cleanup, `Sources/socktainer/Utilities/DockerConnectionUtility.swift`):
 
@@ -109,23 +109,25 @@ These APIs dup the passed fds into the container and then **immediately close th
 guard let pipes = StdioPipes.make([.stdin, .stdout, .stderr]) else {  // or make(.all)
     throw Abort(.internalServerError, reason: "Failed to create I/O pipes")
 }
-let process: ClientProcess
-do {
-    process = try await ContainerClient().createProcess(..., stdio: pipes.stdioArray)
-} catch {
-    pipes.closeAll()           // Apple never took ownership — close all 6 fds
-    throw error
+let process = try await pipes.withHandoff(
+    preparing: { _ = try JSONEncoder().encode(configuration) }
+) { stdio in
+    try await ContainerClient().createProcess(..., configuration: configuration, stdio: stdio)
 }
 do {
     try await process.start()
 } catch {
-    pipes.closeAfterHandoff()  // Apple owns stdin.read, stdout.write, stderr.write
+    pipes.closeAfterHandoff()  // Close only the ends the bridge retains.
     throw error
 }
 // Success — use pipes.stdout?.read, pipes.stderr?.read, pipes.stdin?.write in tasks
 ```
 
-`StdioPipes.make()` handles EMFILE internally (closes any partially-allocated pipes and returns `nil`). `closeAll()` is for createProcess-failure; `closeAfterHandoff()` is for start-failure. `ProcessPipe` (the single-pipe primitive) exists for unusual cases requiring finer control.
+`StdioPipes.make()` handles EMFILE internally (closes any partially-allocated pipes and returns `nil`). `withHandoff` closes all ends if local preparation fails, and only bridge-owned ends if the consuming operation fails. `closeAll()` is only for pipes that have not been passed to the API; an API error alone does not make it safe. `closeAfterHandoff()` also applies to start failures. `ProcessPipe` (the single-pipe primitive) exists for unusual cases requiring finer control.
+
+The pinned `createProcess` encodes configuration before consuming handles. Validate that same configuration in `preparing` so an encoding failure is handled while all ends are still owned locally. The helper always supplies exactly three stdio slots; longer arrays can fail after a partial handoff and must not be used. `bootstrap` consumes its handles before encoding dynamic environment data, so its handoff preparation is empty once pre-start work has succeeded.
+
+Do not automatically retry fd-consuming operations. `XPCClient.send` can fail without confirming whether the remote operation ran, and the supplied handles have already been closed. Use `withClient(retryOnStaleConnection: false)` for those calls; it refreshes a stale connection for the next request without replaying the current one. A new request must allocate its own pipes.
 
 Ownership contract:
 - **stdout/stderr**: pass `.write` via `StdioPipes.stdioArray` — Apple closes it. Caller closes `.read`.

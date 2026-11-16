@@ -67,8 +67,8 @@ struct ProcessPipe: @unchecked Sendable {
 /// allocation, validation, and cleanup that eliminates per-call-site boilerplate
 /// and prevents fd leaks on every error path.
 ///
-/// Ownership after `createProcess(stdio:)` / `bootstrap(id:stdio:)`:
-///   - Apple owns and will close: `stdin?.read`, `stdout?.write`, `stderr?.write`
+/// Ownership once stdio is serialized by `createProcess` / `bootstrap`, before the XPC send:
+///   - Apple has consumed: `stdin?.read`, `stdout?.write`, `stderr?.write`
 ///   - Caller owns and must close: `stdin?.write`, `stdout?.read`, `stderr?.read`
 ///
 /// Usage pattern:
@@ -76,12 +76,10 @@ struct ProcessPipe: @unchecked Sendable {
 /// guard let pipes = StdioPipes.make([.stdin, .stdout, .stderr]) else {
 ///     throw Abort(.internalServerError, reason: "Failed to create I/O pipes")
 /// }
-/// let process: ClientProcess
-/// do {
-///     process = try await ContainerClient().createProcess(..., stdio: pipes.stdioArray)
-/// } catch {
-///     pipes.closeAll()   // Apple never took ownership
-///     throw error
+/// let process = try await pipes.withHandoff(
+///     preparing: { _ = try JSONEncoder().encode(configuration) }
+/// ) { stdio in
+///     try await ContainerClient().createProcess(..., configuration: configuration, stdio: stdio)
 /// }
 /// do {
 ///     try await process.start()
@@ -108,6 +106,27 @@ struct StdioPipes: @unchecked Sendable {
 
     /// `[stdin.read, stdout.write, stderr.write]` — the array to pass to createProcess/bootstrap.
     var stdioArray: [FileHandle?] { [stdin?.read, stdout?.write, stderr?.write] }
+
+    /// Run local validation before handing the three stdio slots to Apple.
+    /// The operation must consume the passed ends, including on failure, and must not retry.
+    /// Validate the same configuration that the operation passes to the pinned API.
+    func withHandoff<T: Sendable>(
+        preparing prepare: () throws -> Void,
+        using operation: ([FileHandle?]) async throws -> T
+    ) async throws -> T {
+        do {
+            try prepare()
+        } catch {
+            closeAll()
+            throw error
+        }
+        do {
+            return try await operation(stdioArray)
+        } catch {
+            closeAfterHandoff()
+            throw error
+        }
+    }
 
     /// Allocates pipes for the requested channels. Returns `nil` (and closes any
     /// partially-allocated pipes) if any required pipe cannot be created (EMFILE).
@@ -152,8 +171,8 @@ struct StdioPipes: @unchecked Sendable {
         return make(channels)
     }
 
-    /// Close all six fds. Use when createProcess/bootstrap has NOT yet taken ownership
-    /// (e.g. the call threw before completing the dup).
+    /// Close all six fds before the API has been invoked (e.g. preparation or parking failed).
+    /// Never use this merely because createProcess/bootstrap threw: serialization consumes fds.
     func closeAll() {
         try? stdin?.read.close()
         try? stdin?.write.close()
