@@ -202,9 +202,9 @@ struct EventsRouteTests {
         _ test: @escaping (Application, EventBroadcaster, Int) async throws -> Void
     ) async throws {
         try await withRoute { app, broadcaster in
-            let port = 28_000 + Int.random(in: 0..<2_000)
             app.http.server.configuration.shutdownTimeout = .milliseconds(100)
-            try await app.server.start(address: .hostname("127.0.0.1", port: port))
+            try await app.server.start(address: .hostname("127.0.0.1", port: 0))
+            let port = try #require(app.http.server.shared.localAddress?.port)
             try await test(app, broadcaster, port)
             await app.server.shutdown()
         }
