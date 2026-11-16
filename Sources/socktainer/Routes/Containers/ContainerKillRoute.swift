@@ -29,9 +29,9 @@ extension ContainerKillRoute {
             do {
                 try await client.kill(id: containerId, signal: signal)
                 if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
-                    // moby's kill event carries the numeric signal in {"signal": <int>}.
+                    // Docker events report Linux signal numbers, even on a macOS host.
                     // Docker defaults to SIGKILL when no signal is given.
-                    let signalNumber = (try? parseSignal(signal ?? "SIGKILL")) ?? SIGKILL
+                    let signalNumber = (try? parseSignal(signal ?? "SIGKILL")) ?? 9
                     let event = DockerEvent.simpleEvent(
                         id: snapshot.map { DockerContainerID.hexId(for: $0) } ?? containerId,
                         type: "container",

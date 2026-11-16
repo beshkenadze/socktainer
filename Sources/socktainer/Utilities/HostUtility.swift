@@ -1,3 +1,4 @@
+import Containerization
 import Foundation
 
 public func isDebug() -> Bool {
@@ -104,41 +105,15 @@ public func discoverContainerCLIPath() -> String? {
     return nil
 }
 
+/// Resolves a Docker signal to its Linux number, independent of the macOS host.
+/// Numeric input is already a Linux number. Names (including real-time signals)
+/// use the same table as the runtime that receives the original signal string.
 public func parseSignal(_ signal: String) throws -> Int32 {
-    let signalUpper = signal.uppercased()
-    switch signalUpper {
-    case "SIGTERM", "TERM", "15":
-        return SIGTERM
-    case "SIGKILL", "KILL", "9":
-        return SIGKILL
-    case "SIGINT", "INT", "2":
-        return SIGINT
-    case "SIGHUP", "HUP", "1":
-        return SIGHUP
-    case "SIGQUIT", "QUIT", "3":
-        return SIGQUIT
-    case "SIGABRT", "ABRT", "6":
-        return SIGABRT
-    case "SIGSTOP", "STOP", "19":
-        return SIGSTOP
-    case "SIGCONT", "CONT", "18":
-        return SIGCONT
-    case "SIGUSR1", "USR1", "10":
-        return SIGUSR1
-    case "SIGUSR2", "USR2", "12":
-        return SIGUSR2
-    case "SIGWINCH", "WINCH", "28":
-        return SIGWINCH
-    case "SIGTSTP", "TSTP", "20":
-        return SIGTSTP
-    case "SIGTTIN", "TTIN", "21":
-        return SIGTTIN
-    case "SIGTTOU", "TTOU", "22":
-        return SIGTTOU
-    default:
-        if let signalNum = Int32(signalUpper) {
-            return signalNum
-        }
-        throw NSError(domain: "SignalParsing", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid signal: \(signal)"])
+    if let number = Int32(signal) {
+        return number
     }
+    if let parsed = try? Signal(signal, from: Signal.linux) {
+        return parsed.rawValue
+    }
+    throw NSError(domain: "SignalParsing", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid signal: \(signal)"])
 }

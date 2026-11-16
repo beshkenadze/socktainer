@@ -265,7 +265,11 @@ extension SharedRuntimeManager {
         let launcherSignal = try SharedRuntimeSignal.launcherSignal(forDocker: signal)
         guard session.phase == .running else { throw SessionError.notRunning(session.spec.id) }
         try await deliver(launcherSignal, to: session)
-        await onEvent(sessionEvent(session, "kill", ["signal": signal ?? "SIGKILL"]))
+        // Report the Docker signal, not the launcher's SIGKILL control signal (36).
+        // Match launcherSignal's existing whitespace handling without changing delivery.
+        let dockerSignal = (signal ?? "SIGKILL").trimmingCharacters(in: .whitespaces)
+        let signalNumber = (try? parseSignal(dockerSignal)) ?? 9
+        await onEvent(sessionEvent(session, "kill", ["signal": String(signalNumber)]))
     }
 
     /// `stop`: the signal of the request or SIGTERM, then the control signal after `timeout`
