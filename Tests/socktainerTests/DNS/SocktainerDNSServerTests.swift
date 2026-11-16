@@ -297,19 +297,19 @@ private func dnsResponseTail(type: UInt16, names: [String], port: Int) -> (arcou
 struct SocktainerDNSQueryTests {
 
     @Test("A query for registered single-label name returns RCODE 0 (NOERROR)")
-    func aQueryKnownNameReturnsNoerror() throws {
+    func aQueryKnownNameReturnsNoerror() async throws {
         let server = SocktainerDNSServer()
         guard let port = server.start(preferredPort: 19700, maxAttempts: 5) else {
             Issue.record("Could not bind DNS server port")
             return
         }
         server.register(hostname: "supabase_db_supabase", ip: "192.168.67.3")
-        let rcode = dnsRcode(type: 1, names: ["supabase_db_supabase"], port: port)
+        let rcode = try await blockingTestIO({ dnsRcode(type: 1, names: ["supabase_db_supabase"], port: port) })
         #expect(rcode == 0, "A for known name must succeed (RCODE=0)")
     }
 
     @Test("A query for unknown single-label name returns local NXDOMAIN (RCODE 3)")
-    func aQueryUnknownNameReturnsNxdomain() throws {
+    func aQueryUnknownNameReturnsNxdomain() async throws {
         let server = SocktainerDNSServer()
         guard let port = server.start(preferredPort: 19710, maxAttempts: 5) else {
             Issue.record("Could not bind DNS server port")
@@ -317,12 +317,12 @@ struct SocktainerDNSQueryTests {
         }
         // Warmup: register a dummy entry — the lock acquisition gives the server thread time to start.
         server.register(hostname: "_warmup", ip: "127.0.0.1")
-        let rcode = dnsRcode(type: 1, names: ["no-such-container"], port: port)
+        let rcode = try await blockingTestIO({ dnsRcode(type: 1, names: ["no-such-container"], port: port) })
         #expect(rcode == 3, "A for unknown single-label name must return NXDOMAIN without forwarding upstream")
     }
 
     @Test("AAAA query for single-label name returns NODATA (RCODE 0, no answers)")
-    func aaaaQuerySingleLabelReturnsNodata() throws {
+    func aaaaQuerySingleLabelReturnsNodata() async throws {
         let server = SocktainerDNSServer()
         guard let port = server.start(preferredPort: 19720, maxAttempts: 5) else {
             Issue.record("Could not bind DNS server port")
@@ -330,24 +330,24 @@ struct SocktainerDNSQueryTests {
         }
         server.register(hostname: "db", ip: "192.168.67.3")
         // NODATA is RCODE=0 with zero answer records; the test checks RCODE only.
-        let rcode = dnsRcode(type: 28, names: ["db"], port: port)
+        let rcode = try await blockingTestIO({ dnsRcode(type: 28, names: ["db"], port: port) })
         #expect(rcode == 0, "AAAA for single-label name must return NODATA (RCODE=0), not an upstream NXDOMAIN")
     }
 
     @Test("AAAA query for unknown single-label name returns NODATA (RCODE 0)")
-    func aaaaQueryUnknownSingleLabelReturnsNodata() throws {
+    func aaaaQueryUnknownSingleLabelReturnsNodata() async throws {
         let server = SocktainerDNSServer()
         guard let port = server.start(preferredPort: 19730, maxAttempts: 5) else {
             Issue.record("Could not bind DNS server port")
             return
         }
         server.register(hostname: "_warmup", ip: "127.0.0.1")
-        let rcode = dnsRcode(type: 28, names: ["unknown-svc"], port: port)
+        let rcode = try await blockingTestIO({ dnsRcode(type: 28, names: ["unknown-svc"], port: port) })
         #expect(rcode == 0, "AAAA for unknown single-label name must return NODATA, never forward upstream")
     }
 
     @Test("Multi-label query is forwarded to the configured upstream, not 1.1.1.1 (#410)")
-    func multiLabelQueryForwardsToConfiguredUpstream() throws {
+    func multiLabelQueryForwardsToConfiguredUpstream() async throws {
         // Stub upstream on loopback: answers every query with RCODE=5 (REFUSED), a code
         // neither 1.1.1.1 nor the local fast path would return for this name.
         let stub = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -390,12 +390,12 @@ struct SocktainerDNSQueryTests {
             Issue.record("Could not bind DNS server port")
             return
         }
-        let rcode = dnsRcode(type: 1, names: ["host.internal.example"], port: port)
+        let rcode = try await blockingTestIO({ dnsRcode(type: 1, names: ["host.internal.example"], port: port) })
         #expect(rcode == 5, "multi-label name must be answered by the configured upstream")
     }
 
     @Test("Query with QDCOUNT > 1 returns FORMERR (RCODE 1)")
-    func qdcountGreaterThanOneReturnsFormerr() throws {
+    func qdcountGreaterThanOneReturnsFormerr() async throws {
         let server = SocktainerDNSServer()
         guard let port = server.start(preferredPort: 19770, maxAttempts: 5) else {
             Issue.record("Could not bind DNS server port")
@@ -403,13 +403,13 @@ struct SocktainerDNSQueryTests {
         }
 
         // Two questions in one query — RFC 9619: must be refused with FORMERR.
-        let rcode = dnsRcode(type: 1, names: ["redis", "db"], port: port)
+        let rcode = try await blockingTestIO({ dnsRcode(type: 1, names: ["redis", "db"], port: port) })
         #expect(rcode == 1, "QDCOUNT > 1 must be answered with FORMERR (RCODE=1)")
     }
 
     // Regression: NS & AR sections should be dropped when their count is set to 0.
     @Test("A query with EDNS0 OPT for a registered name returns a well-formed response")
-    func aQueryWithOPTForRegisteredNameReturnsWellFormedResponse() throws {
+    func aQueryWithOPTForRegisteredNameReturnsWellFormedResponse() async throws {
         let server = SocktainerDNSServer()
         guard let port = server.start(preferredPort: 19740, maxAttempts: 5) else {
             Issue.record("Could not bind DNS server port")
@@ -417,7 +417,7 @@ struct SocktainerDNSQueryTests {
         }
         server.register(hostname: "redis", ip: "192.168.1.10")
 
-        guard let tail = dnsResponseTail(type: 1, names: ["redis"], port: port) else {
+        guard let tail = try await blockingTestIO({ dnsResponseTail(type: 1, names: ["redis"], port: port) }) else {
             Issue.record("No response for EDNS0 A query")
             return
         }
@@ -427,7 +427,7 @@ struct SocktainerDNSQueryTests {
     }
 
     @Test("AAAA query with EDNS0 OPT for a single-label name returns a well-formed NODATA")
-    func aaaaQueryWithOPTForSingleLabelReturnsWellFormedNodata() throws {
+    func aaaaQueryWithOPTForSingleLabelReturnsWellFormedNodata() async throws {
         let server = SocktainerDNSServer()
         guard let port = server.start(preferredPort: 19750, maxAttempts: 5) else {
             Issue.record("Could not bind DNS server port")
@@ -435,7 +435,7 @@ struct SocktainerDNSQueryTests {
         }
         server.register(hostname: "db", ip: "192.168.67.3")
 
-        guard let tail = dnsResponseTail(type: 28, names: ["db"], port: port) else {
+        guard let tail = try await blockingTestIO({ dnsResponseTail(type: 28, names: ["db"], port: port) }) else {
             Issue.record("No response for EDNS0 AAAA query")
             return
         }
@@ -444,14 +444,14 @@ struct SocktainerDNSQueryTests {
     }
 
     @Test("A query with EDNS0 OPT for an unknown single-label name returns a well-formed NXDOMAIN")
-    func aQueryWithOPTForUnknownSingleLabelReturnsWellFormedNxdomain() throws {
+    func aQueryWithOPTForUnknownSingleLabelReturnsWellFormedNxdomain() async throws {
         let server = SocktainerDNSServer()
         guard let port = server.start(preferredPort: 19760, maxAttempts: 5) else {
             Issue.record("Could not bind DNS server port")
             return
         }
 
-        guard let tail = dnsResponseTail(type: 1, names: ["no-such-container"], port: port) else {
+        guard let tail = try await blockingTestIO({ dnsResponseTail(type: 1, names: ["no-such-container"], port: port) }) else {
             Issue.record("No response for EDNS0 A query")
             return
         }
@@ -529,7 +529,7 @@ struct SocktainerDNSMultiHomedTests {
     // The test client always sends from 127.0.0.1. The loopback entry is registered first
     // for one name and last for the other, so neither first- nor last-registered wins both.
     @Test("End-to-end: query is answered with the address on the client's subnet")
-    func endToEndAnswersFromMatchingSubnet() throws {
+    func endToEndAnswersFromMatchingSubnet() async throws {
         let server = SocktainerDNSServer()
         guard let port = server.start(preferredPort: 19790, maxAttempts: 5) else {
             Issue.record("Could not bind DNS server port")
@@ -538,8 +538,8 @@ struct SocktainerDNSMultiHomedTests {
         server.register(hostname: "web", ips: ["127.0.0.9/8", "10.99.0.7/24"])
         server.register(hostname: "api", ips: ["10.99.0.8/24", "127.0.0.10/8"])
 
-        #expect(dnsResponseTail(type: 1, names: ["web"], port: port)?.ip == "127.0.0.9")
-        #expect(dnsResponseTail(type: 1, names: ["api"], port: port)?.ip == "127.0.0.10")
+        #expect(try await blockingTestIO({ dnsResponseTail(type: 1, names: ["web"], port: port) })?.ip == "127.0.0.9")
+        #expect(try await blockingTestIO({ dnsResponseTail(type: 1, names: ["api"], port: port) })?.ip == "127.0.0.10")
     }
 }
 
@@ -909,7 +909,7 @@ struct RegisterDNSAliasesOnResumeTests {
     // The test client always sends from 127.0.0.1, so it plays a peer that shares only the
     // container's second network.
     @Test("End-to-end: a peer on the second network gets the second network's address")
-    func endToEndPeerOnSecondNetworkGetsItsAddress() throws {
+    func endToEndPeerOnSecondNetworkGetsItsAddress() async throws {
         let container = try makeContainerSnapshot(
             nativeId: "web-1",
             networks: [(network: "netA", ip: "10.99.0.7"), (network: "netB", ip: "127.0.0.9")],
@@ -922,7 +922,7 @@ struct RegisterDNSAliasesOnResumeTests {
         }
         ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
 
-        #expect(dnsResponseTail(type: 1, names: ["web"], port: port)?.ip == "127.0.0.9")
-        #expect(dnsResponseTail(type: 1, names: ["web-1"], port: port)?.ip == "127.0.0.9")
+        #expect(try await blockingTestIO({ dnsResponseTail(type: 1, names: ["web"], port: port) })?.ip == "127.0.0.9")
+        #expect(try await blockingTestIO({ dnsResponseTail(type: 1, names: ["web-1"], port: port) })?.ip == "127.0.0.9")
     }
 }

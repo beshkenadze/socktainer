@@ -123,7 +123,7 @@ struct ClientArchiveMountRoutingTests {
     /// Runs the generated script with the host's `/bin/sh` on a tree where `var/run` links to `run`,
     /// as in Debian and Ubuntu images, so the report is what a real shell prints.
     @Test("the preparation script reports where the guest resolves parents and mounts")
-    func scriptReportsResolvedPaths() throws {
+    func scriptReportsResolvedPaths() async throws {
         let created = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("archive-resolve-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: created.appendingPathComponent("run/act"), withIntermediateDirectories: true)
@@ -152,8 +152,10 @@ struct ClientArchiveMountRoutingTests {
         process.arguments = ["-c", script, "sh", root.path]
         let output = Pipe()
         process.standardOutput = output
-        try process.run()
-        process.waitUntilExit()
+        try await blockingTestIO {
+            try process.run()
+            process.waitUntilExit()
+        }
         #expect(process.terminationStatus == 0)
 
         let report = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
@@ -169,7 +171,7 @@ struct ClientArchiveMountRoutingTests {
     /// `cd` cannot enter a file, so a bind of one file, such as `/var/run/docker.sock`, is resolved
     /// through its directory.
     @Test("a single-file mount is resolved through its directory")
-    func scriptResolvesFileMountThroughParent() throws {
+    func scriptResolvesFileMountThroughParent() async throws {
         let created = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("archive-resolve-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: created.appendingPathComponent("run"), withIntermediateDirectories: true)
@@ -193,8 +195,10 @@ struct ClientArchiveMountRoutingTests {
         process.arguments = ["-c", script, "sh", root.path]
         let output = Pipe()
         process.standardOutput = output
-        try process.run()
-        process.waitUntilExit()
+        try await blockingTestIO {
+            try process.run()
+            process.waitUntilExit()
+        }
         #expect(process.terminationStatus == 0)
 
         let report = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)

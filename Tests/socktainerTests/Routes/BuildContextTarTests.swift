@@ -55,7 +55,7 @@ struct BuildContextTarTests {
     }
 
     @Test("A gzip-compressed tar missing its trailing padding fails to extract until terminated")
-    func gzipTarTerminator() throws {
+    func gzipTarTerminator() async throws {
         let (plainTar, cleanup) = try makeUnpaddedTar()
         defer { cleanup() }
 
@@ -69,8 +69,10 @@ struct BuildContextTarTests {
         gzip.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         gzip.arguments = ["gzip", "-c", plainTar.path]
         gzip.standardOutput = out
-        try gzip.run()
-        gzip.waitUntilExit()
+        try await blockingTestIO {
+            try gzip.run()
+            gzip.waitUntilExit()
+        }
         try out.close()
         #expect(gzip.terminationStatus == 0)
 
