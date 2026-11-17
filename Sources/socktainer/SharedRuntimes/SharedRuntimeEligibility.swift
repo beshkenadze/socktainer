@@ -66,7 +66,8 @@ enum SharedRuntimeEligibility {
         if limitKeys.contains(where: { !isDefaultLimit($0, host[$0]) }) { return .limits }
 
         let checkedTop = anyValueKeys.union(["OpenStdin", "AttachStdin", "AttachStdout", "Tty", "Volumes", "NetworkDisabled", "HostConfig", "NetworkingConfig"])
-        let checkedHost = mountKeys.union(portKeys).union(limitKeys).union(["AutoRemove", "NetworkMode"])
+        // TTY requests were rejected above; ConsoleSize has no effect without a TTY.
+        let checkedHost = mountKeys.union(portKeys).union(limitKeys).union(["AutoRemove", "NetworkMode", "ConsoleSize"])
         let sections: [(fields: [String: SharedRuntimeJSON], checked: Set<String>, declared: Set<String>)] = [
             (top, checkedTop, requestKeys),
             (host, checkedHost, hostConfigKeys),
@@ -101,9 +102,6 @@ enum SharedRuntimeEligibility {
             return hasOnlyDefaultFields(.object(policy))
         case "LogConfig":
             return hasOnlyDefaultFields(value)
-        case "ConsoleSize":
-            guard case .array(let size) = value else { return isDefault(value) }
-            return size.allSatisfy(\.isEmptyDefault)
         default:
             return isDefault(value)
         }
