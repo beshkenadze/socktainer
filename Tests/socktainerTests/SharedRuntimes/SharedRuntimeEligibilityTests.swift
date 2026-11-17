@@ -67,6 +67,22 @@ import Testing
         #expect(try reason { $0["Tty"] = true } == .tty)
     }
 
+    @Test func nonTtyRunWithConsoleSizeIsEligible() throws {
+        #expect(
+            try reason {
+                $0["Tty"] = false
+                F.setHostConfig("ConsoleSize", [24, 80])(&$0)
+            } == nil)
+    }
+
+    @Test func ttyRunWithConsoleSizeKeepsTheTtyReason() throws {
+        #expect(
+            try reason {
+                $0["Tty"] = true
+                F.setHostConfig("ConsoleSize", [24, 80])(&$0)
+            } == .tty)
+    }
+
     // MARK: Mounts, ports, network, limits
 
     @Test func bindsAreAMount() throws {
@@ -144,7 +160,6 @@ import Testing
 
     @Test func clientSpelledDefaultsAreDefaultsAndOtherValuesAreNot() throws {
         #expect(try host("ConsoleSize", [0, 0]) == nil)
-        #expect(try host("ConsoleSize", [24, 80]) == .option("ConsoleSize"))
         #expect(try host("LogConfig", ["Type": "", "Config": [String: Any]()]) == nil)
         #expect(try host("LogConfig", ["Type": "json-file"]) == .option("LogConfig"))
         #expect(try host("RestartPolicy", ["Name": "no", "MaximumRetryCount": 3]) == .option("RestartPolicy"))
