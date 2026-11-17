@@ -104,44 +104,34 @@ struct SocktainerDNSServerTests {
 
     // MARK: - Port selection
 
-    @Test("start() returns the resolved port")
-    func startReturnsPort() {
+    @Test("start() returns the actual ephemeral port and accepts queries")
+    func startReturnsPort() async throws {
         let server = SocktainerDNSServer()
-        // Pick an unlikely port range for testing; just verify start() returns a non-nil Int
-        let port = server.start(preferredPort: 19900, maxAttempts: 5)
-        #expect(port != nil)
-        if let p = port {
-            #expect(p >= 19900 && p < 19905)
-        }
+        let port = try #require(server.start(preferredPort: 0))
+        #expect(port > 0)
+        #expect(try await blockingTestIO({ dnsRcode(type: 1, names: ["missing"], port: port) }) == 3)
     }
 
-    @Test("start() falls back when preferred port is taken")
-    func startFallsBack() throws {
-        // Bind a socket on 19800 to simulate the port being taken
+    @Test("start() rejects a port held by a reusable UDP socket")
+    func startRejectsOccupiedPort() throws {
         let blocker = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard blocker >= 0 else { return }
+        try #require(blocker >= 0)
         defer { Darwin.close(blocker) }
         var yes: Int32 = 1
-        setsockopt(blocker, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        try #require(setsockopt(blocker, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size)) == 0)
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(19800).bigEndian
-        addr.sin_addr.s_addr = INADDR_ANY
-        let bound = withUnsafePointer(to: &addr) {
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bound = withUnsafeMutablePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(blocker, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+                bind(blocker, $0, len) == 0 && getsockname(blocker, $0, &len) == 0
             }
         }
-        guard bound else { return }  // skip if bind fails (e.g. CI port conflict)
-
-        let server = SocktainerDNSServer()
-        let port = server.start(preferredPort: 19800, maxAttempts: 5)
-        #expect(port != nil)
-        if let p = port {
-            #expect(p != 19800)  // must have fallen back
-            #expect(p > 19800 && p < 19805)
-        }
+        try #require(bound)
+        let port = Int(UInt16(bigEndian: addr.sin_port))
+        #expect(SocktainerDNSServer().start(preferredPort: port, maxAttempts: 1) == nil)
     }
 
     // MARK: - Multiple entries
@@ -216,8 +206,7 @@ private func makeDnsQuery(names: [String], type: UInt16, edns0: Bool) -> [UInt8]
 }
 
 /// Sends raw query bytes via UDP to 127.0.0.1:port and returns the raw response.
-/// Retries up to 5 times with 50 ms gaps to handle the race between Thread.detachNewThread
-/// and the server loop reaching recvfrom(). Returns nil only if all attempts time out.
+/// start() has already bound the socket, so the first packet can queue before recvfrom().
 private func sendDnsQuery(_ packet: [UInt8], port: Int) -> [UInt8]? {
     var dst = sockaddr_in()
     dst.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -225,12 +214,11 @@ private func sendDnsQuery(_ packet: [UInt8], port: Int) -> [UInt8]? {
     dst.sin_port = in_port_t(port).bigEndian
     inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr)
 
-    for attempt in 0..<5 {
-        if attempt > 0 { Thread.sleep(forTimeInterval: 0.05) }
+    do {
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard fd >= 0 else { continue }
+        guard fd >= 0 else { return nil }
         defer { Darwin.close(fd) }
-        var tv = timeval(tv_sec: 0, tv_usec: 200_000)
+        var tv = timeval(tv_sec: 2, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         let sent = packet.withUnsafeBytes { ptr in
             withUnsafePointer(to: &dst) {
@@ -239,7 +227,7 @@ private func sendDnsQuery(_ packet: [UInt8], port: Int) -> [UInt8]? {
                 }
             }
         }
-        guard sent > 0 else { continue }
+        guard sent > 0 else { return nil }
         var buf = [UInt8](repeating: 0, count: 512)
         let n = recv(fd, &buf, buf.count, 0)
         if n >= 12 { return Array(buf[0..<n]) }
@@ -299,7 +287,7 @@ struct SocktainerDNSQueryTests {
     @Test("A query for registered single-label name returns RCODE 0 (NOERROR)")
     func aQueryKnownNameReturnsNoerror() async throws {
         let server = SocktainerDNSServer()
-        guard let port = server.start(preferredPort: 19700, maxAttempts: 5) else {
+        guard let port = server.start(preferredPort: 0) else {
             Issue.record("Could not bind DNS server port")
             return
         }
@@ -311,12 +299,10 @@ struct SocktainerDNSQueryTests {
     @Test("A query for unknown single-label name returns local NXDOMAIN (RCODE 3)")
     func aQueryUnknownNameReturnsNxdomain() async throws {
         let server = SocktainerDNSServer()
-        guard let port = server.start(preferredPort: 19710, maxAttempts: 5) else {
+        guard let port = server.start(preferredPort: 0) else {
             Issue.record("Could not bind DNS server port")
             return
         }
-        // Warmup: register a dummy entry — the lock acquisition gives the server thread time to start.
-        server.register(hostname: "_warmup", ip: "127.0.0.1")
         let rcode = try await blockingTestIO({ dnsRcode(type: 1, names: ["no-such-container"], port: port) })
         #expect(rcode == 3, "A for unknown single-label name must return NXDOMAIN without forwarding upstream")
     }
@@ -324,7 +310,7 @@ struct SocktainerDNSQueryTests {
     @Test("AAAA query for single-label name returns NODATA (RCODE 0, no answers)")
     func aaaaQuerySingleLabelReturnsNodata() async throws {
         let server = SocktainerDNSServer()
-        guard let port = server.start(preferredPort: 19720, maxAttempts: 5) else {
+        guard let port = server.start(preferredPort: 0) else {
             Issue.record("Could not bind DNS server port")
             return
         }
@@ -337,11 +323,10 @@ struct SocktainerDNSQueryTests {
     @Test("AAAA query for unknown single-label name returns NODATA (RCODE 0)")
     func aaaaQueryUnknownSingleLabelReturnsNodata() async throws {
         let server = SocktainerDNSServer()
-        guard let port = server.start(preferredPort: 19730, maxAttempts: 5) else {
+        guard let port = server.start(preferredPort: 0) else {
             Issue.record("Could not bind DNS server port")
             return
         }
-        server.register(hostname: "_warmup", ip: "127.0.0.1")
         let rcode = try await blockingTestIO({ dnsRcode(type: 28, names: ["unknown-svc"], port: port) })
         #expect(rcode == 0, "AAAA for unknown single-label name must return NODATA, never forward upstream")
     }
@@ -386,7 +371,7 @@ struct SocktainerDNSQueryTests {
         let server = SocktainerDNSServer()
         server.upstreamHost = "127.0.0.1"
         server.upstreamPort = stubPort
-        guard let port = server.start(preferredPort: 19780, maxAttempts: 5) else {
+        guard let port = server.start(preferredPort: 0) else {
             Issue.record("Could not bind DNS server port")
             return
         }
@@ -397,7 +382,7 @@ struct SocktainerDNSQueryTests {
     @Test("Query with QDCOUNT > 1 returns FORMERR (RCODE 1)")
     func qdcountGreaterThanOneReturnsFormerr() async throws {
         let server = SocktainerDNSServer()
-        guard let port = server.start(preferredPort: 19770, maxAttempts: 5) else {
+        guard let port = server.start(preferredPort: 0) else {
             Issue.record("Could not bind DNS server port")
             return
         }
@@ -411,7 +396,7 @@ struct SocktainerDNSQueryTests {
     @Test("A query with EDNS0 OPT for a registered name returns a well-formed response")
     func aQueryWithOPTForRegisteredNameReturnsWellFormedResponse() async throws {
         let server = SocktainerDNSServer()
-        guard let port = server.start(preferredPort: 19740, maxAttempts: 5) else {
+        guard let port = server.start(preferredPort: 0) else {
             Issue.record("Could not bind DNS server port")
             return
         }
@@ -429,7 +414,7 @@ struct SocktainerDNSQueryTests {
     @Test("AAAA query with EDNS0 OPT for a single-label name returns a well-formed NODATA")
     func aaaaQueryWithOPTForSingleLabelReturnsWellFormedNodata() async throws {
         let server = SocktainerDNSServer()
-        guard let port = server.start(preferredPort: 19750, maxAttempts: 5) else {
+        guard let port = server.start(preferredPort: 0) else {
             Issue.record("Could not bind DNS server port")
             return
         }
@@ -446,7 +431,7 @@ struct SocktainerDNSQueryTests {
     @Test("A query with EDNS0 OPT for an unknown single-label name returns a well-formed NXDOMAIN")
     func aQueryWithOPTForUnknownSingleLabelReturnsWellFormedNxdomain() async throws {
         let server = SocktainerDNSServer()
-        guard let port = server.start(preferredPort: 19760, maxAttempts: 5) else {
+        guard let port = server.start(preferredPort: 0) else {
             Issue.record("Could not bind DNS server port")
             return
         }
@@ -531,7 +516,7 @@ struct SocktainerDNSMultiHomedTests {
     @Test("End-to-end: query is answered with the address on the client's subnet")
     func endToEndAnswersFromMatchingSubnet() async throws {
         let server = SocktainerDNSServer()
-        guard let port = server.start(preferredPort: 19790, maxAttempts: 5) else {
+        guard let port = server.start(preferredPort: 0) else {
             Issue.record("Could not bind DNS server port")
             return
         }
@@ -916,7 +901,7 @@ struct RegisterDNSAliasesOnResumeTests {
             labels: ["com.docker.compose.service": "web"]
         )
         let dnsServer = SocktainerDNSServer()
-        guard let port = dnsServer.start(preferredPort: 19795, maxAttempts: 5) else {
+        guard let port = dnsServer.start(preferredPort: 0) else {
             Issue.record("Could not bind DNS server port")
             return
         }

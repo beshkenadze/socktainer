@@ -129,9 +129,9 @@ final class SocktainerDNSServer: @unchecked Sendable {
     func start(preferredPort: Int = 2054, maxAttempts: Int = 10) -> Int? {
         for offset in 0..<maxAttempts {
             let port = preferredPort + offset
-            if canBind(port: port) {
-                Thread.detachNewThread { self.serverLoop(port: port) }
-                return port
+            if let bound = bindSocket(port: port) {
+                Thread.detachNewThread { self.serverLoop(fd: bound.fd, port: bound.port) }
+                return bound.port
             }
             log.warning("[dns] port \(port) unavailable, trying \(port + 1)")
         }
@@ -139,50 +139,43 @@ final class SocktainerDNSServer: @unchecked Sendable {
         return nil
     }
 
-    private func canBind(port: Int) -> Bool {
-        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard fd >= 0 else { return false }
-        defer { Darwin.close(fd) }
-        var yes: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(port).bigEndian
-        addr.sin_addr.s_addr = INADDR_ANY
-        return withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
-            }
-        }
-    }
-
-    private func serverLoop(port: Int) {
+    /// The caller transfers ownership of the bound descriptor to the server thread.
+    private func bindSocket(port: Int) -> (fd: Int32, port: Int)? {
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else {
             log.error("[dns] socket() failed: \(String(cString: strerror(errno)))")
-            return
+            return nil
         }
-        defer { Darwin.close(fd) }
-
-        var yes: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-
+        // Do not share a UDP port with another listener, even if it enables reuse.
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = in_port_t(port).bigEndian
         addr.sin_addr.s_addr = INADDR_ANY
-
-        let bindResult = withUnsafePointer(to: &addr) {
+        let result = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        guard bindResult == 0 else {
-            log.error("[dns] bind() failed on port \(port): \(String(cString: strerror(errno)))")
-            return
+        guard result == 0 else {
+            log.warning("[dns] bind() failed on port \(port): \(String(cString: strerror(errno)))")
+            Darwin.close(fd)
+            return nil
         }
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
+        }
+        guard named == 0 else {
+            log.error("[dns] getsockname() failed: \(String(cString: strerror(errno)))")
+            Darwin.close(fd)
+            return nil
+        }
+        return (fd, Int(UInt16(bigEndian: addr.sin_port)))
+    }
+
+    private func serverLoop(fd: Int32, port: Int) {
+        defer { Darwin.close(fd) }
 
         log.info("[dns] listening on 0.0.0.0:\(port)")
 
