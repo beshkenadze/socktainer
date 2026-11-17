@@ -66,7 +66,21 @@ struct ContainerWaitLoadTests {
 
 private actor WaitCompletion {
     private(set) var finished = false
-    func finish() { finished = true }
+    private let signal: AsyncStream<Void>
+    private let continuation: AsyncStream<Void>.Continuation
+
+    init() {
+        (signal, continuation) = AsyncStream.makeStream()
+    }
+
+    func finish() {
+        finished = true
+        continuation.finish()
+    }
+
+    func wait() async {
+        for await _ in signal {}
+    }
 }
 
 private struct ChannelWaitWriter: AsyncBodyStreamWriter {
@@ -80,7 +94,7 @@ private struct ChannelWaitWriter: AsyncBodyStreamWriter {
 }
 
 extension ContainerWaitLoadTests {
-    @Test("closing the HTTP transport ends the wait and stops client calls", arguments: [ContainerWaitCondition.notRunning, .nextExit, .removed])
+    @Test("closing the HTTP transport ends the wait and stops client calls", .timeLimit(.minutes(1)), arguments: [ContainerWaitCondition.notRunning, .nextExit, .removed])
     func disconnectStopsWait(condition: ContainerWaitCondition) async throws {
         let id = UUID().uuidString
         let client = StaticSnapshotClientMock(
@@ -89,6 +103,7 @@ extension ContainerWaitLoadTests {
         let channel = NIOAsyncTestingChannel()
         let writer = ChannelWaitWriter(channel: channel)
         let completion = WaitCompletion()
+        let started = WaitCompletion()
         let (events, continuation) = AsyncStream.makeStream(of: DockerEvent.self)
         defer { continuation.finish() }
         let task = Task {
@@ -96,12 +111,14 @@ extension ContainerWaitLoadTests {
                 _ = try await ContainerWaitRoute.withDisconnectCancellation(writer: writer) {
                     if condition == .removed {
                         return try await ClientContainerService.waitForExit(id: id, condition: condition) {
-                            try await client.getContainer(id: $0)
+                            let snapshot = try await client.getContainer(id: $0)
+                            await started.finish()
+                            return snapshot
                         }
                     }
                     return await ContainerWaitRoute.resolveNotRunning(
                         containerId: id,
-                        client: WaitingClient(base: client),
+                        client: WaitingClient(base: client, started: started),
                         condition: condition,
                         events: events
                     )
@@ -109,16 +126,13 @@ extension ContainerWaitLoadTests {
             } catch {}
             await completion.finish()
         }
-        // Ensure the wait has started before closing its transport.
-        for _ in 0..<100 {
-            if await client.getCalls > 0 { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        #expect(await client.getCalls > 0)
-        try await Task.sleep(for: .milliseconds(150))
+        defer { task.cancel() }
+        await started.wait()
+        try #require(await started.finished)
         #expect(await completion.finished == false, "a connected wait must stay pending")
         try await channel.close().get()
-        try await Task.sleep(for: .milliseconds(1250))
+        // Completion can be scheduled after the test's timer when the pool is busy.
+        await completion.wait()
         #expect(await completion.finished, "disconnect must end the streaming wait task")
         let calls = await client.getCalls
         try await Task.sleep(for: .milliseconds(1150))
@@ -129,17 +143,55 @@ extension ContainerWaitLoadTests {
     }
 }
 
+/// Holds a state-watcher lookup across native cancellation. The preflight lookup passes
+/// through; native fallback lookups use `base` directly and do not enter this gate.
+private actor WaitLookupGate {
+    let entered = WaitCompletion()
+    private var released = false
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+    let completed = WaitCompletion()
+    private var preflight = true
+
+    func beforeLookup() async -> Bool {
+        if preflight {
+            preflight = false
+            return false
+        }
+        await entered.finish()
+        // An admitted transport request can finish even after its task is cancelled.
+        if !released {
+            await withCheckedContinuation { releaseWaiter = $0 }
+        }
+        return true
+    }
+
+    func release() {
+        released = true
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+}
+
 /// Keep the real service fallback in the route's source race, without a runtime connection.
 private struct WaitingClient: ClientContainerProtocol {
     let base: StaticSnapshotClientMock
     let completion: WaitCompletion?
+    let started: WaitCompletion?
+    let lookupGate: WaitLookupGate?
 
-    init(base: StaticSnapshotClientMock, completion: WaitCompletion? = nil) {
+    init(base: StaticSnapshotClientMock, completion: WaitCompletion? = nil, started: WaitCompletion? = nil, lookupGate: WaitLookupGate? = nil) {
         self.base = base
         self.completion = completion
+        self.started = started
+        self.lookupGate = lookupGate
     }
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { [] }
-    func getContainer(id: String) async throws -> ContainerSnapshot? { try await base.getContainer(id: id) }
+    func getContainer(id: String) async throws -> ContainerSnapshot? {
+        let held = await lookupGate?.beforeLookup() == true
+        let snapshot = try await base.getContainer(id: id)
+        if held { await lookupGate?.completed.finish() }
+        return snapshot
+    }
     func enforceContainerRunning(container: ContainerSnapshot) throws {}
     func start(id: String, detachKeys: String?) async throws {}
     func stop(id: String, signal: String?, timeout: Int?) async throws {}
@@ -149,7 +201,9 @@ private struct WaitingClient: ClientContainerProtocol {
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait {
         do {
             let result = try await ClientContainerService.waitForExit(id: id, condition: condition) {
-                try await base.getContainer(id: $0)
+                let snapshot = try await base.getContainer(id: $0)
+                await started?.finish()
+                return snapshot
             }
             await completion?.finish()
             return result
@@ -174,19 +228,23 @@ private final class WaitHeadReader: ChannelInboundHandler, @unchecked Sendable {
 }
 
 extension ContainerWaitLoadTests {
-    @Test("the real HTTP wait stream stops polling after its peer closes", arguments: [ContainerWaitCondition.notRunning, .nextExit, .removed], [false, true])
+    @Test(
+        "the real HTTP wait stream stops polling after its peer closes", .timeLimit(.minutes(1)), arguments: [ContainerWaitCondition.notRunning, .nextExit, .removed],
+        [false, true])
     func routeDisconnect(condition: ContainerWaitCondition, unixSocket: Bool) async throws {
         let id = UUID().uuidString
         let base = StaticSnapshotClientMock(
             snapshot: try makeContainerSnapshot(nativeId: id, networks: [], labels: [:], status: .running)
         )
         let completion = WaitCompletion()
+        let started = WaitCompletion()
+        let lookupGate = condition == .removed ? nil : WaitLookupGate()
         try await withApp(configure: { app in
             let router = app.regexRouter(with: app.logger)
             app.setRegexRouter(router)
             router.installMiddleware(on: app)
             app.storage[EventBroadcasterKey.self] = EventBroadcaster()
-            try app.register(collection: ContainerWaitRoute(client: WaitingClient(base: base, completion: completion)))
+            try app.register(collection: ContainerWaitRoute(client: WaitingClient(base: base, completion: completion, started: started, lookupGate: lookupGate)))
         }) { app in
             let socketPath = "/tmp/wait-\(UUID().uuidString).sock"
             defer { if unixSocket { try? FileManager.default.removeItem(atPath: socketPath) } }
@@ -220,17 +278,24 @@ extension ContainerWaitLoadTests {
                 try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
                 try await head.futureResult.get()
                 deadline.cancel()
-                try await Task.sleep(for: .milliseconds(150))
+                await started.wait()
+                try #require(await started.finished)
+                await lookupGate?.entered.wait()
                 #expect(await completion.finished == false)
                 try await channel.close().get()
-                // The first data probe can succeed before TCP's reset is observed;
-                // the following probe must detect it.
-                try await Task.sleep(for: .milliseconds(2500))
+                // Await native cancellation rather than racing a fixed wall-clock delay.
+                await completion.wait()
                 #expect(await completion.finished, "the real route must cancel its native wait on disconnect")
+                // A lookup admitted before cancellation may finish after the native wait.
+                let beforeRelease = await base.getCalls
+                await lookupGate?.release()
+                await lookupGate?.completed.wait()
                 let calls = await base.getCalls
+                #expect(calls == beforeRelease + (lookupGate == nil ? 0 : 1))
                 try await Task.sleep(for: .milliseconds(1150))
                 #expect(await base.getCalls == calls, "the route must leave no polling children behind")
             } catch {
+                await lookupGate?.release()
                 try? await channel.close().get()
                 await base.removeSnapshot()
                 await ContainerExitCodeStore.shared.set(id: id, code: 7)
