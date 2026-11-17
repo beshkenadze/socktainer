@@ -75,82 +75,83 @@ struct RegistrySchemeTests {
         #expect(log.urls == ["https://localhost:5000/v2/", "http://localhost:5000/v2/"])
     }
 
-    @Test("the probe tells a plain HTTP registry from an HTTPS one")
+    // TLS and redirect delegates also use the cooperative pool. Keep fixture success
+    // independent of its scheduling delay; timeout behaviour is checked separately.
+    private static func networkProbe(_ url: URL) async -> Bool {
+        await RegistryScheme.answersHTTP(url, timeout: 60)
+    }
+
+    @Test("the probe tells a plain HTTP registry from an HTTPS one", .timeLimit(.minutes(2)))
     func probeAgainstPlainHTTPServer() async throws {
         let server = try await TestServer.start(behavior: .answer)
         defer { server.stop() }
         let address = "127.0.0.1:\(server.port)"
 
-        let httpAnswers = await RegistryScheme.answersHTTP(URL(string: "http://\(address)/v2/")!)
-        let httpsAnswers = await RegistryScheme.answersHTTP(URL(string: "https://\(address)/v2/")!)
+        let httpAnswers = await Self.networkProbe(URL(string: "http://\(address)/v2/")!)
+        let httpsAnswers = await Self.networkProbe(URL(string: "https://\(address)/v2/")!)
         #expect(httpAnswers)
         #expect(!httpsAnswers)
         #expect(await RegistryScheme.scheme(forServer: address) == .http)
     }
 
-    @Test("a loopback TLS registry with an untrusted certificate keeps https")
+    @Test("a loopback TLS registry with an untrusted certificate keeps https", .timeLimit(.minutes(2)))
     func probeAcceptsAnUntrustedCertificate() async throws {
         let server = try await TestServer.start(behavior: .answer, identity: Self.untrustedIdentity())
         defer { server.stop() }
         let address = "127.0.0.1:\(server.port)"
 
-        let httpsAnswers = await RegistryScheme.answersHTTP(URL(string: "https://\(address)/v2/")!)
+        let httpsAnswers = await Self.networkProbe(URL(string: "https://\(address)/v2/")!)
         #expect(httpsAnswers)
-        #expect(await RegistryScheme.scheme(forServer: address) == .https)
+        #expect(await RegistryScheme.scheme(forServer: address, probe: Self.networkProbe) == .https)
     }
 
-    @Test("the probe returns at the response head when the server sends no body")
+    @Test("the probe returns at the response head when the server sends no body", .timeLimit(.minutes(2)))
     func probeReturnsAtTheResponseHead() async throws {
         let server = try await TestServer.start(behavior: .headWithoutBody)
         defer { server.stop() }
 
-        let clock = ContinuousClock()
-        let start = clock.now
-        let answers = await RegistryScheme.answersHTTP(URL(string: "http://127.0.0.1:\(server.port)/v2/")!, timeout: 5)
+        let answers = await Self.networkProbe(URL(string: "http://127.0.0.1:\(server.port)/v2/")!)
         #expect(answers)
-        #expect(clock.now - start < .seconds(2))
     }
 
-    @Test("the probe stops at its timeout while a server sends the response head slowly")
+    @Test("the probe stops at its timeout while a server sends the response head slowly", .timeLimit(.minutes(1)))
     func probeStopsAtItsTimeout() async throws {
         let server = try await TestServer.start(behavior: .slowHead)
         defer { server.stop() }
 
-        let clock = ContinuousClock()
-        let start = clock.now
         let answers = await RegistryScheme.answersHTTP(URL(string: "http://127.0.0.1:\(server.port)/v2/")!, timeout: 1)
         #expect(!answers)
-        #expect(clock.now - start < .seconds(3))
+        #expect(server.requests == 1)
+        #expect(!server.closedAfterTrickle, "the probe must stop before the server closes its unfinished response")
     }
 
-    @Test("the probe stops at its timeout while a server sends only informational responses")
+    @Test("the probe stops at its timeout while a server sends only informational responses", .timeLimit(.minutes(1)))
     func probeStopsAtItsTimeoutDuringInformationalResponses() async throws {
         let server = try await TestServer.start(behavior: .informationalOnly)
         defer { server.stop() }
 
-        let clock = ContinuousClock()
-        let start = clock.now
         let answers = await RegistryScheme.answersHTTP(URL(string: "http://127.0.0.1:\(server.port)/v2/")!, timeout: 1)
         #expect(!answers)
-        #expect(clock.now - start < .seconds(3))
+        #expect(server.requests == 1)
+        #expect(!server.closedAfterTrickle, "the probe must stop before the server closes its unfinished response")
     }
 
-    @Test("the probe does not use a proxy")
-    func probeDoesNotUseAProxy() {
-        let configuration = RegistryScheme.probeConfiguration(timeout: 5)
+    @Test("the probe does not use a proxy", arguments: [1.0, 5.0])
+    func probeDoesNotUseAProxy(timeout: TimeInterval) {
+        let configuration = RegistryScheme.probeConfiguration(timeout: timeout)
         #expect(configuration.connectionProxyDictionary?.isEmpty == true)
-        #expect(configuration.timeoutIntervalForRequest == 5)
-        #expect(configuration.timeoutIntervalForResource == 5)
+        #expect(configuration.timeoutIntervalForRequest == timeout)
+        #expect(configuration.timeoutIntervalForResource == timeout)
     }
 
-    @Test("the probe does not follow a redirect")
+    @Test("the probe does not follow a redirect", .timeLimit(.minutes(2)))
     func probeDoesNotFollowRedirects() async throws {
         let target = try await TestServer.start(behavior: .answer)
         defer { target.stop() }
         let server = try await TestServer.start(behavior: .redirect(to: "http://127.0.0.1:\(target.port)/elsewhere"))
         defer { server.stop() }
 
-        let answers = await RegistryScheme.answersHTTP(URL(string: "http://127.0.0.1:\(server.port)/v2/")!)
+        let answers = await Self.networkProbe(URL(string: "http://127.0.0.1:\(server.port)/v2/")!)
         #expect(answers)
         #expect(server.requests == 1)
         #expect(target.requests == 0)
@@ -182,6 +183,7 @@ private final class TestServer: @unchecked Sendable {
     let port: UInt16
 
     var requests: Int { received.count }
+    var closedAfterTrickle: Bool { received.closedAfterTrickle }
 
     private init(listener: NWListener, received: Received, port: UInt16) {
         self.listener = listener
@@ -216,9 +218,10 @@ private final class TestServer: @unchecked Sendable {
                     connection.send(content: Data("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n".utf8), completion: .contentProcessed { _ in })
                 case .slowHead:
                     let start = Data("HTTP/1.1 200 OK\r\nX-Slow: ".utf8)
-                    connection.send(content: start, completion: .contentProcessed { _ in trickle(connection, queue: queue, chunk: Data("x".utf8), remaining: 50) })
+                    connection.send(
+                        content: start, completion: .contentProcessed { _ in trickle(connection, queue: queue, chunk: Data("x".utf8), remaining: 15, received: received) })
                 case .informationalOnly:
-                    trickle(connection, queue: queue, chunk: Data("HTTP/1.1 103 Early Hints\r\nLink: </v2/>; rel=preload\r\n\r\n".utf8), remaining: 50)
+                    trickle(connection, queue: queue, chunk: Data("HTTP/1.1 103 Early Hints\r\nLink: </v2/>; rel=preload\r\n\r\n".utf8), remaining: 15, received: received)
                 case .redirect(let location):
                     let response = Data("HTTP/1.1 302 Found\r\nLocation: \(location)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
                     connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
@@ -245,8 +248,11 @@ private final class TestServer: @unchecked Sendable {
         return TestServer(listener: listener, received: received, port: port)
     }
 
-    private static func trickle(_ connection: NWConnection, queue: DispatchQueue, chunk: Data, remaining: Int) {
+    // Fifteen chunks close the unfinished response after about 3 seconds: after the
+    // tested 1-second timeout, but before the default 5-second timeout.
+    private static func trickle(_ connection: NWConnection, queue: DispatchQueue, chunk: Data, remaining: Int, received: Received) {
         guard remaining > 0 else {
+            received.closeAfterTrickle()
             connection.cancel()
             return
         }
@@ -255,7 +261,7 @@ private final class TestServer: @unchecked Sendable {
                 content: chunk,
                 completion: .contentProcessed { error in
                     guard error == nil else { return }
-                    trickle(connection, queue: queue, chunk: chunk, remaining: remaining - 1)
+                    trickle(connection, queue: queue, chunk: chunk, remaining: remaining - 1, received: received)
                 }
             )
         }
@@ -268,6 +274,10 @@ private final class TestServer: @unchecked Sendable {
 
 private final class Received: Sendable {
     private let value = Mutex(0)
+    private let closed = Mutex(false)
+
+    var closedAfterTrickle: Bool { closed.withLock { $0 } }
+    func closeAfterTrickle() { closed.withLock { $0 = true } }
 
     var count: Int { value.withLock { $0 } }
 
