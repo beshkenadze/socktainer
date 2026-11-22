@@ -35,10 +35,23 @@ struct ContainerRenameRouteTests {
         containers: [ContainerSnapshot],
         refusesDelete: Bool = false,
         listFails: Bool = false,
+        files: [String: [String]] = [:],
+        appRootFails: Bool = false,
         recreate: (@Sendable (RenameContainerStore, ContainerConfiguration) async throws -> Void)? = nil,
         test: @escaping (Application, RenameContainerStore) async throws -> Void
     ) async throws {
         let store = RenameContainerStore(containers: containers, refusesDelete: refusesDelete, listFails: listFails)
+        // The runtime's app root: each container has the directory of one that was created and
+        // never started, unless `files` gives it other files.
+        let appRoot = FileManager.default.temporaryDirectory.appendingPathComponent("rename-root-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: appRoot) }
+        for container in containers {
+            let directory = appRoot.appendingPathComponent("containers").appendingPathComponent(container.id)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            for name in files[container.id] ?? RenameSafety.createdOnlyLayout {
+                try Data("{}".utf8).write(to: directory.appendingPathComponent(name))
+            }
+        }
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
@@ -53,6 +66,10 @@ struct ContainerRenameRouteTests {
                         } else {
                             await store.add(configuration)
                         }
+                    },
+                    runtimeAppRoot: {
+                        if appRootFails { throw RenameFailure() }
+                        return appRoot
                     }
                 )
             )
@@ -265,6 +282,51 @@ struct ContainerRenameRouteTests {
             try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
                 #expect(res.status == .serviceUnavailable)
                 #expect(res.body.string.contains("the container list could not be read"))
+            }
+            #expect(await store.deleted.isEmpty)
+        }
+    }
+
+    @Test(
+        "A container that has run is refused before anything is deleted, and keeps its files",
+        arguments: [
+            ["config.json", "runtime-configuration.json"],
+            ["rootfs.ext4", "runtime-configuration.json"],
+            ["runtime-configuration.json", "vminitd.log"],
+            ["runtime-configuration.json", "service.plist"],
+        ])
+    func startedContainerIsRefused(files: [String]) async throws {
+        try await withRoute(containers: [Self.snapshot(id: "web", status: .stopped)], files: ["web": files]) { app, store in
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
+                #expect(res.status == .conflict)
+                #expect(res.body.string.contains("a container that has run would lose its files and logs"))
+                #expect(res.body.string.contains("docker cp"))
+            }
+            #expect(await store.deleted.isEmpty)
+            #expect(await store.names() == ["web"])
+        }
+    }
+
+    @Test("A runtime app root that cannot be read refuses the rename")
+    func unknownAppRootRefuses() async throws {
+        try await withRoute(containers: [Self.snapshot(id: "web", status: .stopped)], appRootFails: true) { app, store in
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
+                #expect(res.status == .conflict)
+                #expect(res.body.string.contains("the runtime's app root could not be read"))
+            }
+            #expect(await store.deleted.isEmpty)
+        }
+    }
+
+    @Test("A container with an exit record in the bridge is refused")
+    func exitRecordRefuses() async throws {
+        let id = "ran-\(UUID().uuidString.prefix(8).lowercased())"
+        await ContainerExitCodeStore.shared.set(id: id, code: 0)
+        defer { Task { await ContainerExitCodeStore.shared.remove(id: id) } }
+        try await withRoute(containers: [Self.snapshot(id: id, status: .stopped)]) { app, store in
+            try await app.testing().test(.POST, "/v1.51/containers/\(id)/rename?name=\(id)-old") { res async in
+                #expect(res.status == .conflict)
+                #expect(res.body.string.contains("the bridge has its exit record"))
             }
             #expect(await store.deleted.isEmpty)
         }
