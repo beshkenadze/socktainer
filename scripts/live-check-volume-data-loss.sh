@@ -4,23 +4,28 @@
 #
 #   C=<container CLI> scripts/live-check-volume-data-loss.sh <socktainer binary>
 #
+# For a host where nobody else creates containers or volumes whose names start with vdl- during
+# the run: the script checks that its names are free before it starts, and an object that
+# another actor makes under one of them in between would be taken as its own.
+#
 # Checks (each prints PASS or FAIL):
 #   D-1        a Postgres create on a volume that holds data and /lost+found keeps the data;
 #   D-2        a create on a volume that a running container uses keeps that container's writes;
+#   rejected   a Postgres create that the runtime rejects leaves the volume image byte-identical;
 #   copy-up    a new volume mounted over an image directory gets that directory's contents;
 #   postgres   Postgres initialises on a new volume mounted at its PGDATA;
-#   two-a      a plain service, then Postgres, created one after the other on one new volume:
-#              Postgres initialises;
+#   two-a      a plain service, then Postgres, created one after the other on one new volume;
 #   two-b      the same in the other order;
-#   nocopy-v   `-v vol:/path:nocopy` starts, and the volume stays empty;
-#   nocopy-m   `--mount ...,volume-nocopy=true` leaves the volume empty.
+#   holder     Postgres on a volume that a never-started container names: it initialises, or the
+#              create warns that the volume was not prepared (the stated difference from 166bbd5);
+#   nocopy-v   `-v vol:/path:nocopy` starts, and the volume does not get the image's directory;
+#   nocopy-m   `--mount ...,volume-nocopy=true` does not get it either.
 #
-# Every object carries a random suffix and is recorded when it is made; the cleanup trap removes
-# only recorded objects. Any failed setup step stops the run with status 2. Exit status: 0 when
-# every check passed, 1 when one failed, 2 when the run could not complete.
+# Exit status: 0 when every check passed, 1 when one failed, 2 when the run could not complete.
 # PG_IMAGE (default postgres:17-alpine) is pulled if it is not there.
 
 set -u
+unset DOCKER_CONTEXT DOCKER_HOST
 BRIDGE=${1:?usage: C=<container CLI> $0 <socktainer binary>}
 C=${C:-container}
 IMG=${IMG:-busybox:1.37-musl}
@@ -33,50 +38,80 @@ VOLUMES=()
 RESULT=0
 BRIDGE_PID=
 
+d() { docker --host "unix://$SOCK" "$@"; }
+
 cleanup() {
-    local name
-    for name in "${CONTAINERS[@]+"${CONTAINERS[@]}"}"; do
-        docker rm -f -v "$name" >/dev/null 2>&1 || "$C" delete --force "$name" >/dev/null 2>&1
+    local n
+    for n in "${CONTAINERS[@]+"${CONTAINERS[@]}"}"; do
+        d rm -f -v "$n" >/dev/null 2>&1 || "$C" delete --force "$n" >/dev/null 2>&1
     done
-    for name in "${VOLUMES[@]+"${VOLUMES[@]}"}"; do
-        docker volume rm -f "$name" >/dev/null 2>&1 || "$C" volume delete "$name" >/dev/null 2>&1
+    for n in "${VOLUMES[@]+"${VOLUMES[@]}"}"; do
+        d volume rm -f "$n" >/dev/null 2>&1 || "$C" volume delete "$n" >/dev/null 2>&1
     done
     [[ -n "$BRIDGE_PID" ]] && kill "$BRIDGE_PID" 2>/dev/null && wait "$BRIDGE_PID" 2>/dev/null
     rm -f -- "$SOCK"
     echo "bridge log: $WORK/bridge.txt"
 }
 trap cleanup EXIT
+trap 'exit 2' INT TERM
 
 die() { echo "ERROR: $*" >&2; exit 2; }
 result() { echo "$1: $2 - $3"; [[ "$2" == PASS ]] || RESULT=1; }
 name() { printf 'vdl-%s-%s' "$RUN" "$1"; }
 
-# Make a volume or a container and record it. Any failure stops the run.
-cli_volume() { "$C" volume create "$1" >/dev/null || die "container volume create $1"; VOLUMES+=("$1"); }
-docker_volume() { docker volume create "$1" >/dev/null || die "docker volume create $1"; VOLUMES+=("$1"); }
-docker_create() { # name args...
+# Every name this run uses. Checked before anything is made.
+SUFFIXES=(d1 d1c d2 d2a d2b rj rjc rjh cu cuc pg pgc ta tap taa tb tbp tba ho hoh hop ncv ncvc ncm ncmc)
+status="$("$C" system status 2>/dev/null)" || die "the container system does not answer"
+ROOT="$(printf '%s\n' "$status" | awk '$1 == "paths.appRoot" { sub(/^[^ ]+ +/, ""); print }')"
+ROOT="${ROOT%/}"
+[[ -n "$ROOT" && -d "$ROOT" ]] || die "the daemon reports no usable app root"
+listing="$("$C" list --all --format json)" || die "container list failed"
+listing+="$("$C" volume list --format json)" || die "container volume list failed"
+for s in "${SUFFIXES[@]}"; do
+    n=$(name "$s")
+    printf '%s' "$listing" | grep -qi -- "\"$n\"" && die "$n exists"
+    [[ -e "$ROOT/containers/$n" || -e "$ROOT/volumes/$n" ]] && die "$n exists under $ROOT"
+done
+
+# Make an object and record it only when this run's own create made it. Any failure stops the run.
+new_volume() { # name: created through the bridge; refused when the name exists right before
+    d volume inspect "$1" >/dev/null 2>&1 && die "volume $1 appeared during the run"
+    d volume create "$1" >/dev/null || die "docker volume create $1"
+    VOLUMES+=("$1")
+}
+cli_volume() {
+    "$C" volume create "$1" >/dev/null || die "container volume create $1"
+    VOLUMES+=("$1")
+}
+new_container() { # name args... -> 0 when created, 1 when the create was refused
     local n=$1
     shift
-    docker create --name "$n" "$@" >/dev/null 2>"$WORK/$n.create.txt" || die "docker create $n: $(cat "$WORK/$n.create.txt")"
-    CONTAINERS+=("$n")
+    if d create --name "$n" "$@" >/dev/null 2>"$WORK/$n.create.txt"; then
+        CONTAINERS+=("$n")
+        return 0
+    fi
+    return 1
 }
-docker_start() { docker start "$1" >/dev/null 2>&1 || die "docker start $1"; }
-# The names in a volume's root, read with the runtime CLI.
-volume_ls() { "$C" run --rm -v "$1:/v" "$IMG" ls -A /v 2>/dev/null | tr '\n' ' '; }
-pg_ready() { # container: waits up to 90 s for Postgres to accept connections
+must_create() { new_container "$@" || die "docker create $1: $(cat "$WORK/$1.create.txt")"; }
+must_start() { d start "$1" >/dev/null 2>&1 || die "docker start $1"; }
+# A file's content in a volume, read with the runtime CLI. Prints nothing and fails when the
+# read fails, so a check cannot pass on a failed read.
+volume_cat() { "$C" run --rm -v "$1:/v" "$IMG" cat "/v/$2" 2>/dev/null; }
+volume_has() { "$C" run --rm -v "$1:/v" "$IMG" test -e "/v/$2" 2>/dev/null; }
+volume_lacks() { "$C" run --rm -v "$1:/v" "$IMG" sh -c "ls -A /v >/dev/null && test ! -e /v/$2" 2>/dev/null; }
+pg_initialised() { # container: true once the final server (not the init server) accepts connections
     local i
-    for i in $(seq 1 90); do
-        docker logs "$1" 2>&1 | grep -q "database system is ready to accept connections" && return 0
-        docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -q true || return 1
+    for i in $(seq 1 120); do
+        if d logs "$1" 2>&1 | grep -q "PostgreSQL init process complete" && d exec "$1" pg_isready -q 2>/dev/null; then
+            return 0
+        fi
+        d inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -q true || return 1
         sleep 1
     done
     return 1
 }
+pg_why() { d logs "$1" 2>&1 | grep -iE "initdb|error|lost\+found|not empty" | head -2 | tr '\n' ' '; }
 
-for n in d1 d2 d2a d2b cu cuc pg pgc ta tap taa tb tbp tba ncv ncvc ncm ncmc; do
-    "$C" list --all --quiet 2>/dev/null | grep -qix "$(name $n)" && die "$(name $n) exists"
-    "$C" volume list --quiet 2>/dev/null | grep -qix "$(name $n)" && die "volume $(name $n) exists"
-done
 "$C" image inspect "$PG_IMAGE" >/dev/null 2>&1 || "$C" image pull "$PG_IMAGE" >/dev/null || die "cannot pull $PG_IMAGE"
 "$C" image inspect "$IMG" >/dev/null 2>&1 || "$C" image pull "$IMG" >/dev/null || die "cannot pull $IMG"
 
@@ -84,85 +119,114 @@ done
 BRIDGE_PID=$!
 for _ in $(seq 1 60); do [[ -S "$SOCK" ]] && break; sleep 0.5; done
 [[ -S "$SOCK" ]] || die "the bridge did not start; see $WORK/bridge.txt"
-export DOCKER_HOST=unix://$SOCK
-echo "run $RUN, bridge $BRIDGE, work $WORK"
+echo "run $RUN, bridge $BRIDGE, root $ROOT, work $WORK"
+PG=(-e POSTGRES_PASSWORD=x -e PGDATA=/var/lib/postgresql/data)
 
 # D-1: data written outside the bridge keeps /lost+found next to it.
 v=$(name d1)
 cli_volume "$v"
 "$C" run --rm -v "$v:/v" "$IMG" sh -c 'echo keep > /v/keep && sync' >/dev/null 2>&1 || die "writing into $v"
-docker_create "$(name d1)c" -e PGDATA=/var/lib/postgresql/data -v "$v:/var/lib/postgresql/data" "$IMG" true
-after=$(volume_ls "$v")
-[[ " $after" == *" keep "* ]] && result D-1 PASS "the data stayed ($after)" || result D-1 FAIL "the data was erased ($after)"
+must_create "$(name d1c)" -e PGDATA=/var/lib/postgresql/data -v "$v:/var/lib/postgresql/data" "$IMG" true
+[[ "$(volume_cat "$v" keep)" == keep ]] && result D-1 PASS "the data stayed" || result D-1 FAIL "the data was erased"
 
 # D-2: a second create on a volume that a running container uses.
 v=$(name d2)
-docker_volume "$v"
-docker_create "$(name d2a)" -v "$v:/data" "$IMG" sleep 600
-docker_start "$(name d2a)"
-docker_create "$(name d2b)" -v "$v:/etc" "$IMG" true
-docker exec "$(name d2a)" sh -c 'echo important > /data/x && sync' || die "writing in $(name d2a)"
-docker stop -t 1 "$(name d2a)" >/dev/null 2>&1 || die "docker stop $(name d2a)"
-after=$(volume_ls "$v")
-[[ " $after" == *" x "* ]] && result D-2 PASS "the running container's write stayed ($after)" ||
-    result D-2 FAIL "the volume image was replaced under a running container ($after)"
+new_volume "$v"
+must_create "$(name d2a)" -v "$v:/data" "$IMG" sleep 600
+must_start "$(name d2a)"
+must_create "$(name d2b)" -v "$v:/etc" "$IMG" true
+d exec "$(name d2a)" sh -c 'echo important > /data/x && sync' || die "writing in $(name d2a)"
+d stop -t 1 "$(name d2a)" >/dev/null 2>&1 || die "docker stop $(name d2a)"
+[[ "$(volume_cat "$v" x)" == important ]] && result D-2 PASS "the running container's write stayed" ||
+    result D-2 FAIL "the volume image was replaced under a running container"
+
+# rejected: a create that the runtime refuses (its name is taken) changes no volume.
+v=$(name rj)
+new_volume "$v"
+image="$ROOT/volumes/$v/volume.img"
+must_create "$(name rjh)" "$IMG" true
+# The image's identity (inode, size, modification time) and its first 64 MiB, which hold the
+# superblock, the group descriptors and the root directory. Hashing all of a sparse 512 GiB image
+# would take hours; a replacement changes the inode anyway.
+fingerprint() { stat -f '%i %z %m' "$1" && head -c $((64 * 1024 * 1024)) "$1" | shasum | cut -d' ' -f1; }
+before=$(fingerprint "$image") || die "cannot read $image"
+if new_container "$(name rjh)" "${PG[@]}" -v "$v:/var/lib/postgresql/data" "$PG_IMAGE"; then
+    result rejected FAIL "the duplicate create was accepted"
+else
+    after=$(fingerprint "$image")
+    [[ "$before" == "$after" ]] && result rejected PASS "the image is byte-identical" ||
+        result rejected FAIL "the rejected create changed the image"
+fi
 
 # copy-up: a new volume over an image directory gets its contents.
 v=$(name cu)
-docker_volume "$v"
-docker_create "$(name cuc)" -v "$v:/etc" "$IMG" true
-after=$(volume_ls "$v")
-[[ " $after" == *" passwd "* ]] && result copy-up PASS "the image's /etc arrived ($after)" || result copy-up FAIL "the volume holds: $after"
+new_volume "$v"
+must_create "$(name cuc)" -v "$v:/etc" "$IMG" true
+volume_has "$v" passwd && result copy-up PASS "the image's /etc arrived" || result copy-up FAIL "the volume lacks /etc/passwd"
 
 # postgres: initialises on a new volume at its PGDATA.
 v=$(name pg)
-docker_volume "$v"
-docker_create "$(name pgc)" -e POSTGRES_PASSWORD=x -e PGDATA=/var/lib/postgresql/data -v "$v:/var/lib/postgresql/data" "$PG_IMAGE"
-docker_start "$(name pgc)"
-pg_ready "$(name pgc)" && result postgres PASS "initialised" ||
-    result postgres FAIL "$(docker logs "$(name pgc)" 2>&1 | grep -iE "initdb|error|lost\+found" | head -2 | tr '\n' ' ')"
-docker stop -t 5 "$(name pgc)" >/dev/null 2>&1
+new_volume "$v"
+must_create "$(name pgc)" "${PG[@]}" -v "$v:/var/lib/postgresql/data" "$PG_IMAGE"
+must_start "$(name pgc)"
+pg_initialised "$(name pgc)" && result postgres PASS "initialised" || result postgres FAIL "$(pg_why "$(name pgc)")"
+d stop -t 5 "$(name pgc)" >/dev/null 2>&1
 
 # two-a and two-b: two services on one new volume, created one after the other. The plain
 # service mounts a path that its image does not have, so its copy-up brings nothing.
 two() { # label first second
-    local label=$1 first=$2 second=$3 vol pgname
+    local label=$1 first=$2 second=$3 vol pgname svc
     vol=$(name "$label")
-    docker_volume "$vol"
+    new_volume "$vol"
     pgname=$(name "${label}p")
     for svc in "$first" "$second"; do
         if [[ "$svc" == postgres ]]; then
-            docker_create "$pgname" -e POSTGRES_PASSWORD=x -e PGDATA=/var/lib/postgresql/data -v "$vol:/var/lib/postgresql/data" "$PG_IMAGE"
+            must_create "$pgname" "${PG[@]}" -v "$vol:/var/lib/postgresql/data" "$PG_IMAGE"
         else
-            docker_create "$(name "${label}a")" -v "$vol:/no-such-dir" "$IMG" true
+            must_create "$(name "${label}a")" -v "$vol:/no-such-dir" "$IMG" true
         fi
     done
-    docker_start "$pgname"
-    pg_ready "$pgname" && result "two-$label" PASS "$first then $second: Postgres initialised" ||
-        result "two-$label" FAIL "$first then $second: $(docker logs "$pgname" 2>&1 | grep -iE "initdb|error|lost\+found" | head -2 | tr '\n' ' ')"
-    docker stop -t 5 "$pgname" >/dev/null 2>&1
+    must_start "$pgname"
+    pg_initialised "$pgname" && result "two-$label" PASS "$first then $second: initialised" ||
+        result "two-$label" FAIL "$first then $second: $(pg_why "$pgname")"
+    d stop -t 5 "$pgname" >/dev/null 2>&1
 }
 two ta plain postgres
 two tb postgres plain
 
+# holder: a never-started container made with the runtime CLI names a new volume.
+v=$(name ho)
+cli_volume "$v"
+"$C" create --name "$(name hoh)" -v "$v:/data" "$IMG" true >/dev/null 2>&1 || die "container create $(name hoh)"
+CONTAINERS+=("$(name hoh)")
+must_create "$(name hop)" "${PG[@]}" -v "$v:/var/lib/postgresql/data" "$PG_IMAGE"
+warned=no
+grep -q "was not prepared" "$WORK/$(name hop).create.txt" && warned=yes
+must_start "$(name hop)"
+if pg_initialised "$(name hop)"; then
+    result holder PASS "initialised (warning shown: $warned)"
+elif [[ $warned == yes ]]; then
+    result holder PASS "did not initialise, and the create warned: $(grep -o 'volume "[^"]*" was not prepared ([^)]*)' "$WORK/$(name hop).create.txt")"
+else
+    result holder FAIL "did not initialise and gave no warning: $(pg_why "$(name hop)")"
+fi
+d stop -t 5 "$(name hop)" >/dev/null 2>&1
+
 # nocopy, both forms.
 v=$(name ncv)
-docker_volume "$v"
-if docker run --name "$(name ncvc)" -v "$v:/etc:nocopy" "$IMG" true >"$WORK/ncv.txt" 2>&1; then
-    CONTAINERS+=("$(name ncvc)")
-    after=$(volume_ls "$v")
-    [[ " $after" != *" passwd "* ]] && result nocopy-v PASS "started, the volume holds: ${after:-nothing}" ||
-        result nocopy-v FAIL "the image's /etc was copied in ($after)"
+new_volume "$v"
+must_create "$(name ncvc)" -v "$v:/etc:nocopy" "$IMG" true
+if d start -a "$(name ncvc)" >"$WORK/ncv.txt" 2>&1; then
+    volume_lacks "$v" passwd && result nocopy-v PASS "started; the volume has no /etc/passwd" ||
+        result nocopy-v FAIL "the image's /etc was copied in, or the volume could not be read"
 else
-    CONTAINERS+=("$(name ncvc)")
     result nocopy-v FAIL "the container did not start: $(grep -o 'mount failed[^"]*' "$WORK/ncv.txt" | head -1)"
 fi
 v=$(name ncm)
-docker_volume "$v"
-docker_create "$(name ncmc)" --mount "type=volume,src=$v,dst=/etc,volume-nocopy=true" "$IMG" true
-after=$(volume_ls "$v")
-[[ " $after" != *" passwd "* ]] && result nocopy-m PASS "the volume holds: ${after:-nothing}" ||
-    result nocopy-m FAIL "the image's /etc was copied in ($after)"
+new_volume "$v"
+must_create "$(name ncmc)" --mount "type=volume,src=$v,dst=/etc,volume-nocopy=true" "$IMG" true
+volume_lacks "$v" passwd && result nocopy-m PASS "the volume has no /etc/passwd" ||
+    result nocopy-m FAIL "the image's /etc was copied in, or the volume could not be read"
 
-grep -h "volume-copyup\|volume-clean" "$WORK/bridge.txt" | sed 's/^/bridge: /' | cut -c1-220
+grep -h "volume-prepare\|volume-copyup\|volume-clean" "$WORK/bridge.txt" | sed 's/^/bridge: /' | cut -c1-220
 exit $RESULT
