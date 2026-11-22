@@ -34,6 +34,19 @@ enum VolumeImageCleaner {
         return true
     }
 
+    /// Whether a create cleans /lost+found from this volume: a Postgres container, an EXT4 volume
+    /// that holds nothing but /lost+found (Postgres refuses to initialise over it), and no other
+    /// container configuration that names the volume (one may hold the image). A volume with data
+    /// keeps /lost+found: Postgres only refuses it when it initialises an empty directory.
+    static func shouldClean(
+        mergedEnv: [String], name: String, format: String, source: String, labels: [String: String],
+        named: VolumeImageWriters.Named
+    ) -> Bool {
+        isPostgresDataVolume(mergedEnv: mergedEnv) && format == "ext4" && isEnabled(labels: labels)
+            && VolumeCopyUp.isEmpty(volumeImagePath: source)
+            && VolumeImageWriters.mayWrite(name: name, source: source, named: named)
+    }
+
     /// Reformats the EXT4 block image at `imagePath`, removing `/lost+found`.
     /// Skips non-regular-files, non-EXT4 images, and images already without it.
     static func removeLostFound(imagePath: String, logger: Logger) {
@@ -55,6 +68,13 @@ enum VolumeImageCleaner {
         }
 
         let path = FilePath(imagePath)
+
+        // The formatter below writes a new, empty filesystem over the image. Only an image that
+        // holds nothing but /lost+found may get it: anything else would be erased.
+        guard VolumeCopyUp.isEmpty(volumeImagePath: imagePath) else {
+            logger.warning("[volume-clean] skip: \(imagePath) holds data; /lost+found stays")
+            return
+        }
 
         // Idempotency + safety: skip if not EXT4 or already clean.
         do {

@@ -12,6 +12,15 @@ import SystemPackage
 /// instead, which is why an image like Postgres cannot initialise its own data
 /// directory on a new volume.
 enum VolumeCopyUp {
+    /// The candidates whose image the copy-up may replace: those that no other container
+    /// configuration names, in any state. A container's status does not prove that it has let go
+    /// of its disks, so a stopped one counts too; such a volume is left as it is.
+    static func targets(
+        _ candidates: [(source: String, destination: String, name: String)], named: VolumeImageWriters.Named
+    ) -> [(source: String, destination: String, name: String)] {
+        candidates.filter { VolumeImageWriters.mayWrite(name: $0.name, source: $0.source, named: named) }
+    }
+
     /// True when the volume holds nothing but what a freshly formatted EXT4 image
     /// always carries. Copy-up applies to empty volumes only: Docker leaves a
     /// volume that already has contents alone.
