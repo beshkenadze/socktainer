@@ -36,13 +36,14 @@ struct ContainerRenameRouteTests {
         refusesDelete: Bool = false,
         listFails: Bool = false,
         hidden: Set<String> = [],
+        failAtCall: Int? = nil,
         files: [String: [String]] = [:],
         appRootFails: Bool = false,
         appRootNeverAnswers: NeverAnswered? = nil,
         recreate: (@Sendable (RenameContainerStore, ContainerConfiguration) async throws -> Void)? = nil,
         test: @escaping (Application, RenameContainerStore) async throws -> Void
     ) async throws {
-        let store = RenameContainerStore(containers: containers, refusesDelete: refusesDelete, listFails: listFails, hidden: hidden)
+        let store = RenameContainerStore(containers: containers, refusesDelete: refusesDelete, listFails: listFails, hidden: hidden, failAtCall: failAtCall)
         // The runtime's app root: each container has the directory of one that was created and
         // never started, unless `files` gives it other files.
         let appRoot = FileManager.default.temporaryDirectory.appendingPathComponent("rename-root-\(UUID().uuidString)")
@@ -281,6 +282,18 @@ struct ContainerRenameRouteTests {
         }
     }
 
+    @Test("A failure of any lookup before the delete answers 503 and changes nothing", arguments: [1, 2, 3])
+    func everyLookupFailureIs503(failAtCall: Int) async throws {
+        try await withRoute(containers: [Self.snapshot(id: "web", status: .stopped)], failAtCall: failAtCall) { app, store in
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
+                #expect(res.status == .serviceUnavailable, "call \(failAtCall)")
+                #expect(res.body.string.contains("the container list could not be read"))
+            }
+            #expect(await store.deleted.isEmpty)
+            #expect(await store.names() == ["web"])
+        }
+    }
+
     @Test("A case-only rename of the same container is not refused by the name check")
     func caseOnlyRenameOfTheSameContainer() async throws {
         try await withRoute(containers: [Self.snapshot(id: "web", status: .stopped)]) { app, store in
@@ -461,13 +474,23 @@ private actor RenameContainerStore {
     private let listFails: Bool
     /// Containers that the runtime lists but the Docker listing hides (DNS sidecars, plugin-owned).
     let hidden: Set<String>
+    /// The lookup or list call (counted from 1) that fails, as a runtime that does not answer.
+    private let failAtCall: Int?
+    private var calls = 0
     private(set) var deleted: [String] = []
 
-    init(containers: [ContainerSnapshot], refusesDelete: Bool, listFails: Bool = false, hidden: Set<String> = []) {
+    init(containers: [ContainerSnapshot], refusesDelete: Bool, listFails: Bool = false, hidden: Set<String> = [], failAtCall: Int? = nil) {
         self.containers = containers
         self.refusesDelete = refusesDelete
         self.listFails = listFails
         self.hidden = hidden
+        self.failAtCall = failAtCall
+    }
+
+    /// Counts a lookup or list call; throws at `failAtCall`.
+    func call() throws {
+        calls += 1
+        if calls == failAtCall { throw RenameFailure() }
     }
 
     func all() throws -> [ContainerSnapshot] {
@@ -496,9 +519,18 @@ private actor RenameContainerStore {
 private struct RenameMock: ClientContainerProtocol {
     let store: RenameContainerStore
 
-    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { try await store.visible() }
-    func listEveryRuntimeContainer() async throws -> [ContainerSnapshot] { try await store.all() }
-    func getContainer(id: String) async throws -> ContainerSnapshot? { await store.get(id) }
+    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
+        try await store.call()
+        return try await store.visible()
+    }
+    func listEveryRuntimeContainer() async throws -> [ContainerSnapshot] {
+        try await store.call()
+        return try await store.all()
+    }
+    func getContainer(id: String) async throws -> ContainerSnapshot? {
+        try await store.call()
+        return await store.get(id)
+    }
     func enforceContainerRunning(container: ContainerSnapshot) throws {}
     func start(id: String, detachKeys: String?) async throws {}
     func stop(id: String, signal: String?, timeout: Int?) async throws {}

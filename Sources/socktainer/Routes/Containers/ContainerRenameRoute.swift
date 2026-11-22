@@ -80,7 +80,24 @@ struct ContainerRenameRoute: RouteCollection {
             // those straight back.
             let newName = ContainerNameUtility.sanitize(requestedName.hasPrefix("/") ? String(requestedName.dropFirst()) : requestedName)
 
-            guard let container = try await client.getContainer(id: id) else {
+            // Every list or lookup before the delete: a failure stops the rename with the same 503,
+            // and nothing is changed. A ClientContainerError (an ambiguous ID, an invalid name) is
+            // the lookup's answer, not a failure, and keeps its own status.
+            func lookup<T>(_ body: () async throws -> T) async throws -> T {
+                do {
+                    return try await body()
+                } catch let answer as ClientContainerError {
+                    throw answer
+                } catch {
+                    req.logger.error("Failed to look up containers before renaming \(id): \(error)")
+                    throw Abort(
+                        .serviceUnavailable,
+                        reason: "Cannot rename container \(id): the container list could not be read (\(error)). Nothing was changed"
+                    )
+                }
+            }
+
+            guard let container = try await lookup({ try await client.getContainer(id: id) }) else {
                 throw Abort(.notFound, reason: "No such container: \(id)")
             }
 
@@ -89,7 +106,7 @@ struct ContainerRenameRoute: RouteCollection {
                 return Response(status: .noContent)
             }
 
-            if try await client.getContainer(id: newName) != nil {
+            if try await lookup({ try await client.getContainer(id: newName) }) != nil {
                 throw Abort(.conflict, reason: "Conflict. The container name \"/\(newName)\" is already in use")
             }
 
@@ -112,16 +129,7 @@ struct ContainerRenameRoute: RouteCollection {
             // frees its own directory before the create. The list is the runtime's own, unfiltered:
             // a DNS sidecar or a plugin-owned container holds a directory too. A list that cannot
             // be read stops the rename.
-            let listed: [ContainerSnapshot]
-            do {
-                listed = try await client.listEveryRuntimeContainer()
-            } catch {
-                req.logger.error("Failed to list containers before renaming \(container.id): \(error)")
-                throw Abort(
-                    .serviceUnavailable,
-                    reason: "Cannot rename container \(container.id): the container list could not be read (\(error)). Nothing was changed"
-                )
-            }
+            let listed = try await lookup { try await client.listEveryRuntimeContainer() }
             if let holder = listed.first(where: { $0.id != container.id && $0.id.lowercased() == newName.lowercased() }) {
                 throw ContainerNameConflict.abort(name: newName, holderID: ContainerNameConflict.holderID(of: holder))
             }
