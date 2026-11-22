@@ -38,6 +38,7 @@ struct ContainerRenameRouteTests {
         hidden: Set<String> = [],
         files: [String: [String]] = [:],
         appRootFails: Bool = false,
+        appRootNeverAnswers: NeverAnswered? = nil,
         recreate: (@Sendable (RenameContainerStore, ContainerConfiguration) async throws -> Void)? = nil,
         test: @escaping (Application, RenameContainerStore) async throws -> Void
     ) async throws {
@@ -70,6 +71,7 @@ struct ContainerRenameRouteTests {
                     },
                     runtimeAppRoot: {
                         if appRootFails { throw RenameFailure() }
+                        if let appRootNeverAnswers { _ = await appRootNeverAnswers.wait() }
                         return appRoot
                     }
                 )
@@ -329,6 +331,21 @@ struct ContainerRenameRouteTests {
             }
             #expect(await store.deleted.isEmpty)
         }
+    }
+
+    @Test("A health call whose reply never comes is answered at the bound: the rename is refused, nothing is deleted")
+    func healthWithoutReplyIsBounded() async throws {
+        let reply = NeverAnswered()
+        try await withRoute(containers: [Self.snapshot(id: "web", status: .stopped)], appRootNeverAnswers: reply) { app, store in
+            let start = ContinuousClock.now
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
+                #expect(res.status == .conflict)
+                #expect(res.body.string.contains("no answer within"))
+            }
+            #expect(ContinuousClock.now - start < .seconds(30), "the request was answered, not held")
+            #expect(await store.deleted.isEmpty)
+        }
+        reply.answerLate()
     }
 
     @Test("A container with an exit record in the bridge is refused")

@@ -132,7 +132,8 @@ struct ContainerRenameRoute: RouteCollection {
             // rename in the runtime closes that.
             let reason: String?
             do {
-                let appRoot = try await runtimeAppRoot()
+                // The health call can wait for a reply that never comes: answer at the bound.
+                let appRoot = try await Bounded.value(within: .seconds(2)) { try await runtimeAppRoot() }
                 let hexId = DockerContainerID.hexId(for: container)
                 let nativeRecord = await ContainerExitCodeStore.shared.get(id: container.id)
                 let hexRecord = await ContainerExitCodeStore.shared.get(id: hexId)
