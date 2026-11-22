@@ -6,11 +6,13 @@ import Logging
 /// else. It happens after the native create has succeeded, so a create that the runtime refuses
 /// changes no volume.
 ///
-/// A volume is prepared at most once per create, by its first mount in the order of the request
-/// (Binds, then Mounts, then the image's declared volumes, as on 166bbd5). When that mount has no
-/// `nocopy`, and `VolumeImageEligibility` finds the image empty and clean, the copy-up builds a
-/// new image with what the container's image has at the mount path (nothing when the path is
-/// absent), without `/lost+found`. With `nocopy`, the volume is not touched, as in Docker.
+/// Every mount without `nocopy` is a copy-up candidate, in the order of the request (Binds, then
+/// Mounts, then the image's declared volumes, as on 166bbd5). Each candidate is judged again by
+/// `VolumeImageEligibility` right before its write: a volume that an earlier candidate filled is
+/// skipped, and one that an earlier candidate left empty gets the next. The copy-up builds a new
+/// image with what the container's image has at the mount path (nothing when the path is absent),
+/// without `/lost+found`. A mount with `nocopy` is never a candidate: the volume is not touched
+/// for it, as in Docker.
 ///
 /// A copy-up needs the container list, read after the native create (three attempts): no write to
 /// a volume that another container configuration names (by volume name or image path), and none
@@ -30,9 +32,9 @@ enum VolumeImageWrites {
     /// What touches images; replaced in tests.
     protocol Writer: Sendable {
         func verdict(imagePath: String) -> VolumeImageEligibility.Verdict
-        /// Copies up each volume for `container`; returns why each copy-up that did not complete
-        /// failed, keyed by the volume's image path.
-        func copyUp(_ volumes: [(source: String, destination: String)], into container: ContainerSnapshot) -> [String: String]
+        /// Copies up each mount in order, judging each again right before its write; returns why
+        /// each volume that was not prepared was not, keyed by its image path.
+        func copyUp(_ mounts: [(source: String, destination: String)], into container: ContainerSnapshot) -> [String: String]
     }
 
     struct Production: Writer {
@@ -42,8 +44,8 @@ enum VolumeImageWrites {
             VolumeImageEligibility.check(imagePath: imagePath)
         }
 
-        func copyUp(_ volumes: [(source: String, destination: String)], into container: ContainerSnapshot) -> [String: String] {
-            ContainerCreateRoute.populateEmptyVolumes(volumes, for: container, logger: logger)
+        func copyUp(_ mounts: [(source: String, destination: String)], into container: ContainerSnapshot) -> [String: String] {
+            ContainerCreateRoute.populateEmptyVolumes(mounts, for: container, logger: logger)
         }
     }
 
@@ -61,13 +63,31 @@ enum VolumeImageWrites {
         mergedEnv.first { $0.hasPrefix("PGDATA=") }.map { String($0.dropFirst("PGDATA=".count)) }
     }
 
+    /// A path with its empty and `.` components dropped and `..` applied, so that `/data/`,
+    /// `/data/.` and `/data` compare equal.
+    static func normalised(_ path: String) -> String {
+        var parts: [Substring] = []
+        for part in path.split(separator: "/") where part != "." {
+            if part == ".." {
+                _ = parts.popLast()
+            } else {
+                parts.append(part)
+            }
+        }
+        return "/" + parts.joined(separator: "/")
+    }
+
     /// The text of a create warning for a volume that was not prepared. It says only what the
-    /// check saw: the copy-up part only when a copy-up was wanted, and /lost+found as present
-    /// only when the check found it.
-    static func notPrepared(_ volume: Volume, reason: String, verdict: VolumeImageEligibility.Verdict) -> String {
+    /// check saw: the copy-up part only when a copy-up was wanted (`copyTo` is not empty), and the
+    /// /lost+found part only when the check saw one or could not tell.
+    static func notPrepared(
+        _ name: String, copyTo destinations: [String], reason: String, verdict: VolumeImageEligibility.Verdict
+    ) -> String {
         var missed: [String] = []
-        if !volume.noCopy {
-            missed.append("the image's files at \(volume.destination) were not copied into it")
+        var remedies: [String] = []
+        if !destinations.isEmpty {
+            missed.append("the image's files at \(destinations.joined(separator: " and ")) were not copied into it")
+            remedies.append("copy those files in")
         }
         switch verdict {
         case .replaceable(hasLostFound: true):
@@ -77,10 +97,16 @@ enum VolumeImageWrites {
         case .doubtful, .holdsData:
             missed.append("a /lost+found directory, if it has one, was not removed")
         }
-        return "volume \"\(volume.name)\" was not prepared (\(reason)): " + missed.joined(separator: ", and ")
-            + ". If the container needs either, stop every container that uses the volume, then copy the files in or run "
-            + "`docker run --rm -v \(volume.name):/v busybox rmdir /v/lost+found`, or create and start the container that "
-            + "fills the volume first"
+        if missed.count > remedies.count {
+            remedies.append("run `docker run --rm -v \(name):/v busybox rmdir /v/lost+found`")
+        }
+        let text = "volume \"\(name)\" was not prepared (\(reason))"
+        guard !missed.isEmpty else {
+            return text
+        }
+        return text + ": " + missed.joined(separator: ", and ") + ". If the container needs "
+            + (missed.count == 1 ? "this" : "either") + ", stop every container that uses the volume, then "
+            + remedies.joined(separator: " or ") + ", or create and start the container that fills the volume first"
     }
 
     static func create(
@@ -93,30 +119,44 @@ enum VolumeImageWrites {
     ) async throws -> (container: ContainerSnapshot, warnings: [String]) {
         let container = try await nativeCreate()
 
-        // One plan per volume: its first mount decides.
-        var seen = Set<String>()
-        let firstMounts = volumes.filter { seen.insert($0.source).inserted }
+        // The volumes, in the order of their first mount.
+        var order: [String] = []
+        var mountsOf: [String: [Volume]] = [:]
+        for volume in volumes {
+            if mountsOf[volume.source] == nil {
+                order.append(volume.source)
+            }
+            mountsOf[volume.source, default: []].append(volume)
+        }
 
         var warnings: [String] = []
-        var candidates: [(volume: Volume, verdict: VolumeImageEligibility.Verdict)] = []
-        let pgdata = pgdata(mergedEnv)
-        for volume in firstMounts {
-            let verdict = writer.verdict(imagePath: volume.source)
+        var candidates: [(name: String, source: String, copyTo: [String], verdict: VolumeImageEligibility.Verdict)] = []
+        let pgdata = pgdata(mergedEnv).map(normalised)
+        for source in order {
+            let mounts = mountsOf[source] ?? []
+            guard let name = mounts.first?.name else {
+                continue
+            }
+            let verdict = writer.verdict(imagePath: source)
             if case .holdsData = verdict {
                 continue
             }
-            if volume.noCopy {
-                // Not touched. A Postgres data directory at the volume root refuses /lost+found.
-                if case .replaceable(hasLostFound: true) = verdict, pgdata == volume.destination {
-                    warnings.append(notPrepared(volume, reason: "nocopy is set", verdict: verdict))
+            let copyTo = mounts.filter { !$0.noCopy }.map(\.destination)
+            guard !copyTo.isEmpty else {
+                // Only nocopy mounts: not touched. A Postgres data directory at a mount path
+                // refuses /lost+found.
+                if case .replaceable(hasLostFound: true) = verdict, let pgdata,
+                    mounts.contains(where: { normalised($0.destination) == pgdata })
+                {
+                    warnings.append(notPrepared(name, copyTo: [], reason: "nocopy is set", verdict: verdict))
                 }
                 continue
             }
             if case .doubtful(let reason) = verdict {
-                warnings.append(notPrepared(volume, reason: "its image could not be judged: \(reason)", verdict: verdict))
+                warnings.append(notPrepared(name, copyTo: copyTo, reason: "its image could not be judged: \(reason)", verdict: verdict))
                 continue
             }
-            candidates.append((volume, verdict))
+            candidates.append((name, source, copyTo, verdict))
         }
 
         if !candidates.isEmpty {
@@ -128,23 +168,28 @@ enum VolumeImageWrites {
                 }
             }
             let named = list.map { VolumeImageWriters.named(by: $0, except: container.id) }
-            var targets: [(volume: Volume, verdict: VolumeImageEligibility.Verdict)] = []
-            for (volume, verdict) in candidates {
+            var targets: [(name: String, source: String, copyTo: [String], verdict: VolumeImageEligibility.Verdict)] = []
+            for candidate in candidates {
                 guard let named else {
-                    warnings.append(notPrepared(volume, reason: "the container list could not be read", verdict: verdict))
+                    warnings.append(
+                        notPrepared(candidate.name, copyTo: candidate.copyTo, reason: "the container list could not be read", verdict: candidate.verdict))
                     continue
                 }
-                guard VolumeImageWriters.mayWrite(name: volume.name, source: volume.source, named: named) else {
-                    warnings.append(notPrepared(volume, reason: "another container names it, in any state", verdict: verdict))
+                guard VolumeImageWriters.mayWrite(name: candidate.name, source: candidate.source, named: named) else {
+                    warnings.append(
+                        notPrepared(
+                            candidate.name, copyTo: candidate.copyTo, reason: "another container names it, in any state", verdict: candidate.verdict))
                     continue
                 }
-                targets.append((volume, verdict))
+                targets.append(candidate)
             }
             if !targets.isEmpty {
-                let failures = writer.copyUp(targets.map { (source: $0.volume.source, destination: $0.volume.destination) }, into: container)
-                for (volume, verdict) in targets {
-                    if let failure = failures[volume.source] {
-                        warnings.append(notPrepared(volume, reason: failure, verdict: verdict))
+                let allowed = Set(targets.map(\.source))
+                let mounts = volumes.filter { !$0.noCopy && allowed.contains($0.source) }
+                let failures = writer.copyUp(mounts.map { (source: $0.source, destination: $0.destination) }, into: container)
+                for target in targets {
+                    if let failure = failures[target.source] {
+                        warnings.append(notPrepared(target.name, copyTo: target.copyTo, reason: failure, verdict: target.verdict))
                     }
                 }
             }

@@ -172,29 +172,49 @@ import Testing
         }
     }
 
-    @Test("a volume mounted at two paths is prepared once, from its first mount")
-    func onePlanPerVolume() async throws {
-        let first = volume("v", at: "/etc")
-        let second = volume("v", at: "/data", noCopy: true)
-        var recorder = Recorder([first.source: .replaceable(hasLostFound: true)])
-        _ = try await run([first, second], recorder: recorder, lists: [[]])
-        #expect(recorder.events == ["create", "list", "copy-up \(first.source) from /etc"])
+    @Test("every mount of a volume without nocopy is a candidate, in order; a nocopy mount is not")
+    func everyMountWithoutNoCopyIsACandidate() async throws {
+        let etc = volume("v", at: "/etc")
+        let data = volume("v", at: "/data")
+        let skipped = volume("v", at: "/skip", noCopy: true)
+        var recorder = Recorder([etc.source: .replaceable(hasLostFound: true)])
+        _ = try await run([etc, skipped, data], recorder: recorder, lists: [[]])
+        #expect(recorder.events == ["create", "list", "copy-up \(etc.source) from /etc", "copy-up \(etc.source) from /data"])
 
-        // The first mount has nocopy: the volume is not touched, whatever the second asks.
-        recorder = Recorder([first.source: .replaceable(hasLostFound: true)])
-        _ = try await run([second, first], env: [], recorder: recorder, lists: [[]])
+        // The nocopy mount comes first: the other mount is still a candidate.
+        recorder = Recorder([etc.source: .replaceable(hasLostFound: true)])
+        _ = try await run([skipped, etc], env: [], recorder: recorder, lists: [[]])
+        #expect(recorder.events == ["create", "list", "copy-up \(etc.source) from /etc"])
+
+        // Only nocopy mounts: the volume is not touched.
+        recorder = Recorder([etc.source: .replaceable(hasLostFound: true)])
+        _ = try await run([skipped], env: [], recorder: recorder, lists: [[]])
         #expect(recorder.events == ["create"])
     }
 
-    @Test("the warning names /lost+found as present only when the check saw it")
+    @Test("the warning names /lost+found and offers rmdir only when the check saw it or could not tell")
     func warningSaysWhatIsKnown() {
-        let v = volume("v")
-        let seen = VolumeImageWrites.notPrepared(v, reason: "r", verdict: .replaceable(hasLostFound: true))
+        let seen = VolumeImageWrites.notPrepared("v", copyTo: ["/data"], reason: "r", verdict: .replaceable(hasLostFound: true))
         #expect(seen.contains("files at /data were not copied") && seen.contains("its /lost+found directory was not removed"))
-        let absent = VolumeImageWrites.notPrepared(v, reason: "r", verdict: .replaceable(hasLostFound: false))
-        #expect(!absent.contains("lost+found directory"))
-        let unknown = VolumeImageWrites.notPrepared(v, reason: "r", verdict: .doubtful("x"))
-        #expect(unknown.contains("a /lost+found directory, if it has one, was not removed"))
+        #expect(seen.contains("rmdir /v/lost+found") && seen.contains("copy those files in"))
+        let absent = VolumeImageWrites.notPrepared("v", copyTo: ["/data"], reason: "r", verdict: .replaceable(hasLostFound: false))
+        #expect(!absent.contains("lost+found"))
+        #expect(absent.contains("copy those files in"))
+        let unknown = VolumeImageWrites.notPrepared("v", copyTo: ["/data"], reason: "r", verdict: .doubtful("x"))
+        #expect(unknown.contains("a /lost+found directory, if it has one, was not removed") && unknown.contains("rmdir"))
+        let noCopy = VolumeImageWrites.notPrepared("v", copyTo: [], reason: "nocopy is set", verdict: .replaceable(hasLostFound: true))
+        #expect(!noCopy.contains("copied") && noCopy.contains("rmdir"))
+    }
+
+    @Test("PGDATA and the mount path are compared as normalised paths")
+    func pgdataIsNormalised() async throws {
+        let pg = volume("pg", noCopy: true)
+        for env in [["PGDATA=/data/"], ["PGDATA=/data/."], ["PGDATA=//data"], ["PGDATA=/x/../data"]] {
+            let recorder = Recorder([pg.source: .replaceable(hasLostFound: true)])
+            let warnings = try await run([pg], env: env, recorder: recorder, lists: [[]])
+            #expect(warnings.count == 1 && warnings[0].contains("nocopy is set"), "\(env)")
+        }
+        #expect(VolumeImageWrites.normalised("/var/lib/postgresql/data/") == "/var/lib/postgresql/data")
     }
 
     @Test("nocopy is taken off the mount options")

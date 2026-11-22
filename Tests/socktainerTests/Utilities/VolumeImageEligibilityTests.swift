@@ -106,12 +106,70 @@ import Testing
             bytes: try Data(contentsOf: URL(fileURLWithPath: path)))
     }
 
-    /// A container image whose root file system has `/data/seed`.
+    /// A container image whose root file system has `/data/seed`, and `/bad` with a regular file
+    /// named `lost+found` (a copy-up from `/bad` fails: the new image already has that directory).
     private func rootfs(_ path: String) throws {
         let formatter = try EXT4.Formatter(FilePath(path), blockSize: 4096, minDiskSize: 16 * 1024 * 1024)
         try formatter.create(path: FilePath("/data"), mode: EXT4.Inode.Mode(.S_IFDIR, 0o755))
         try formatter.create(path: FilePath("/data/seed"), mode: EXT4.Inode.Mode(.S_IFREG, 0o644), buf: InputStream(data: Data("seed".utf8)))
+        try formatter.create(path: FilePath("/bad"), mode: EXT4.Inode.Mode(.S_IFDIR, 0o755))
+        try formatter.create(path: FilePath("/bad/lost+found"), mode: EXT4.Inode.Mode(.S_IFREG, 0o644), buf: InputStream(data: Data("x".utf8)))
         try formatter.close()
+    }
+
+    private func rootEntries(_ image: String) throws -> [String] {
+        try EXT4.EXT4Reader(blockDevice: FilePath(image)).listDirectory(FilePath("/")).filter { $0 != "." && $0 != ".." }.sorted()
+    }
+
+    @Test("mounts of one volume in order: a first mount over an absent path does not stop the next from seeding it")
+    func absentSourceThenSeed() throws {
+        let scratch = try Scratch()
+        let image = scratch.path("volume.img")
+        let source = scratch.path("rootfs.ext4")
+        try formatted(image)
+        try rootfs(source)
+
+        let failures = VolumeCopyUp.populateInOrder(
+            [(source: image, destination: "/nope"), (source: image, destination: "/data")], fromRootfs: source, logger: logger)
+
+        #expect(failures.isEmpty)
+        #expect(try rootEntries(image) == ["seed"])
+    }
+
+    @Test("mounts of one volume in order: after a failed copy-up the next mount still prepares the volume")
+    func failedCopyUpThenNext() throws {
+        let scratch = try Scratch()
+        let image = scratch.path("volume.img")
+        let source = scratch.path("rootfs.ext4")
+        try formatted(image)
+        try rootfs(source)
+
+        let failures = VolumeCopyUp.populateInOrder(
+            [(source: image, destination: "/bad"), (source: image, destination: "/nope")], fromRootfs: source, logger: logger)
+
+        #expect(failures.isEmpty)
+        #expect(try rootEntries(image) == [])
+        #expect(VolumeImageEligibility.check(imagePath: image) == .replaceable(hasLostFound: false))
+    }
+
+    @Test("mounts of one volume in order: a volume that an earlier mount filled is skipped, and a lone failure is reported")
+    func filledVolumeIsSkipped() throws {
+        let scratch = try Scratch()
+        let image = scratch.path("volume.img")
+        let source = scratch.path("rootfs.ext4")
+        try formatted(image)
+        try rootfs(source)
+
+        var failures = VolumeCopyUp.populateInOrder(
+            [(source: image, destination: "/data"), (source: image, destination: "/bad")], fromRootfs: source, logger: logger)
+        #expect(failures.isEmpty)
+        #expect(try rootEntries(image) == ["seed"])
+
+        let other = scratch.path("other.img")
+        try formatted(other)
+        failures = VolumeCopyUp.populateInOrder([(source: other, destination: "/bad")], fromRootfs: source, logger: logger)
+        #expect(failures[other]?.hasPrefix("the copy-up failed") == true)
+        #expect(try rootEntries(other) == ["lost+found"])
     }
 
     // MARK: The writers leave every image that is not shown to be empty and clean as it is.

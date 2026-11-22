@@ -989,20 +989,7 @@ extension ContainerCreateRoute {
             return Dictionary(candidates.map { ($0.source, reason) }, uniquingKeysWith: { first, _ in first })
         }
 
-        var failures: [String: String] = [:]
-        for candidate in candidates {
-            do {
-                try VolumeCopyUp.populate(
-                    volumeImagePath: candidate.source,
-                    fromRootfs: rootfs.path,
-                    sourcePath: candidate.destination,
-                    logger: logger
-                )
-            } catch {
-                failures[candidate.source] = "the copy-up failed: \(error)"
-            }
-        }
-        return failures
+        return VolumeCopyUp.populateInOrder(candidates, fromRootfs: rootfs.path, logger: logger)
     }
 
     static func makeCreateEvent(for container: ContainerSnapshot) -> DockerEvent {

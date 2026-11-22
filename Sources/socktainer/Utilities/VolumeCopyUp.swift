@@ -34,6 +34,43 @@ enum VolumeCopyUp {
         let source = URL(fileURLWithPath: config.containerRootFilesystem.source)
         return FileManager.default.fileExists(atPath: source.path) ? source : nil
     }
+    /// Copies up each mount in the order given, as 166bbd5 did: each mount is judged again right
+    /// before its write, so a volume that an earlier mount filled is skipped, and a volume that an
+    /// earlier mount left empty (its copy-up failed, or its path was absent) gets the next mount.
+    /// Returns, per image path, why its volume was not prepared.
+    static func populateInOrder(
+        _ mounts: [(source: String, destination: String)],
+        fromRootfs rootfs: String,
+        logger: Logger
+    ) -> [String: String] {
+        var failures: [String: String] = [:]
+        var prepared = Set<String>()
+        for mount in mounts {
+            switch VolumeImageEligibility.check(imagePath: mount.source) {
+            case .holdsData:
+                failures[mount.source] = nil
+                continue
+            case .doubtful(let reason):
+                if !prepared.contains(mount.source) {
+                    failures[mount.source] = "its image could not be judged: \(reason)"
+                }
+                continue
+            case .replaceable:
+                break
+            }
+            do {
+                try populate(volumeImagePath: mount.source, fromRootfs: rootfs, sourcePath: mount.destination, logger: logger)
+                prepared.insert(mount.source)
+                failures[mount.source] = nil
+            } catch {
+                logger.warning("[volume-copyup] \(mount.destination) not copied: \(error)")
+                if !prepared.contains(mount.source) {
+                    failures[mount.source] = "the copy-up failed: \(error)"
+                }
+            }
+        }
+        return failures
+    }
 
     /// Rebuilds the volume image so its root carries what the image holds at
     /// `sourcePath`. Runs even when the image has nothing there, because the
