@@ -39,18 +39,33 @@ import Testing
         #expect(after.exists(path: "/pgdata/PG_VERSION"), "the volume's data was erased")
     }
 
-    /// The create cleans /lost+found only from an empty volume that no other container names.
-    @Test func theCreateCleansOnlyAnEmptyVolumeThatNoOtherContainerNames() throws {
+    /// The create cleans /lost+found only from an empty volume that no other container names
+    /// (through the production writer, on real images).
+    @Test func theCreateCleansOnlyAnEmptyVolumeThatNoOtherContainerNames() async throws {
         let (dir, img) = try image(with: [])
         defer { try? FileManager.default.removeItem(at: dir) }
         let (dataDir, data) = try image(with: ["/pgdata/PG_VERSION"])
         defer { try? FileManager.default.removeItem(at: dataDir) }
-        let postgres = ["PGDATA=/var/lib/postgresql/data"]
-        let none = VolumeImageWriters.Named(names: [], sources: [])
-        #expect(VolumeImageCleaner.shouldClean(mergedEnv: postgres, name: "v", format: "ext4", source: img.path, labels: [:], named: none))
-        #expect(!VolumeImageCleaner.shouldClean(mergedEnv: postgres, name: "v", format: "ext4", source: data.path, labels: [:], named: none))
-        let used = VolumeImageWriters.Named(names: ["v"], sources: [])
-        #expect(!VolumeImageCleaner.shouldClean(mergedEnv: postgres, name: "v", format: "ext4", source: img.path, labels: [:], named: used))
+        let (usedDir, used) = try image(with: [])
+        defer { try? FileManager.default.removeItem(at: usedDir) }
+
+        let volumes = [("v", img), ("d", data), ("u", used)].map {
+            VolumeImageWrites.Volume(name: $0.0, source: $0.1.path, destination: "/x", labels: [:])
+        }
+        var holder = try makeContainerSnapshot(nativeId: "holder", networks: [], labels: [:])
+        holder.configuration.mounts = [Filesystem.volume(name: "u", format: "ext4", source: used.path, destination: "/u", options: [])]
+        let dataBefore = try Data(contentsOf: data)
+        let usedBefore = try Data(contentsOf: used)
+        let new = try makeContainerSnapshot(nativeId: "new", networks: [], labels: [:])
+
+        _ = try await VolumeImageWrites.create(
+            volumes: volumes, mergedEnv: ["PGDATA=/var/lib/postgresql/data"],
+            listContainers: { [holder] }, nativeCreate: { new },
+            writer: VolumeImageWrites.Production(logger: logger), logger: logger)
+
+        #expect(VolumeImageEligibility.check(imagePath: img.path) == .replaceable(hasLostFound: false))
+        #expect(try Data(contentsOf: data) == dataBefore)
+        #expect(try Data(contentsOf: used) == usedBefore)
     }
 
     // MARK: D-2
@@ -64,16 +79,15 @@ import Testing
         let v = Filesystem.volume(name: "shared", format: "ext4", source: "/vols/shared/volume.img", destination: "/data", options: [])
         let other = Filesystem.volume(name: "other", format: "ext4", source: "/vols/other/volume.img", destination: "/x", options: [])
         let alias = Filesystem.block(format: "ext4", source: "/vols/shared/volume.img", destination: "/y", options: [])
-        let candidates = [(source: "/vols/shared/volume.img", destination: "/data", name: "shared")]
+        func mayWrite(_ named: VolumeImageWriters.Named) -> Bool {
+            VolumeImageWriters.mayWrite(name: "shared", source: "/vols/shared/volume.img", named: named)
+        }
 
         // Only the new container names it: copy-up goes ahead.
-        var named = VolumeImageWriters.named(by: [config("new", [v]), config("a", [other])], except: "new")
-        #expect(VolumeCopyUp.targets(candidates, named: named).map(\.name) == ["shared"])
+        #expect(mayWrite(VolumeImageWriters.named(by: [config("new", [v]), config("a", [other])], except: "new")))
         // Another container (stopped or running, it does not matter) names it by name.
-        named = VolumeImageWriters.named(by: [config("new", [v]), config("a", [v])], except: "new")
-        #expect(VolumeCopyUp.targets(candidates, named: named).isEmpty)
+        #expect(!mayWrite(VolumeImageWriters.named(by: [config("new", [v]), config("a", [v])], except: "new")))
         // Another container names the same image as a block device.
-        named = VolumeImageWriters.named(by: [config("new", [v]), config("b", [alias])], except: "new")
-        #expect(VolumeCopyUp.targets(candidates, named: named).isEmpty)
+        #expect(!mayWrite(VolumeImageWriters.named(by: [config("new", [v]), config("b", [alias])], except: "new")))
     }
 }

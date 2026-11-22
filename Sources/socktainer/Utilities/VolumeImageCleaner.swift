@@ -34,80 +34,21 @@ enum VolumeImageCleaner {
         return true
     }
 
-    /// Whether a create cleans /lost+found from this volume: a Postgres container, an EXT4 volume
-    /// that holds nothing but /lost+found (Postgres refuses to initialise over it), and no other
-    /// container configuration that names the volume (one may hold the image). A volume with data
-    /// keeps /lost+found: Postgres only refuses it when it initialises an empty directory.
-    static func shouldClean(
-        mergedEnv: [String], name: String, format: String, source: String, labels: [String: String],
-        named: VolumeImageWriters.Named
-    ) -> Bool {
-        isPostgresDataVolume(mergedEnv: mergedEnv) && format == "ext4" && isEnabled(labels: labels)
-            && VolumeCopyUp.isEmpty(volumeImagePath: source)
-            && VolumeImageWriters.mayWrite(name: name, source: source, named: named)
-    }
-
-    /// Reformats the EXT4 block image at `imagePath`, removing `/lost+found`.
-    /// Skips non-regular-files, non-EXT4 images, and images already without it.
+    /// Replaces an empty EXT4 image that has `/lost+found` with an empty one that does not. The
+    /// new image is built beside the old one and moved into place, so a failure leaves the old
+    /// image whole; any image that is not shown to be empty and clean is left as it is.
     static func removeLostFound(imagePath: String, logger: Logger) {
-        let fm = FileManager.default
-
-        // Guard against a directory-backed mount point (never a block image).
-        var isDirectory: ObjCBool = false
-        guard fm.fileExists(atPath: imagePath, isDirectory: &isDirectory), !isDirectory.boolValue else {
-            logger.warning("[volume-clean] skip: \(imagePath) is not a regular file")
+        guard VolumeImageEligibility.check(imagePath: imagePath) == .replaceable(hasLostFound: true) else {
+            logger.info("[volume-clean] \(imagePath) left as it is: not an empty volume with /lost+found")
             return
         }
-
-        // Use the real file size, not the optional volume metadata.
-        guard let attributes = try? fm.attributesOfItem(atPath: imagePath),
-            let size = (attributes[.size] as? NSNumber)?.uint64Value, size >= 4 * 1024 * 1024
-        else {
-            logger.warning("[volume-clean] skip: image too small to be a valid EXT4 filesystem: \(imagePath)")
-            return
-        }
-
-        let path = FilePath(imagePath)
-
-        // The formatter below writes a new, empty filesystem over the image. Only an image that
-        // holds nothing but /lost+found may get it: anything else would be erased.
-        guard VolumeCopyUp.isEmpty(volumeImagePath: imagePath) else {
-            logger.warning("[volume-clean] skip: \(imagePath) holds data; /lost+found stays")
-            return
-        }
-
-        // Idempotency + safety: skip if not EXT4 or already clean.
         do {
-            let probe = try EXT4Editor(devicePath: path)
-            guard probe.exists(path: "/lost+found") else {
-                logger.info("[volume-clean] \(imagePath) has no /lost+found; nothing to do")
-                return
+            try VolumeImageReplacement.replace(imagePath: imagePath) { formatter in
+                try formatter.unlink(path: FilePath("/lost+found"))
             }
+            logger.info("[volume-clean] removed /lost+found from \(imagePath)")
         } catch {
-            logger.warning("[volume-clean] skip: \(imagePath) is not a readable EXT4 image: \(error)")
-            return
-        }
-
-        do {
-            // blockSize 4096, no journal — mirrors Apple's own ContainerManager.
-            let formatter = try EXT4.Formatter(path, blockSize: 4096, minDiskSize: size)
-            try formatter.unlink(path: FilePath("/lost+found"))
-            try formatter.close()
-        } catch {
-            logger.warning("[volume-clean] reformat failed for \(imagePath): \(error)")
-            return
-        }
-
-        // Verify.
-        do {
-            let editor = try EXT4Editor(devicePath: path)
-            if editor.exists(path: "/lost+found") {
-                logger.warning("[volume-clean] /lost+found still present after reformat: \(imagePath)")
-            } else {
-                logger.info("[volume-clean] removed /lost+found from \(imagePath)")
-            }
-        } catch {
-            logger.warning("[volume-clean] post-reformat verification failed for \(imagePath): \(error)")
+            logger.warning("[volume-clean] \(imagePath) left as it is: \(error)")
         }
     }
 }
