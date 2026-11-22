@@ -34,10 +34,11 @@ struct ContainerRenameRouteTests {
     private func withRoute(
         containers: [ContainerSnapshot],
         refusesDelete: Bool = false,
+        listFails: Bool = false,
         recreate: (@Sendable (RenameContainerStore, ContainerConfiguration) async throws -> Void)? = nil,
         test: @escaping (Application, RenameContainerStore) async throws -> Void
     ) async throws {
-        let store = RenameContainerStore(containers: containers, refusesDelete: refusesDelete)
+        let store = RenameContainerStore(containers: containers, refusesDelete: refusesDelete, listFails: listFails)
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
@@ -235,6 +236,40 @@ struct ContainerRenameRouteTests {
         }
     }
 
+    @Test("A target that equals another container's name without case is refused before anything is deleted")
+    func foldedTargetIsRefusedFirst() async throws {
+        let containers = [Self.snapshot(id: "api", status: .stopped), Self.snapshot(id: "web", status: .stopped)]
+        try await withRoute(containers: containers) { app, store in
+            try await app.testing().test(.POST, "/v1.51/containers/api/rename?name=WEB") { res async in
+                #expect(res.status == .conflict)
+                #expect(res.body.string.contains("/WEB") && res.body.string.contains("is already in use by container"))
+            }
+            #expect(await store.deleted.isEmpty)
+            #expect(await store.names() == ["api", "web"])
+        }
+    }
+
+    @Test("A case-only rename of the same container is not refused by the name check")
+    func caseOnlyRenameOfTheSameContainer() async throws {
+        try await withRoute(containers: [Self.snapshot(id: "web", status: .stopped)]) { app, store in
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=WEB") { res async in
+                #expect(res.status == .noContent)
+            }
+            #expect(await store.names() == ["WEB"])
+        }
+    }
+
+    @Test("A container list that cannot be read stops the rename before anything is deleted")
+    func failedListStopsTheRename() async throws {
+        try await withRoute(containers: [Self.snapshot(id: "web", status: .stopped)], listFails: true) { app, store in
+            try await app.testing().test(.POST, "/v1.51/containers/web/rename?name=web-old") { res async in
+                #expect(res.status == .serviceUnavailable)
+                #expect(res.body.string.contains("the container list could not be read"))
+            }
+            #expect(await store.deleted.isEmpty)
+        }
+    }
+
     @Test("A running container is refused, because recreating it would kill the process")
     func runningContainerIsRefused() async throws {
         try await withRoute(containers: [Self.snapshot(id: "web", status: .running)]) { app, _ in
@@ -331,13 +366,19 @@ struct ContainerRenameMapTests {
 private actor RenameContainerStore {
     private var containers: [ContainerSnapshot]
     private let refusesDelete: Bool
+    private let listFails: Bool
+    private(set) var deleted: [String] = []
 
-    init(containers: [ContainerSnapshot], refusesDelete: Bool) {
+    init(containers: [ContainerSnapshot], refusesDelete: Bool, listFails: Bool = false) {
         self.containers = containers
         self.refusesDelete = refusesDelete
+        self.listFails = listFails
     }
 
-    func all() -> [ContainerSnapshot] { containers }
+    func all() throws -> [ContainerSnapshot] {
+        if listFails { throw RenameFailure() }
+        return containers
+    }
     func get(_ id: String) -> ContainerSnapshot? { containers.first { $0.id == id } }
 
     func add(_ configuration: ContainerConfiguration) {
@@ -346,6 +387,7 @@ private actor RenameContainerStore {
 
     func remove(_ id: String) throws {
         if refusesDelete { throw RenameFailure() }
+        deleted.append(id)
         containers.removeAll { $0.id == id }
     }
 
@@ -355,7 +397,7 @@ private actor RenameContainerStore {
 private struct RenameMock: ClientContainerProtocol {
     let store: RenameContainerStore
 
-    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { await store.all() }
+    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { try await store.all() }
     func getContainer(id: String) async throws -> ContainerSnapshot? { await store.get(id) }
     func enforceContainerRunning(container: ContainerSnapshot) throws {}
     func start(id: String, detachKeys: String?) async throws {}

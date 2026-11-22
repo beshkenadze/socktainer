@@ -94,6 +94,27 @@ struct ContainerRenameRoute: RouteCollection {
                 )
             }
 
+            // The runtime keeps a container's state in a directory named after it, and its data
+            // root is case-insensitive by default: there `web` and `WEB` are one directory, and
+            // the runtime refuses the create of the target after the source is gone. So a target
+            // that equals another container's name without case is refused here, before anything
+            // is deleted. The source itself is excluded: a case-only rename of the same container
+            // frees its own directory before the create. A list that cannot be read stops the
+            // rename.
+            let listed: [ContainerSnapshot]
+            do {
+                listed = try await client.list(showAll: true, filters: [:])
+            } catch {
+                req.logger.error("Failed to list containers before renaming \(container.id): \(error)")
+                throw Abort(
+                    .serviceUnavailable,
+                    reason: "Cannot rename container \(container.id): the container list could not be read (\(error)). Nothing was changed"
+                )
+            }
+            if let holder = listed.first(where: { $0.id != container.id && $0.id.lowercased() == newName.lowercased() }) {
+                throw ContainerNameConflict.abort(name: newName, holderID: ContainerNameConflict.holderID(of: holder))
+            }
+
             let retiredHexId = DockerContainerID.hexId(for: container)
             var configuration = container.configuration
             configuration.id = newName

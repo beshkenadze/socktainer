@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerResource
 import ContainerizationError
 import Foundation
 import Vapor
@@ -46,8 +47,11 @@ enum ContainerNameConflict {
             return nil
         }
         let listed = try? await client.list(showAll: true, filters: [:])
-        let stored = listed?.first { $0.id == holder }?.configuration.labels[DockerContainerID.idLabel]
-        let holderID = stored.flatMap { DockerContainerID.isWellFormed($0) ? $0 : nil } ?? holder
-        return abort(name: name, holderID: holderID)
+        return abort(name: name, holderID: listed?.first { $0.id == holder }.map(holderID(of:)) ?? holder)
+    }
+
+    /// How a 409 names `holder`: its stored, well-formed Docker ID label, else its native name.
+    static func holderID(of holder: ContainerSnapshot) -> String {
+        holder.configuration.labels[DockerContainerID.idLabel].flatMap { DockerContainerID.isWellFormed($0) ? $0 : nil } ?? holder.id
     }
 }
