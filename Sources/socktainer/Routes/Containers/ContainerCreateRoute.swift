@@ -978,7 +978,7 @@ extension ContainerCreateRoute {
         _ candidates: [(source: String, destination: String)],
         for container: ContainerSnapshot,
         logger: Logger
-    ) -> [String: String] {
+    ) -> [String: VolumeCopyUp.Failure] {
         guard !candidates.isEmpty else { return [:] }
         let appSupport = URL(fileURLWithPath: "\(NSHomeDirectory())/Library/Application Support/com.apple.container")
         guard
@@ -986,7 +986,9 @@ extension ContainerCreateRoute {
                 containerId: container.id, appSupportPath: appSupport)
         else {
             let reason = "the container's image file system could not be found"
-            return Dictionary(candidates.map { ($0.source, reason) }, uniquingKeysWith: { first, _ in first })
+            return Dictionary(
+                candidates.map { ($0.source, VolumeCopyUp.Failure(reason: reason, verdict: VolumeImageEligibility.check(imagePath: $0.source))) },
+                uniquingKeysWith: { first, _ in first })
         }
 
         return VolumeCopyUp.populateInOrder(candidates, fromRootfs: rootfs.path, logger: logger)

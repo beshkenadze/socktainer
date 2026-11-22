@@ -17,9 +17,9 @@ import Testing
     private final class Recorder: VolumeImageWrites.Writer, @unchecked Sendable {
         private let lock = Mutex<[String]>([])
         let verdicts: [String: VolumeImageEligibility.Verdict]
-        let failing: [String: String]
+        let failing: [String: VolumeCopyUp.Failure]
 
-        init(_ verdicts: [String: VolumeImageEligibility.Verdict], failing: [String: String] = [:]) {
+        init(_ verdicts: [String: VolumeImageEligibility.Verdict], failing: [String: VolumeCopyUp.Failure] = [:]) {
             self.verdicts = verdicts
             self.failing = failing
         }
@@ -31,7 +31,7 @@ import Testing
             verdicts[imagePath] ?? .doubtful("unknown image")
         }
 
-        func copyUp(_ volumes: [(source: String, destination: String)], into container: ContainerSnapshot) -> [String: String] {
+        func copyUp(_ volumes: [(source: String, destination: String)], into container: ContainerSnapshot) -> [String: VolumeCopyUp.Failure] {
             for volume in volumes {
                 record("copy-up \(volume.source) from \(volume.destination)")
             }
@@ -144,10 +144,34 @@ import Testing
     @Test("a copy-up that fails gives a warning with its reason")
     func failedCopyUpWarns() async throws {
         let v = volume("v")
-        let recorder = Recorder([v.source: .replaceable(hasLostFound: true)], failing: [v.source: "the copy-up failed: disk full"])
+        let recorder = Recorder(
+            [v.source: .replaceable(hasLostFound: true)],
+            failing: [v.source: .init(reason: "the copy-up failed: disk full", verdict: .replaceable(hasLostFound: true))])
         let warnings = try await run([v], recorder: recorder, lists: [[]])
         #expect(recorder.events == ["create", "list", "copy-up \(v.source) from /data"])
         #expect(warnings.count == 1 && warnings[0].contains("disk full"))
+    }
+
+    @Test("the warning uses the verdict of the last check, not the one of the plan")
+    func warningUsesTheLastVerdict() async throws {
+        let v = volume("v")
+        let recorder = Recorder(
+            [v.source: .replaceable(hasLostFound: true)],
+            failing: [v.source: .init(reason: "its image could not be judged: recovery pending", verdict: .doubtful("recovery pending"))])
+        let warnings = try await run([v], recorder: recorder, lists: [[]])
+        #expect(warnings.count == 1)
+        #expect(warnings[0].contains("a /lost+found directory, if it has one, was not removed"))
+        #expect(!warnings[0].contains("its /lost+found directory was not removed"))
+    }
+
+    @Test("a relative PGDATA is not compared with the mount path")
+    func relativePgdataIsUnknown() async throws {
+        let pg = volume("pg", noCopy: true)
+        for env in [["PGDATA=data"], ["PGDATA=./data"]] {
+            let recorder = Recorder([pg.source: .replaceable(hasLostFound: true)])
+            let warnings = try await run([pg], env: env, recorder: recorder, lists: [[]])
+            #expect(warnings.isEmpty, "\(env)")
+        }
     }
 
     @Test("nocopy: the volume is not touched; Postgres at its root with /lost+found gets a warning")

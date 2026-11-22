@@ -37,22 +37,24 @@ enum VolumeCopyUp {
     /// Copies up each mount in the order given, as 166bbd5 did: each mount is judged again right
     /// before its write, so a volume that an earlier mount filled is skipped, and a volume that an
     /// earlier mount left empty (its copy-up failed, or its path was absent) gets the next mount.
-    /// Returns, per image path, why its volume was not prepared.
+    /// Returns, per image path, why its volume was not prepared, with the verdict of the last
+    /// eligibility check of that image.
     static func populateInOrder(
         _ mounts: [(source: String, destination: String)],
         fromRootfs rootfs: String,
         logger: Logger
-    ) -> [String: String] {
-        var failures: [String: String] = [:]
+    ) -> [String: Failure] {
+        var failures: [String: Failure] = [:]
         var prepared = Set<String>()
         for mount in mounts {
-            switch VolumeImageEligibility.check(imagePath: mount.source) {
+            let verdict = VolumeImageEligibility.check(imagePath: mount.source)
+            switch verdict {
             case .holdsData:
                 failures[mount.source] = nil
                 continue
             case .doubtful(let reason):
                 if !prepared.contains(mount.source) {
-                    failures[mount.source] = "its image could not be judged: \(reason)"
+                    failures[mount.source] = Failure(reason: "its image could not be judged: \(reason)", verdict: verdict)
                 }
                 continue
             case .replaceable:
@@ -65,7 +67,7 @@ enum VolumeCopyUp {
             } catch {
                 logger.warning("[volume-copyup] \(mount.destination) not copied: \(error)")
                 if !prepared.contains(mount.source) {
-                    failures[mount.source] = "the copy-up failed: \(error)"
+                    failures[mount.source] = Failure(reason: "the copy-up failed: \(error)", verdict: verdict)
                 }
             }
         }
@@ -78,6 +80,12 @@ enum VolumeCopyUp {
     /// and Postgres refuses a data directory that does. Only an image that
     /// `VolumeImageEligibility` finds empty and clean is replaced; it throws for
     /// any other, which is left as it is.
+    /// Why a volume was not prepared, and what the last eligibility check of its image found.
+    struct Failure: Equatable, Sendable {
+        let reason: String
+        let verdict: VolumeImageEligibility.Verdict
+    }
+
     static func populate(
         volumeImagePath: String,
         fromRootfs rootfsPath: String,

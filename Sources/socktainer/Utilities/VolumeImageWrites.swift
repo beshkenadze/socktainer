@@ -34,7 +34,7 @@ enum VolumeImageWrites {
         func verdict(imagePath: String) -> VolumeImageEligibility.Verdict
         /// Copies up each mount in order, judging each again right before its write; returns why
         /// each volume that was not prepared was not, keyed by its image path.
-        func copyUp(_ mounts: [(source: String, destination: String)], into container: ContainerSnapshot) -> [String: String]
+        func copyUp(_ mounts: [(source: String, destination: String)], into container: ContainerSnapshot) -> [String: VolumeCopyUp.Failure]
     }
 
     struct Production: Writer {
@@ -44,7 +44,7 @@ enum VolumeImageWrites {
             VolumeImageEligibility.check(imagePath: imagePath)
         }
 
-        func copyUp(_ mounts: [(source: String, destination: String)], into container: ContainerSnapshot) -> [String: String] {
+        func copyUp(_ mounts: [(source: String, destination: String)], into container: ContainerSnapshot) -> [String: VolumeCopyUp.Failure] {
             ContainerCreateRoute.populateEmptyVolumes(mounts, for: container, logger: logger)
         }
     }
@@ -131,7 +131,8 @@ enum VolumeImageWrites {
 
         var warnings: [String] = []
         var candidates: [(name: String, source: String, copyTo: [String], verdict: VolumeImageEligibility.Verdict)] = []
-        let pgdata = pgdata(mergedEnv).map(normalised)
+        // A relative PGDATA depends on the working directory: it is not compared.
+        let pgdata = pgdata(mergedEnv).flatMap { $0.hasPrefix("/") ? normalised($0) : nil }
         for source in order {
             let mounts = mountsOf[source] ?? []
             guard let name = mounts.first?.name else {
@@ -189,7 +190,7 @@ enum VolumeImageWrites {
                 let failures = writer.copyUp(mounts.map { (source: $0.source, destination: $0.destination) }, into: container)
                 for target in targets {
                     if let failure = failures[target.source] {
-                        warnings.append(notPrepared(target.name, copyTo: target.copyTo, reason: failure, verdict: target.verdict))
+                        warnings.append(notPrepared(target.name, copyTo: target.copyTo, reason: failure.reason, verdict: failure.verdict))
                     }
                 }
             }

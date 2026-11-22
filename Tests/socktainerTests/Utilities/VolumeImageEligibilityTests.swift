@@ -168,7 +168,8 @@ import Testing
         let other = scratch.path("other.img")
         try formatted(other)
         failures = VolumeCopyUp.populateInOrder([(source: other, destination: "/bad")], fromRootfs: source, logger: logger)
-        #expect(failures[other]?.hasPrefix("the copy-up failed") == true)
+        #expect(failures[other]?.reason.hasPrefix("the copy-up failed") == true)
+        #expect(failures[other]?.verdict == .replaceable(hasLostFound: true))
         #expect(try rootEntries(other) == ["lost+found"])
     }
 
