@@ -35,13 +35,19 @@ enum ContainerNameConflict {
         )
     }
 
-    /// The 409 for `error` when it is the runtime's refusal of `name`, with the holder's full
-    /// Docker ID when the holder can be found (its name otherwise); nil for any other error.
+    /// The 409 for `error` when it is the runtime's refusal of `name`, or nil for any other error.
+    ///
+    /// The holder's full Docker ID comes from one list call: the container whose native name is
+    /// exactly the holder's, and only its stored Docker ID label. Otherwise the 409 names the
+    /// holder. No ID-prefix match (it could pick another container) and no derived ID (it can read
+    /// the creation date from disk).
     static func conflict(after error: Error, name: String, client: ClientContainerProtocol) async -> Abort? {
         guard let holder = holder(of: name, in: error) else {
             return nil
         }
-        let holderID = (try? await client.getContainer(id: holder)).flatMap { $0 }.map(DockerContainerID.hexId(for:)) ?? holder
+        let listed = try? await client.list(showAll: true, filters: [:])
+        let stored = listed?.first { $0.id == holder }?.configuration.labels[DockerContainerID.idLabel]
+        let holderID = stored.flatMap { DockerContainerID.isWellFormed($0) ? $0 : nil } ?? holder
         return abort(name: name, holderID: holderID)
     }
 }

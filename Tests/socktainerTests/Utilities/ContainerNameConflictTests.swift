@@ -32,9 +32,10 @@ import Vapor
         }
     }
 
-    @Test("the 409 carries Docker's message with the holder's full Docker ID")
+    @Test("the 409 carries Docker's message with the holder's stored Docker ID")
     func conflictNamesTheHolderID() async throws {
-        let holder = try makeContainerSnapshot(nativeId: "web", networks: [], labels: [:])
+        let id = DockerContainerID.mint()
+        let holder = try makeContainerSnapshot(nativeId: "web", networks: [], labels: [DockerContainerID.idLabel: id])
         let client = StaticSnapshotClientMock(snapshot: holder)
 
         let abort = try #require(
@@ -42,18 +43,25 @@ import Vapor
         #expect(abort.status == .conflict)
         #expect(
             abort.reason
-                == "Conflict. The container name \"/WEB\" is already in use by container \"\(DockerContainerID.hexId(for: holder))\". You have to remove (or rename) that container to be able to reuse that name."
+                == "Conflict. The container name \"/WEB\" is already in use by container \"\(id)\". You have to remove (or rename) that container to be able to reuse that name."
         )
+        #expect(await client.getCalls == 0, "no lookup that can match by ID prefix")
     }
 
-    @Test("without the holder in the runtime, the 409 names it; any other error is not mapped")
-    func conflictWithoutTheHolder() async throws {
-        let client = StaticSnapshotClientMock(snapshot: try makeContainerSnapshot(nativeId: "web", networks: [], labels: [:]))
-        await client.removeSnapshot()
+    @Test("a holder without a stored Docker ID, or not in the list, is named, never another container")
+    func conflictWithoutAStoredID() async throws {
+        let refusal = ContainerizationError(.exists, message: "container already exists: ab")
+        // No stored ID: the name, not an ID derived from the creation date on disk.
+        var client = StaticSnapshotClientMock(snapshot: try makeContainerSnapshot(nativeId: "ab", networks: [], labels: [:]))
+        var abort = await ContainerNameConflict.conflict(after: refusal, name: "ab", client: client)
+        #expect(abort?.reason.contains("is already in use by container \"ab\"") == true)
 
-        let abort = await ContainerNameConflict.conflict(
-            after: ContainerizationError(.exists, message: "container already exists: web"), name: "web", client: client)
-        #expect(abort?.reason.contains("is already in use by container \"web\"") == true)
-        #expect(await ContainerNameConflict.conflict(after: CancellationError(), name: "web", client: client) == nil)
+        // The holder is gone; another container whose Docker ID starts with "ab" is not named.
+        let other = try makeContainerSnapshot(nativeId: "next", networks: [], labels: [DockerContainerID.idLabel: "ab" + String(repeating: "0", count: 62)])
+        client = StaticSnapshotClientMock(snapshot: other)
+        abort = await ContainerNameConflict.conflict(after: refusal, name: "ab", client: client)
+        #expect(abort?.reason.contains("is already in use by container \"ab\"") == true)
+
+        #expect(await ContainerNameConflict.conflict(after: CancellationError(), name: "ab", client: client) == nil)
     }
 }
