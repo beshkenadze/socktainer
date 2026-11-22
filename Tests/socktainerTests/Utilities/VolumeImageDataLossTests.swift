@@ -50,7 +50,7 @@ import Testing
         defer { try? FileManager.default.removeItem(at: usedDir) }
 
         let volumes = [("v", img), ("d", data), ("u", used)].map {
-            VolumeImageWrites.Volume(name: $0.0, source: $0.1.path, destination: "/x", labels: [:])
+            VolumeImageWrites.Volume(name: $0.0, source: $0.1.path, destination: "/x", labels: [:], noCopy: true)
         }
         var holder = try makeContainerSnapshot(nativeId: "holder", networks: [], labels: [:])
         holder.configuration.mounts = [Filesystem.volume(name: "u", format: "ext4", source: used.path, destination: "/u", options: [])]

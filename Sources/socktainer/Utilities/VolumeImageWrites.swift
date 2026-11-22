@@ -16,6 +16,8 @@ enum VolumeImageWrites {
         let source: String
         let destination: String
         let labels: [String: String]
+        /// `nocopy` (bind option) or `VolumeOptions.NoCopy` (mount): no copy-up.
+        let noCopy: Bool
     }
 
     /// What touches images; replaced in tests.
@@ -41,6 +43,12 @@ enum VolumeImageWrites {
         }
     }
 
+    /// Splits the `nocopy` option off a named volume's options: it is not a mount option.
+    static func splitNoCopy(_ options: [String]) -> (options: [String], noCopy: Bool) {
+        let kept = options.filter { $0.lowercased() != "nocopy" }
+        return (kept, kept.count != options.count)
+    }
+
     static func create(
         volumes: [Volume],
         mergedEnv: [String],
@@ -63,7 +71,7 @@ enum VolumeImageWrites {
         let container = try await nativeCreate()
 
         var warnings: [String] = []
-        let candidates = volumes
+        let candidates = volumes.filter { !$0.noCopy }
         guard !candidates.isEmpty else {
             return (container, warnings)
         }

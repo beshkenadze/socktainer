@@ -594,11 +594,15 @@ extension ContainerCreateRoute {
                 let namedVolumeMounts = volumeMounts.filter { !$0.Source.isEmpty }
                 if !namedVolumeMounts.isEmpty {
                     let volumeStrings = namedVolumeMounts.map { mount in
-                        var volumeString = "\(mount.Source):\(mount.Target)"
+                        var options: [String] = []
                         if mount.ReadOnly == true {
-                            volumeString += ":ro"
+                            options.append("ro")
                         }
-                        return volumeString
+                        if mount.VolumeOptions?.NoCopy == true {
+                            options.append("nocopy")
+                        }
+                        return ([mount.Source, mount.Target] + (options.isEmpty ? [] : [options.joined(separator: ",")]))
+                            .joined(separator: ":")
                     }
                     let volumeMountsOrFs = try Parser.volumes(volumeStrings)
                     mountsOrFs.append(contentsOf: volumeMountsOrFs)
@@ -691,6 +695,7 @@ extension ContainerCreateRoute {
                             createdAnonymousVolumes.append(volume.name)
                         }
 
+                        let (mountOptions, noCopy) = VolumeImageWrites.splitNoCopy(parsed.options)
                         // Per-volume sync label wins; fall back to global --volume-sync (default: nosync).
                         let syncMode =
                             volume.labels[Filesystem.SyncMode.socktainerLabel]
@@ -702,14 +707,14 @@ extension ContainerCreateRoute {
                             format: volume.format,
                             source: volume.source,
                             destination: parsed.destination,
-                            options: parsed.options,
+                            options: mountOptions,
                             sync: syncMode
                         )
                         if volume.format == "ext4" {
                             volumeWrites.append(
                                 VolumeImageWrites.Volume(
                                     name: volume.name, source: volume.source, destination: parsed.destination,
-                                    labels: volume.labels))
+                                    labels: volume.labels, noCopy: noCopy))
                         }
                         resolvedMounts.append(volumeMount)
                     }

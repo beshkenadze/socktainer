@@ -33,8 +33,8 @@ import Testing
         }
     }
 
-    private func volume(_ name: String, labels: [String: String] = [:]) -> VolumeImageWrites.Volume {
-        VolumeImageWrites.Volume(name: name, source: "/vols/\(name)/volume.img", destination: "/data", labels: labels)
+    private func volume(_ name: String, noCopy: Bool = false, labels: [String: String] = [:]) -> VolumeImageWrites.Volume {
+        VolumeImageWrites.Volume(name: name, source: "/vols/\(name)/volume.img", destination: "/data", labels: labels, noCopy: noCopy)
     }
 
     private func snapshot(_ id: String, mounts: [Filesystem] = []) throws -> ContainerSnapshot {
@@ -127,6 +127,16 @@ import Testing
         #expect(warnings.count == 1 && warnings[0].contains("\"doubt\"") && warnings[0].contains("not marked clean"))
     }
 
+    @Test("nocopy stops the copy-up; a Postgres volume is still cleaned")
+    func noCopy() async throws {
+        let pg = volume("pg", noCopy: true)
+        let plain = volume("plain", noCopy: true)
+        let recorder = Recorder([pg.source: .replaceable(hasLostFound: true), plain.source: .replaceable(hasLostFound: true)])
+        let warnings = try await run([pg, plain], recorder: recorder, lists: [[]])
+        #expect(recorder.events == ["list", "clean \(pg.source)", "clean \(plain.source)", "create"])
+        #expect(warnings.isEmpty)
+    }
+
     @Test("no clean-up without PGDATA or with the opt-out label")
     func cleanUpConditions() async throws {
         let v = volume("v")
@@ -150,4 +160,10 @@ import Testing
         #expect(recorder.events == ["create"])
     }
 
+    @Test("nocopy is taken off the mount options")
+    func splitNoCopy() {
+        #expect(VolumeImageWrites.splitNoCopy(["ro", "nocopy"]) == (["ro"], true))
+        #expect(VolumeImageWrites.splitNoCopy(["NoCopy"]) == ([], true))
+        #expect(VolumeImageWrites.splitNoCopy(["ro"]) == (["ro"], false))
+    }
 }
