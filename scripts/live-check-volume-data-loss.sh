@@ -12,8 +12,8 @@
 # Checks (each prints PASS or FAIL):
 #   D-1        a Postgres create on a volume that holds data and /lost+found keeps the data;
 #   D-2        a create on a volume that a running container uses keeps that container's writes;
-#   rejected   a Postgres create that the runtime rejects as a name conflict leaves the volume
-#              image unchanged;
+#   rejected   a Postgres create that the runtime rejects as a name conflict ("container already
+#              exists: <name>") leaves the volume image unchanged;
 #   copy-up    a new volume mounted over an image directory gets that directory's contents;
 #   postgres   Postgres initialises on a new volume mounted at its PGDATA;
 #   two-a      a plain service, then Postgres, created one after the other on one new volume;
@@ -151,14 +151,20 @@ must_create "$(name rjh)" "$IMG" true
 # The image's identity (inode, size, modification time) and its first 64 MiB, which hold the
 # superblock, the group descriptors and the root directory. Hashing all of a sparse 512 GiB image
 # would take hours; a replacement changes the inode anyway.
-fingerprint() { stat -f '%i %z %m' "$1" && head -c $((64 * 1024 * 1024)) "$1" | shasum | cut -d' ' -f1; }
+# An image's identity and the hash of its first 64 MiB. Fails when any read fails.
+fingerprint() {
+    local meta sum
+    meta=$(stat -f '%i %z %m' "$1") || return 1
+    sum=$(set -o pipefail; head -c $((64 * 1024 * 1024)) "$1" | shasum) || return 1
+    printf '%s %s\n' "$meta" "${sum%% *}"
+}
 before=$(fingerprint "$image") || die "cannot read $image"
 if new_container "$(name rjh)" "${PG[@]}" -v "$v:/var/lib/postgresql/data" "$PG_IMAGE"; then
     result rejected FAIL "the duplicate create was accepted"
-elif ! grep -qiE "already exists|already in use|conflict" "$WORK/$(name rjh).create.txt"; then
+elif ! grep -qF "container already exists: $(name rjh)" "$WORK/$(name rjh).create.txt"; then
     result rejected FAIL "the create failed, but not on the name conflict: $(head -c 200 "$WORK/$(name rjh).create.txt")"
 else
-    after=$(fingerprint "$image")
+    after=$(fingerprint "$image") || die "cannot read $image"
     [[ "$before" == "$after" ]] && result rejected PASS "refused as a name conflict; the image is unchanged" ||
         result rejected FAIL "the rejected create changed the image"
 fi
@@ -207,7 +213,7 @@ CONTAINERS+=("$(name hoh)")
 image="$ROOT/volumes/$v/volume.img"
 before=$(fingerprint "$image") || die "cannot read $image"
 must_create "$(name hop)" "${PG[@]}" -v "$v:/var/lib/postgresql/data" "$PG_IMAGE"
-after=$(fingerprint "$image")
+after=$(fingerprint "$image") || die "cannot read $image"
 if grep -q "volume \"$v\" was not prepared (another container names it" "$WORK/$(name hop).create.txt" && [[ "$before" == "$after" ]]; then
     result holder PASS "the create warned that another container names the volume, and the volume is unchanged"
 elif [[ "$before" != "$after" ]]; then
