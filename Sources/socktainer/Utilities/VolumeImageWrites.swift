@@ -2,19 +2,20 @@ import ContainerResource
 import Foundation
 import Logging
 
-/// The host-side writes to volume images that a container create makes. They all happen after
-/// the native create has succeeded: a create that the runtime refuses changes no volume.
+/// The host-side writes to volume images that a container create makes: the copy-up, and nothing
+/// else. It happens after the native create has succeeded, so a create that the runtime refuses
+/// changes no volume.
 ///
-/// A volume that `VolumeImageEligibility` finds empty and clean is prepared, as on 166bbd5:
-/// - without `nocopy`, the copy-up builds a new image with what the container's image has at the
-///   mount path (nothing when the path is absent), without `/lost+found`;
-/// - with `nocopy`, only a Postgres container (`PGDATA`, no opt-out) gets one change: the empty
-///   `/lost+found` is dropped. Otherwise nothing is wanted.
-/// A wanted preparation needs the container list, read after the native create: no write to a
-/// volume that another container configuration names (by volume name or image path), and none
-/// when the list cannot be read. Every wanted preparation that does not happen gives a create
-/// warning that says why and what to do. A volume that holds data is not touched and gives no
-/// warning.
+/// A volume is prepared at most once per create, by its first mount in the order of the request
+/// (Binds, then Mounts, then the image's declared volumes, as on 166bbd5). When that mount has no
+/// `nocopy`, and `VolumeImageEligibility` finds the image empty and clean, the copy-up builds a
+/// new image with what the container's image has at the mount path (nothing when the path is
+/// absent), without `/lost+found`. With `nocopy`, the volume is not touched, as in Docker.
+///
+/// A copy-up needs the container list, read after the native create (three attempts): no write to
+/// a volume that another container configuration names (by volume name or image path), and none
+/// when the list cannot be read. Every wanted copy-up that does not happen gives a create warning
+/// that says why. A volume that holds data is not touched and gives no warning.
 enum VolumeImageWrites {
     /// An ext4 volume that the new container mounts.
     struct Volume: Equatable, Sendable {
@@ -26,24 +27,12 @@ enum VolumeImageWrites {
         let noCopy: Bool
     }
 
-    /// One preparation of one volume.
-    enum Job: Equatable, Sendable {
-        case copyUp(source: String, destination: String)
-        case dropLostFound(source: String)
-
-        var source: String {
-            switch self {
-            case .copyUp(let source, _), .dropLostFound(let source): source
-            }
-        }
-    }
-
     /// What touches images; replaced in tests.
     protocol Writer: Sendable {
         func verdict(imagePath: String) -> VolumeImageEligibility.Verdict
-        /// Runs the jobs for `container`; returns why each job that did not complete failed,
-        /// keyed by the volume's image path.
-        func prepare(_ jobs: [Job], for container: ContainerSnapshot) -> [String: String]
+        /// Copies up each volume for `container`; returns why each copy-up that did not complete
+        /// failed, keyed by the volume's image path.
+        func copyUp(_ volumes: [(source: String, destination: String)], into container: ContainerSnapshot) -> [String: String]
     }
 
     struct Production: Writer {
@@ -53,25 +42,13 @@ enum VolumeImageWrites {
             VolumeImageEligibility.check(imagePath: imagePath)
         }
 
-        func prepare(_ jobs: [Job], for container: ContainerSnapshot) -> [String: String] {
-            var failures: [String: String] = [:]
-            var copies: [(source: String, destination: String)] = []
-            for job in jobs {
-                switch job {
-                case .copyUp(let source, let destination):
-                    copies.append((source: source, destination: destination))
-                case .dropLostFound(let source):
-                    do {
-                        try VolumeImageCleaner.removeLostFound(imagePath: source, logger: logger)
-                    } catch {
-                        failures[source] = "\(error)"
-                    }
-                }
-            }
-            failures.merge(ContainerCreateRoute.populateEmptyVolumes(copies, for: container, logger: logger)) { $1 }
-            return failures
+        func copyUp(_ volumes: [(source: String, destination: String)], into container: ContainerSnapshot) -> [String: String] {
+            ContainerCreateRoute.populateEmptyVolumes(volumes, for: container, logger: logger)
         }
     }
+
+    static let listAttempts = 3
+    static let listPause = Duration.milliseconds(200)
 
     /// Splits the `nocopy` option off a named volume's options: it is not a mount option.
     static func splitNoCopy(_ options: [String]) -> (options: [String], noCopy: Bool) {
@@ -79,13 +56,31 @@ enum VolumeImageWrites {
         return (kept, kept.count != options.count)
     }
 
-    /// The text of a create warning for a volume whose preparation did not happen.
-    static func notPrepared(_ volume: Volume, reason: String) -> String {
-        "volume \"\(volume.name)\" was not prepared (\(reason)): it keeps /lost+found and "
-            + (volume.noCopy ? "" : "the image's \(volume.destination) was not copied into it. ")
-            + "A Postgres container with PGDATA at the volume root refuses /lost+found: stop every container that uses the volume, "
-            + "then run `docker run --rm -v \(volume.name):/v busybox rmdir /v/lost+found`, or create and start the service "
-            + "that fills the volume before the others"
+    /// The `PGDATA` value of the container, when it sets one.
+    static func pgdata(_ mergedEnv: [String]) -> String? {
+        mergedEnv.first { $0.hasPrefix("PGDATA=") }.map { String($0.dropFirst("PGDATA=".count)) }
+    }
+
+    /// The text of a create warning for a volume that was not prepared. It says only what the
+    /// check saw: the copy-up part only when a copy-up was wanted, and /lost+found as present
+    /// only when the check found it.
+    static func notPrepared(_ volume: Volume, reason: String, verdict: VolumeImageEligibility.Verdict) -> String {
+        var missed: [String] = []
+        if !volume.noCopy {
+            missed.append("the image's files at \(volume.destination) were not copied into it")
+        }
+        switch verdict {
+        case .replaceable(hasLostFound: true):
+            missed.append("its /lost+found directory was not removed")
+        case .replaceable(hasLostFound: false):
+            break
+        case .doubtful, .holdsData:
+            missed.append("a /lost+found directory, if it has one, was not removed")
+        }
+        return "volume \"\(volume.name)\" was not prepared (\(reason)): " + missed.joined(separator: ", and ")
+            + ". If the container needs either, stop every container that uses the volume, then copy the files in or run "
+            + "`docker run --rm -v \(volume.name):/v busybox rmdir /v/lost+found`, or create and start the container that "
+            + "fills the volume first"
     }
 
     static func create(
@@ -98,58 +93,59 @@ enum VolumeImageWrites {
     ) async throws -> (container: ContainerSnapshot, warnings: [String]) {
         let container = try await nativeCreate()
 
-        let postgres = VolumeImageCleaner.isPostgresDataVolume(mergedEnv: mergedEnv)
-        // The preparation each volume wants, decided on its image after the create.
-        var wanted: [(volume: Volume, verdict: VolumeImageEligibility.Verdict)] = []
-        for volume in volumes {
+        // One plan per volume: its first mount decides.
+        var seen = Set<String>()
+        let firstMounts = volumes.filter { seen.insert($0.source).inserted }
+
+        var warnings: [String] = []
+        var candidates: [(volume: Volume, verdict: VolumeImageEligibility.Verdict)] = []
+        let pgdata = pgdata(mergedEnv)
+        for volume in firstMounts {
             let verdict = writer.verdict(imagePath: volume.source)
             if case .holdsData = verdict {
                 continue
             }
             if volume.noCopy {
-                guard postgres, VolumeImageCleaner.isEnabled(labels: volume.labels) else {
-                    continue
+                // Not touched. A Postgres data directory at the volume root refuses /lost+found.
+                if case .replaceable(hasLostFound: true) = verdict, pgdata == volume.destination {
+                    warnings.append(notPrepared(volume, reason: "nocopy is set", verdict: verdict))
                 }
-                if case .replaceable(hasLostFound: false) = verdict {
-                    continue
-                }
+                continue
             }
-            wanted.append((volume, verdict))
-        }
-        var warnings: [String] = []
-        var replaceable: [Volume] = []
-        for (volume, verdict) in wanted {
             if case .doubtful(let reason) = verdict {
-                warnings.append(notPrepared(volume, reason: "its image could not be shown to be empty: \(reason)"))
-            } else {
-                replaceable.append(volume)
+                warnings.append(notPrepared(volume, reason: "its image could not be judged: \(reason)", verdict: verdict))
+                continue
             }
+            candidates.append((volume, verdict))
         }
 
-        var jobs: [(volume: Volume, job: Job)] = []
-        // The list is read only when a volume can be prepared.
-        let named =
-            replaceable.isEmpty ? nil : (try? await listContainers()).map { VolumeImageWriters.named(by: $0, except: container.id) }
-        for volume in replaceable {
-            guard let named else {
-                warnings.append(notPrepared(volume, reason: "the container list could not be read"))
-                continue
+        if !candidates.isEmpty {
+            var list: [ContainerSnapshot]?
+            for attempt in 1...listAttempts where list == nil {
+                list = try? await listContainers()
+                if list == nil, attempt < listAttempts {
+                    try? await Task.sleep(for: listPause)
+                }
             }
-            guard VolumeImageWriters.mayWrite(name: volume.name, source: volume.source, named: named) else {
-                warnings.append(notPrepared(volume, reason: "another container uses it, in any state"))
-                continue
+            let named = list.map { VolumeImageWriters.named(by: $0, except: container.id) }
+            var targets: [(volume: Volume, verdict: VolumeImageEligibility.Verdict)] = []
+            for (volume, verdict) in candidates {
+                guard let named else {
+                    warnings.append(notPrepared(volume, reason: "the container list could not be read", verdict: verdict))
+                    continue
+                }
+                guard VolumeImageWriters.mayWrite(name: volume.name, source: volume.source, named: named) else {
+                    warnings.append(notPrepared(volume, reason: "another container names it, in any state", verdict: verdict))
+                    continue
+                }
+                targets.append((volume, verdict))
             }
-            let job: Job =
-                volume.noCopy
-                ? .dropLostFound(source: volume.source)
-                : .copyUp(source: volume.source, destination: volume.destination)
-            jobs.append((volume, job))
-        }
-        if !jobs.isEmpty {
-            let failures = writer.prepare(jobs.map(\.job), for: container)
-            for (volume, job) in jobs {
-                if let failure = failures[job.source] {
-                    warnings.append(notPrepared(volume, reason: failure))
+            if !targets.isEmpty {
+                let failures = writer.copyUp(targets.map { (source: $0.volume.source, destination: $0.volume.destination) }, into: container)
+                for (volume, verdict) in targets {
+                    if let failure = failures[volume.source] {
+                        warnings.append(notPrepared(volume, reason: failure, verdict: verdict))
+                    }
                 }
             }
         }

@@ -116,18 +116,6 @@ import Testing
 
     // MARK: The writers leave every image that is not shown to be empty and clean as it is.
 
-    @Test("the /lost+found clean-up leaves the image as it is", arguments: Shape.allCases)
-    func cleanUpRefuses(_ shape: Shape) throws {
-        let scratch = try Scratch()
-        let image = scratch.path("volume.img")
-        try make(shape, at: image)
-        let before = try state(image)
-
-        try? VolumeImageCleaner.removeLostFound(imagePath: image, logger: logger)
-
-        #expect(try state(image) == before, "\(shape): the image was written")
-    }
-
     @Test("the copy-up leaves the image as it is", arguments: Shape.allCases)
     func copyUpRefuses(_ shape: Shape) throws {
         let scratch = try Scratch()
@@ -170,23 +158,6 @@ import Testing
         #expect(VolumeImageEligibility.check(imagePath: image) == .replaceable(hasLostFound: true))
     }
 
-    @Test("the clean-up builds a new image beside the old one and leaves an empty volume without /lost+found")
-    func cleanUpReplacesAnEmptyImage() throws {
-        let scratch = try Scratch()
-        let image = scratch.path("volume.img")
-        try formatted(image)
-        let before = try state(image)
-
-        let stale = scratch.path("rebuild-\(UUID().uuidString).img")
-        FileManager.default.createFile(atPath: stale, contents: Data("left by a killed bridge".utf8))
-
-        try VolumeImageCleaner.removeLostFound(imagePath: image, logger: logger)
-
-        #expect(try state(image).inode != before.inode, "the formatter ran over the existing file")
-        #expect(VolumeImageEligibility.check(imagePath: image) == .replaceable(hasLostFound: false))
-        #expect(try FileManager.default.contentsOfDirectory(atPath: scratch.dir.path) == ["volume.img"])
-    }
-
     @Test("the copy-up fills an empty volume from the image")
     func copyUpFillsAnEmptyImage() throws {
         let scratch = try Scratch()
@@ -195,11 +166,20 @@ import Testing
         try formatted(image)
         try rootfs(source)
 
+        // A file of the user's whose name looks like a staging file: nothing removes by pattern.
+        let lookalike = scratch.path("rebuild-not-ours.img")
+        try FileManager.default.createDirectory(atPath: lookalike, withIntermediateDirectories: false)
+        try Data("user data".utf8).write(to: URL(fileURLWithPath: lookalike).appendingPathComponent("keep"))
+        let before = try state(image)
+
         try VolumeCopyUp.populate(volumeImagePath: image, fromRootfs: source, sourcePath: "/data", logger: logger)
 
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(image))
         #expect(try reader.listDirectory(FilePath("/")).filter { $0 != "." && $0 != ".." } == ["seed"])
         #expect(VolumeImageEligibility.check(imagePath: image) == .holdsData)
+        #expect(try state(image).inode != before.inode, "the formatter ran over the existing file")
+        #expect(try FileManager.default.contentsOfDirectory(atPath: scratch.dir.path).sorted() == ["rebuild-not-ours.img", "rootfs.ext4", "volume.img"])
+        #expect(FileManager.default.fileExists(atPath: URL(fileURLWithPath: lookalike).appendingPathComponent("keep").path))
     }
 
     @Test("a copy-up from a path that the image does not have leaves an empty volume without /lost+found")

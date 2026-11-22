@@ -30,42 +30,40 @@ import Testing
     // MARK: D-1
 
     /// A Postgres volume whose data did not come from a copy-up keeps /lost+found next to its
-    /// data. Removing /lost+found must never write a new filesystem over that data.
-    @Test func removeLostFoundKeepsTheDataOfAVolumeThatHasData() throws {
+    /// data. A Postgres create on it (through the production writer, on a real image) must leave
+    /// the image byte for byte as it was.
+    @Test func aPostgresCreateKeepsTheDataOfAVolumeThatHasData() async throws {
         let (dir, img) = try image(with: ["/pgdata/PG_VERSION"])
         defer { try? FileManager.default.removeItem(at: dir) }
-        try? VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
-        let after = try EXT4Editor(devicePath: FilePath(img.path))
-        #expect(after.exists(path: "/pgdata/PG_VERSION"), "the volume's data was erased")
-    }
-
-    /// The create cleans /lost+found only from an empty volume that no other container names
-    /// (through the production writer, on real images).
-    @Test func theCreateCleansOnlyAnEmptyVolumeThatNoOtherContainerNames() async throws {
-        let (dir, img) = try image(with: [])
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let (dataDir, data) = try image(with: ["/pgdata/PG_VERSION"])
-        defer { try? FileManager.default.removeItem(at: dataDir) }
-        let (usedDir, used) = try image(with: [])
-        defer { try? FileManager.default.removeItem(at: usedDir) }
-
-        let volumes = [("v", img), ("d", data), ("u", used)].map {
-            VolumeImageWrites.Volume(name: $0.0, source: $0.1.path, destination: "/x", labels: [:], noCopy: true)
-        }
-        var holder = try makeContainerSnapshot(nativeId: "holder", networks: [], labels: [:])
-        holder.configuration.mounts = [Filesystem.volume(name: "u", format: "ext4", source: used.path, destination: "/u", options: [])]
-        let dataBefore = try Data(contentsOf: data)
-        let usedBefore = try Data(contentsOf: used)
+        let before = try Data(contentsOf: img)
         let new = try makeContainerSnapshot(nativeId: "new", networks: [], labels: [:])
+        let volume = VolumeImageWrites.Volume(name: "v", source: img.path, destination: "/var/lib/postgresql/data", labels: [:], noCopy: false)
 
-        _ = try await VolumeImageWrites.create(
-            volumes: volumes, mergedEnv: ["PGDATA=/var/lib/postgresql/data"],
-            listContainers: { [holder] }, nativeCreate: { new },
+        let result = try await VolumeImageWrites.create(
+            volumes: [volume], mergedEnv: ["PGDATA=/var/lib/postgresql/data"],
+            listContainers: { [] }, nativeCreate: { new },
             writer: VolumeImageWrites.Production(logger: logger), logger: logger)
 
-        #expect(VolumeImageEligibility.check(imagePath: img.path) == .replaceable(hasLostFound: false))
-        #expect(try Data(contentsOf: data) == dataBefore)
-        #expect(try Data(contentsOf: used) == usedBefore)
+        #expect(try Data(contentsOf: img) == before, "the volume's data was changed")
+        #expect(result.warnings.isEmpty)
+    }
+
+    /// With nocopy the volume is not touched, also an empty Postgres volume with /lost+found; the
+    /// create warns instead (through the production writer, on a real image).
+    @Test func aNoCopyVolumeIsNeverWritten() async throws {
+        let (dir, img) = try image(with: [])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let before = try Data(contentsOf: img)
+        let new = try makeContainerSnapshot(nativeId: "new", networks: [], labels: [:])
+        let volume = VolumeImageWrites.Volume(name: "v", source: img.path, destination: "/var/lib/postgresql/data", labels: [:], noCopy: true)
+
+        let result = try await VolumeImageWrites.create(
+            volumes: [volume], mergedEnv: ["PGDATA=/var/lib/postgresql/data"],
+            listContainers: { [] }, nativeCreate: { new },
+            writer: VolumeImageWrites.Production(logger: logger), logger: logger)
+
+        #expect(try Data(contentsOf: img) == before)
+        #expect(result.warnings.count == 1 && result.warnings[0].contains("nocopy is set"))
     }
 
     /// A create that the runtime refuses leaves every volume byte for byte as it was, also a
