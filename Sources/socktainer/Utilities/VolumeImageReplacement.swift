@@ -19,6 +19,7 @@ enum VolumeImageReplacement {
     /// `/lost+found`, of the old image's size.
     static func replace(imagePath: String, build: (EXT4.Formatter) throws -> Void) throws {
         try requireReplaceable(imagePath)
+        removeStaleStaging(beside: imagePath)
 
         let attributes = try FileManager.default.attributesOfItem(atPath: imagePath)
         let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
@@ -37,6 +38,16 @@ enum VolumeImageReplacement {
         try requireReplaceable(imagePath)
         _ = try FileManager.default.replaceItemAt(destination, withItemAt: staging)
         placed = true
+    }
+
+    /// Removes the staging files that a bridge killed during an earlier rebuild of this volume
+    /// left beside the image. They are only ever this code's own files: `rebuild-<UUID>.img`.
+    private static func removeStaleStaging(beside imagePath: String) {
+        let directory = URL(fileURLWithPath: imagePath).deletingLastPathComponent()
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        for entry in entries where entry.hasPrefix("rebuild-") && entry.hasSuffix(".img") {
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(entry))
+        }
     }
 
     private static func requireReplaceable(_ imagePath: String) throws {

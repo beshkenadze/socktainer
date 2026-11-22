@@ -972,18 +972,24 @@ extension ContainerCreateRoute {
     /// the container exists, which is when the image's filesystem can be read, and
     /// always before it starts. Best-effort: a volume that cannot be prepared is
     /// left as it was rather than failing the creation.
+    /// Copies up each candidate; returns why each one that did not complete failed, keyed by
+    /// the volume's image path.
     static func populateEmptyVolumes(
         _ candidates: [(source: String, destination: String)],
         for container: ContainerSnapshot,
         logger: Logger
-    ) {
-        guard !candidates.isEmpty else { return }
+    ) -> [String: String] {
+        guard !candidates.isEmpty else { return [:] }
         let appSupport = URL(fileURLWithPath: "\(NSHomeDirectory())/Library/Application Support/com.apple.container")
         guard
             let rootfs = VolumeCopyUp.imageFilesystem(
                 containerId: container.id, appSupportPath: appSupport)
-        else { return }
+        else {
+            let reason = "the container's image file system could not be found"
+            return Dictionary(candidates.map { ($0.source, reason) }, uniquingKeysWith: { first, _ in first })
+        }
 
+        var failures: [String: String] = [:]
         for candidate in candidates {
             do {
                 try VolumeCopyUp.populate(
@@ -993,9 +999,10 @@ extension ContainerCreateRoute {
                     logger: logger
                 )
             } catch {
-                logger.warning("[volume-copyup] \(candidate.destination) not copied: \(error)")
+                failures[candidate.source] = "the copy-up failed: \(error)"
             }
         }
+        return failures
     }
 
     static func makeCreateEvent(for container: ContainerSnapshot) -> DockerEvent {

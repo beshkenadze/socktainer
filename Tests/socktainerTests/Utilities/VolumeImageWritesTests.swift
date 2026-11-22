@@ -12,13 +12,16 @@ import Testing
     private let logger = Logger(label: "test.volume-writes")
     private static let postgres = ["PGDATA=/var/lib/postgresql/data"]
 
-    /// Records every call in order and answers the verdicts it is given.
+    /// Records every call in order, answers the verdicts it is given, and fails the jobs it is
+    /// told to fail.
     private final class Recorder: VolumeImageWrites.Writer, @unchecked Sendable {
         private let lock = Mutex<[String]>([])
         let verdicts: [String: VolumeImageEligibility.Verdict]
+        let failing: [String: String]
 
-        init(_ verdicts: [String: VolumeImageEligibility.Verdict]) {
+        init(_ verdicts: [String: VolumeImageEligibility.Verdict], failing: [String: String] = [:]) {
             self.verdicts = verdicts
+            self.failing = failing
         }
 
         var events: [String] { lock.withLock { $0 } }
@@ -27,9 +30,15 @@ import Testing
         func verdict(imagePath: String) -> VolumeImageEligibility.Verdict {
             verdicts[imagePath] ?? .doubtful("unknown image")
         }
-        func removeLostFound(imagePath: String) { record("clean \(imagePath)") }
-        func copyUp(_ volumes: [(source: String, destination: String)], into container: ContainerSnapshot) {
-            record("copy-up \(volumes.map(\.source).joined(separator: ",")) into \(container.id)")
+
+        func prepare(_ jobs: [VolumeImageWrites.Job], for container: ContainerSnapshot) -> [String: String] {
+            for job in jobs {
+                switch job {
+                case .copyUp(let source, _): record("copy-up \(source) into \(container.id)")
+                case .dropLostFound(let source): record("drop lost+found \(source)")
+                }
+            }
+            return failing
         }
     }
 
@@ -47,22 +56,18 @@ import Testing
         .volume(name: name, format: "ext4", source: "/vols/\(name)/volume.img", destination: "/x", options: [])
     }
 
-    /// Runs `create` with lists that answer in turn from `lists` (nil: the list fails).
+    /// Runs `create`; the container list answers `list` (nil: it fails).
     private func run(
         _ volumes: [VolumeImageWrites.Volume], env: [String] = postgres, recorder: Recorder,
-        lists: [[ContainerSnapshot]?], createFails: Bool = false
+        list: [ContainerSnapshot]?, createFails: Bool = false
     ) async throws -> [String] {
-        let answers = Mutex(lists)
         let created = try snapshot("new", mounts: volumes.map { mount($0.name) })
         let result = try await VolumeImageWrites.create(
             volumes: volumes,
             mergedEnv: env,
             listContainers: {
                 recorder.record("list")
-                let next: [ContainerSnapshot]?? = answers.withLock { lists in
-                    lists.isEmpty ? .none : .some(lists.removeFirst())
-                }
-                guard case .some(.some(let list)) = next else { throw CancellationError() }
+                guard let list else { throw CancellationError() }
                 return list
             },
             nativeCreate: {
@@ -76,88 +81,87 @@ import Testing
         return result.warnings
     }
 
-    @Test("an empty Postgres volume is cleaned before the native create and filled after it")
+    @Test("nothing is written before the native create; an empty volume is filled after it")
     func order() async throws {
         let v = volume("pg")
         let recorder = Recorder([v.source: .replaceable(hasLostFound: true)])
-        let warnings = try await run([v], recorder: recorder, lists: [[], [try snapshot("new", mounts: [mount("pg")])]])
-        #expect(recorder.events == ["list", "clean \(v.source)", "create", "list", "copy-up \(v.source) into new"])
+        let warnings = try await run([v], recorder: recorder, list: [try snapshot("new", mounts: [mount("pg")])])
+        #expect(recorder.events == ["create", "list", "copy-up \(v.source) into new"])
         #expect(warnings.isEmpty)
     }
 
-    @Test("no write at all when the container list cannot be read")
+    @Test("a native create that fails gets no list and no write")
+    func failedCreateWritesNothing() async throws {
+        let v = volume("pg")
+        let recorder = Recorder([v.source: .replaceable(hasLostFound: true)])
+        await #expect(throws: CancellationError.self) {
+            _ = try await run([v], recorder: recorder, list: [], createFails: true)
+        }
+        #expect(recorder.events == ["create"])
+    }
+
+    @Test("no write when the container list cannot be read, and a warning that says so")
     func listFailureMeansNoWrite() async throws {
         let v = volume("pg")
         let recorder = Recorder([v.source: .replaceable(hasLostFound: true)])
-        let warnings = try await run([v], recorder: recorder, lists: [nil, nil])
-        #expect(recorder.events == ["list", "create", "list"])
-        #expect(warnings.count == 1 && warnings[0].contains("could not be read"))
+        let warnings = try await run([v], recorder: recorder, list: nil)
+        #expect(recorder.events == ["create", "list"])
+        #expect(warnings.count == 1 && warnings[0].contains("could not be read") && warnings[0].contains("rmdir /v/lost+found"))
     }
 
-    @Test("no write to a volume that another container names, by name or as a block device")
+    @Test("no write to a volume that another container names, by name or as a block device, and a warning")
     func namedElsewhereMeansNoWrite() async throws {
         let v = volume("shared")
         let byName = try snapshot("other", mounts: [mount("shared")])
-        let byPath = try snapshot(
-            "alias", mounts: [.block(format: "ext4", source: v.source, destination: "/y", options: [])])
+        let byPath = try snapshot("alias", mounts: [.block(format: "ext4", source: v.source, destination: "/y", options: [])])
         for holder in [byName, byPath] {
             let recorder = Recorder([v.source: .replaceable(hasLostFound: true)])
-            let warnings = try await run([v], recorder: recorder, lists: [[holder], [holder]])
-            #expect(recorder.events == ["list", "create", "list"], "holder \(holder.id)")
-            #expect(warnings.count == 1 && warnings[0].contains("is used by another container"))
+            let warnings = try await run([v], recorder: recorder, list: [holder])
+            #expect(recorder.events == ["create", "list"], "holder \(holder.id)")
+            #expect(warnings.count == 1 && warnings[0].contains("another container uses it"))
         }
     }
 
-    @Test("a container that names the volume and appears during the create stops the copy-up")
-    func lateHolderStopsTheCopyUp() async throws {
-        let v = volume("data")
-        let recorder = Recorder([v.source: .replaceable(hasLostFound: true)])
-        let late = try snapshot("late", mounts: [mount("data")])
-        _ = try await run([v], env: [], recorder: recorder, lists: [[late]])
-        #expect(recorder.events == ["create", "list"])
-    }
-
-    @Test("a volume with data gets no write and no warning; a doubtful one gets no write and a warning")
+    @Test("a volume with data gets no list, no write and no warning; a doubtful one gets a warning and no list")
     func verdictsDecide() async throws {
         let data = volume("data")
         let doubt = volume("doubt")
         let recorder = Recorder([data.source: .holdsData, doubt.source: .doubtful("not marked clean")])
-        let warnings = try await run([data, doubt], recorder: recorder, lists: [[], []])
-        #expect(recorder.events == ["create", "list"])
+        let warnings = try await run([data, doubt], recorder: recorder, list: [])
+        #expect(recorder.events == ["create"])
         #expect(warnings.count == 1 && warnings[0].contains("\"doubt\"") && warnings[0].contains("not marked clean"))
     }
 
-    @Test("nocopy stops the copy-up; a Postgres volume is still cleaned")
+    @Test("a preparation that fails gives a warning with its reason")
+    func failedPreparationWarns() async throws {
+        let v = volume("v")
+        let recorder = Recorder([v.source: .replaceable(hasLostFound: true)], failing: [v.source: "the copy-up failed: disk full"])
+        let warnings = try await run([v], recorder: recorder, list: [])
+        #expect(recorder.events == ["create", "list", "copy-up \(v.source) into new"])
+        #expect(warnings.count == 1 && warnings[0].contains("disk full"))
+    }
+
+    @Test("nocopy: no copy-up; a Postgres volume with /lost+found only loses it, and nothing else is wanted")
     func noCopy() async throws {
         let pg = volume("pg", noCopy: true)
-        let plain = volume("plain", noCopy: true)
-        let recorder = Recorder([pg.source: .replaceable(hasLostFound: true), plain.source: .replaceable(hasLostFound: true)])
-        let warnings = try await run([pg, plain], recorder: recorder, lists: [[]])
-        #expect(recorder.events == ["list", "clean \(pg.source)", "clean \(plain.source)", "create"])
+        var recorder = Recorder([pg.source: .replaceable(hasLostFound: true)])
+        var warnings = try await run([pg], recorder: recorder, list: [])
+        #expect(recorder.events == ["create", "list", "drop lost+found \(pg.source)"])
         #expect(warnings.isEmpty)
-    }
 
-    @Test("no clean-up without PGDATA or with the opt-out label")
-    func cleanUpConditions() async throws {
-        let v = volume("v")
-        var recorder = Recorder([v.source: .replaceable(hasLostFound: true)])
-        _ = try await run([v], env: ["FOO=1"], recorder: recorder, lists: [[]])
-        #expect(!recorder.events.contains { $0.hasPrefix("clean") })
-
-        let optedOut = volume("o", labels: [VolumeImageCleaner.optOutLabel: "false"])
-        recorder = Recorder([optedOut.source: .replaceable(hasLostFound: true)])
-        _ = try await run([optedOut], recorder: recorder, lists: [[], []])
-        #expect(!recorder.events.contains { $0.hasPrefix("clean") })
-    }
-
-    @Test("a native create that fails gets no copy-up")
-    func failedCreateGetsNoCopyUp() async throws {
-        let v = volume("v")
-        let recorder = Recorder([v.source: .replaceable(hasLostFound: false)])
-        await #expect(throws: CancellationError.self) {
-            _ = try await run([v], env: [], recorder: recorder, lists: [[]], createFails: true)
+        // Not Postgres, opted out, or already without /lost+found: nothing is wanted, no list.
+        let optedOut = volume("o", noCopy: true, labels: [VolumeImageCleaner.optOutLabel: "false"])
+        let clean = volume("c", noCopy: true)
+        for (vol, env, verdict) in [
+            (pg, ["FOO=1"], VolumeImageEligibility.Verdict.replaceable(hasLostFound: true)),
+            (optedOut, Self.postgres, .replaceable(hasLostFound: true)),
+            (clean, Self.postgres, .replaceable(hasLostFound: false)),
+        ] {
+            recorder = Recorder([vol.source: verdict])
+            warnings = try await run([vol], env: env, recorder: recorder, list: [])
+            #expect(recorder.events == ["create"], "\(vol.name)")
+            #expect(warnings.isEmpty)
         }
-        #expect(recorder.events == ["create"])
     }
 
     @Test("nocopy is taken off the mount options")

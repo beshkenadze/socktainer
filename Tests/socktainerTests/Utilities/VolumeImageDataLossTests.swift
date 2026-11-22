@@ -34,7 +34,7 @@ import Testing
     @Test func removeLostFoundKeepsTheDataOfAVolumeThatHasData() throws {
         let (dir, img) = try image(with: ["/pgdata/PG_VERSION"])
         defer { try? FileManager.default.removeItem(at: dir) }
-        VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
+        try? VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
         let after = try EXT4Editor(devicePath: FilePath(img.path))
         #expect(after.exists(path: "/pgdata/PG_VERSION"), "the volume's data was erased")
     }
@@ -66,6 +66,26 @@ import Testing
         #expect(VolumeImageEligibility.check(imagePath: img.path) == .replaceable(hasLostFound: false))
         #expect(try Data(contentsOf: data) == dataBefore)
         #expect(try Data(contentsOf: used) == usedBefore)
+    }
+
+    /// A create that the runtime refuses leaves every volume byte for byte as it was, also a
+    /// Postgres volume with /lost+found (166bbd5 wrote nothing before the native create either).
+    @Test func aRefusedCreateChangesNoVolume() async throws {
+        let (dir, img) = try image(with: [])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let before = try Data(contentsOf: img)
+        let volumes = [false, true].map {
+            VolumeImageWrites.Volume(name: "v", source: img.path, destination: "/var/lib/postgresql/data", labels: [:], noCopy: $0)
+        }
+        for volume in volumes {
+            await #expect(throws: CancellationError.self) {
+                _ = try await VolumeImageWrites.create(
+                    volumes: [volume], mergedEnv: ["PGDATA=/var/lib/postgresql/data"],
+                    listContainers: { [] }, nativeCreate: { throw CancellationError() },
+                    writer: VolumeImageWrites.Production(logger: logger), logger: logger)
+            }
+            #expect(try Data(contentsOf: img) == before)
+        }
     }
 
     // MARK: D-2

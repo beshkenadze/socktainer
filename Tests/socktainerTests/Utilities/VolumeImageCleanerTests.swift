@@ -39,7 +39,7 @@ final class VolumeImageCleanerTests {
     @Test("removeLostFound deletes /lost+found and leaves a readable filesystem")
     func removesLostFound() throws {
         let img = try freshExt4Image()
-        VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
+        try VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
 
         let editor = try EXT4Editor(devicePath: FilePath(img.path))
         #expect(editor.exists(path: "/lost+found") == false)
@@ -49,21 +49,21 @@ final class VolumeImageCleanerTests {
 
     @Test("Skips a path that is not a regular file (never wipes a directory)")
     func skipsNonRegularFile() {
-        // Must not throw or touch anything when handed a directory.
-        VolumeImageCleaner.removeLostFound(imagePath: tempDir.path, logger: logger)
+        // Refuses, and touches nothing, when handed a directory.
+        #expect(throws: (any Error).self) { try VolumeImageCleaner.removeLostFound(imagePath: tempDir.path, logger: logger) }
         #expect(FileManager.default.fileExists(atPath: tempDir.path))
     }
 
     @Test("Skips a missing path")
     func skipsMissingPath() {
-        VolumeImageCleaner.removeLostFound(imagePath: tempDir.appendingPathComponent("nope.img").path, logger: logger)
+        try? VolumeImageCleaner.removeLostFound(imagePath: tempDir.appendingPathComponent("nope.img").path, logger: logger)
     }
 
     @Test("Skips a regular file that is not an EXT4 image (never reformats it)")
     func skipsNonExt4File() throws {
         let junk = tempDir.appendingPathComponent("junk.img")
         try Data(repeating: 0, count: 1024 * 1024).write(to: junk)  // 1 MB of zeros — not ext4
-        VolumeImageCleaner.removeLostFound(imagePath: junk.path, logger: logger)
+        try? VolumeImageCleaner.removeLostFound(imagePath: junk.path, logger: logger)
         // The file must be left untouched — not reformatted into a valid ext4 fs.
         #expect((try? EXT4Editor(devicePath: FilePath(junk.path))) == nil)
     }
@@ -71,9 +71,9 @@ final class VolumeImageCleanerTests {
     @Test("Is idempotent — safe to call on a volume already without /lost+found")
     func idempotentOnCleanVolume() throws {
         let img = try freshExt4Image()
-        VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
+        try? VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
         // Second call must not wipe the volume — /lost+found is already gone.
-        VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
+        try? VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
         let editor = try EXT4Editor(devicePath: FilePath(img.path))
         #expect(editor.exists(path: "/") == true)
         #expect(editor.exists(path: "/lost+found") == false)
@@ -84,13 +84,13 @@ final class VolumeImageCleanerTests {
         // Safety guarantee: once /lost+found is gone the cleaner is a no-op,
         // so data written after the first clean (e.g. by initdb) is never wiped.
         let img = try freshExt4Image()
-        VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
+        try? VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
 
         let editor = try EXT4Editor(devicePath: FilePath(img.path))
         try editor.createDirectory(path: "/userdata", uid: 0, gid: 0)
         try editor.sync()
 
-        VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)  // must be no-op
+        try? VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)  // must be no-op
 
         let verifier = try EXT4Editor(devicePath: FilePath(img.path))
         #expect(verifier.exists(path: "/userdata") == true)

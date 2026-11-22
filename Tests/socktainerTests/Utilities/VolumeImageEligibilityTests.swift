@@ -123,7 +123,7 @@ import Testing
         try make(shape, at: image)
         let before = try state(image)
 
-        VolumeImageCleaner.removeLostFound(imagePath: image, logger: logger)
+        try? VolumeImageCleaner.removeLostFound(imagePath: image, logger: logger)
 
         #expect(try state(image) == before, "\(shape): the image was written")
     }
@@ -177,7 +177,10 @@ import Testing
         try formatted(image)
         let before = try state(image)
 
-        VolumeImageCleaner.removeLostFound(imagePath: image, logger: logger)
+        let stale = scratch.path("rebuild-\(UUID().uuidString).img")
+        FileManager.default.createFile(atPath: stale, contents: Data("left by a killed bridge".utf8))
+
+        try VolumeImageCleaner.removeLostFound(imagePath: image, logger: logger)
 
         #expect(try state(image).inode != before.inode, "the formatter ran over the existing file")
         #expect(VolumeImageEligibility.check(imagePath: image) == .replaceable(hasLostFound: false))

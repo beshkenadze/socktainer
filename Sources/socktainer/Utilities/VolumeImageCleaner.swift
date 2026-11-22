@@ -37,18 +37,13 @@ enum VolumeImageCleaner {
     /// Replaces an empty EXT4 image that has `/lost+found` with an empty one that does not. The
     /// new image is built beside the old one and moved into place, so a failure leaves the old
     /// image whole; any image that is not shown to be empty and clean is left as it is.
-    static func removeLostFound(imagePath: String, logger: Logger) {
+    static func removeLostFound(imagePath: String, logger: Logger) throws {
         guard VolumeImageEligibility.check(imagePath: imagePath) == .replaceable(hasLostFound: true) else {
-            logger.info("[volume-clean] \(imagePath) left as it is: not an empty volume with /lost+found")
-            return
+            throw VolumeImageReplacement.Refused(reason: "not an empty volume with /lost+found")
         }
-        do {
-            try VolumeImageReplacement.replace(imagePath: imagePath) { formatter in
-                try formatter.unlink(path: FilePath("/lost+found"))
-            }
-            logger.info("[volume-clean] removed /lost+found from \(imagePath)")
-        } catch {
-            logger.warning("[volume-clean] \(imagePath) left as it is: \(error)")
+        try VolumeImageReplacement.replace(imagePath: imagePath) { formatter in
+            try formatter.unlink(path: FilePath("/lost+found"))
         }
+        logger.info("[volume-clean] removed /lost+found from \(imagePath)")
     }
 }
