@@ -5,19 +5,22 @@
 #   C=<container CLI> scripts/live-check-volume-data-loss.sh <socktainer binary>
 #
 # For a host where nobody else creates containers or volumes whose names start with vdl- during
-# the run: the script checks that its names are free before it starts, and an object that
-# another actor makes under one of them in between would be taken as its own.
+# the run: the script checks that its names are free before it starts and again right before
+# each volume create, but a native `container` CLI actor that creates one of those names between
+# that check and the create would have its object taken as the script's own, and removed.
 #
 # Checks (each prints PASS or FAIL):
 #   D-1        a Postgres create on a volume that holds data and /lost+found keeps the data;
 #   D-2        a create on a volume that a running container uses keeps that container's writes;
-#   rejected   a Postgres create that the runtime rejects leaves the volume image byte-identical;
+#   rejected   a Postgres create that the runtime rejects as a name conflict leaves the volume
+#              image unchanged;
 #   copy-up    a new volume mounted over an image directory gets that directory's contents;
 #   postgres   Postgres initialises on a new volume mounted at its PGDATA;
 #   two-a      a plain service, then Postgres, created one after the other on one new volume;
 #   two-b      the same in the other order;
-#   holder     Postgres on a volume that a never-started container names: it initialises, or the
-#              create warns that the volume was not prepared (the stated difference from 166bbd5);
+#   holder     a create on a volume that a never-started container names: the create warns that the
+#              volume was not prepared because another container names it, and the volume is
+#              unchanged. On 166bbd5 this reports DIFFERS-BY-DESIGN (it prepared the volume).
 #   nocopy-v   `-v vol:/path:nocopy` starts, and the volume does not get the image's directory;
 #   nocopy-m   `--mount ...,volume-nocopy=true` does not get it either.
 #
@@ -152,9 +155,11 @@ fingerprint() { stat -f '%i %z %m' "$1" && head -c $((64 * 1024 * 1024)) "$1" | 
 before=$(fingerprint "$image") || die "cannot read $image"
 if new_container "$(name rjh)" "${PG[@]}" -v "$v:/var/lib/postgresql/data" "$PG_IMAGE"; then
     result rejected FAIL "the duplicate create was accepted"
+elif ! grep -qiE "already exists|already in use|conflict" "$WORK/$(name rjh).create.txt"; then
+    result rejected FAIL "the create failed, but not on the name conflict: $(head -c 200 "$WORK/$(name rjh).create.txt")"
 else
     after=$(fingerprint "$image")
-    [[ "$before" == "$after" ]] && result rejected PASS "the image is byte-identical" ||
+    [[ "$before" == "$after" ]] && result rejected PASS "refused as a name conflict; the image is unchanged" ||
         result rejected FAIL "the rejected create changed the image"
 fi
 
@@ -199,18 +204,18 @@ v=$(name ho)
 cli_volume "$v"
 "$C" create --name "$(name hoh)" -v "$v:/data" "$IMG" true >/dev/null 2>&1 || die "container create $(name hoh)"
 CONTAINERS+=("$(name hoh)")
+image="$ROOT/volumes/$v/volume.img"
+before=$(fingerprint "$image") || die "cannot read $image"
 must_create "$(name hop)" "${PG[@]}" -v "$v:/var/lib/postgresql/data" "$PG_IMAGE"
-warned=no
-grep -q "was not prepared" "$WORK/$(name hop).create.txt" && warned=yes
-must_start "$(name hop)"
-if pg_initialised "$(name hop)"; then
-    result holder PASS "initialised (warning shown: $warned)"
-elif [[ $warned == yes ]]; then
-    result holder PASS "did not initialise, and the create warned: $(grep -o 'volume "[^"]*" was not prepared ([^)]*)' "$WORK/$(name hop).create.txt")"
+after=$(fingerprint "$image")
+if grep -q "volume \"$v\" was not prepared (another container names it" "$WORK/$(name hop).create.txt" && [[ "$before" == "$after" ]]; then
+    result holder PASS "the create warned that another container names the volume, and the volume is unchanged"
+elif [[ "$before" != "$after" ]]; then
+    RESULT=1
+    echo "holder: DIFFERS-BY-DESIGN - the volume was prepared although another container names it (166bbd5 behaviour)"
 else
-    result holder FAIL "did not initialise and gave no warning: $(pg_why "$(name hop)")"
+    result holder FAIL "the volume is unchanged but the create gave no holder warning: $(head -c 300 "$WORK/$(name hop).create.txt")"
 fi
-d stop -t 5 "$(name hop)" >/dev/null 2>&1
 
 # nocopy, both forms.
 v=$(name ncv)
