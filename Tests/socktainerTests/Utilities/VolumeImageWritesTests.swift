@@ -170,4 +170,12 @@ import Testing
         #expect(VolumeImageWrites.splitNoCopy(["NoCopy"]) == ([], true))
         #expect(VolumeImageWrites.splitNoCopy(["ro"]) == (["ro"], false))
     }
+
+    @Test("an anonymous long-form mount keeps NoCopy")
+    func anonymousNoCopy() throws {
+        let mount = try JSONDecoder().decode(
+            Mount.self, from: Data(#"{"Type":"volume","Target":"/etc","VolumeOptions":{"NoCopy":true}}"#.utf8))
+        let parsed = try ContainerCreateRoute.anonymousVolume(for: mount)
+        #expect(VolumeImageWrites.splitNoCopy(parsed.options).noCopy)
+    }
 }

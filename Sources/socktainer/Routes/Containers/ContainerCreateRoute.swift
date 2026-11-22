@@ -1037,9 +1037,13 @@ extension ContainerCreateRoute {
         guard mount.Target.hasPrefix("/") else {
             throw ContainerizationError(.invalidArgument, message: "invalid volume destination: \(mount.Target)")
         }
+        var options: [String] = mount.ReadOnly == true ? ["ro"] : []
+        if mount.VolumeOptions?.NoCopy == true {
+            options.append("nocopy")
+        }
         return ParsedVolume(
             name: VolumeStorage.generateAnonymousVolumeName(), destination: mount.Target,
-            options: mount.ReadOnly == true ? ["ro"] : [], isAnonymous: true)
+            options: options, isAnonymous: true)
     }
 
     static func validateCpuLimits(hostConfig: HostConfig?) -> String? {
