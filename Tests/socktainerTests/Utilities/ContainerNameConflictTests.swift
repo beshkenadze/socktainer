@@ -5,62 +5,55 @@ import Vapor
 
 @testable import socktainer
 
-/// A container name is in use when the data root's file system already has its directory.
+/// The runtime's refusal of a create because the name is in use becomes Docker's 409.
 @Suite struct ContainerNameConflictTests {
-    private final class Root {
-        let dir: URL
-        init() throws {
-            dir = FileManager.default.temporaryDirectory.appendingPathComponent("name-conflict-\(UUID().uuidString)")
-            try FileManager.default.createDirectory(at: dir.appendingPathComponent("web"), withIntermediateDirectories: true)
+    private static let folded =
+        "container 'WEB' cannot be created: on this file system its name is the same as that of the existing container 'web'"
+
+    @Test("the runtime's refusals of a name in use name their holder; other refusals are not name conflicts")
+    func holder() {
+        #expect(ContainerNameConflict.holder(of: "web", in: ContainerizationError(.exists, message: "container already exists: web")) == "web")
+        #expect(ContainerNameConflict.holder(of: "WEB", in: ContainerizationError(.exists, message: Self.folded)) == "web")
+
+        let notNameConflicts: [Error] = [
+            ContainerizationError(.exists, message: "hostname(s) already exist: [\"web\"]"),
+            ContainerizationError(.exists, message: "alias(es) already exist: [\"db\"]"),
+            ContainerizationError(
+                .exists,
+                message:
+                    "container 'web' cannot be created: /x/containers/web already exists, holds files and belongs to no container. An earlier create that stopped before it finished leaves such a directory"
+            ),
+            ContainerizationError(.internalError, message: "container already exists: web"),
+            ContainerizationError(.exists, message: "container already exists: other"),
+            CancellationError(),
+        ]
+        for error in notNameConflicts {
+            #expect(ContainerNameConflict.holder(of: "web", in: error) == nil, "\(error)")
         }
-        deinit { try? FileManager.default.removeItem(at: dir) }
     }
 
-    private static func tempDirIsCaseInsensitive() -> Bool {
-        let base = FileManager.default.temporaryDirectory
-        let probe = base.appendingPathComponent("CaseProbe-\(UUID().uuidString)")
-        guard FileManager.default.createFile(atPath: probe.path, contents: nil) else {
-            return false
-        }
-        defer { try? FileManager.default.removeItem(at: probe) }
-        return FileManager.default.fileExists(atPath: base.appendingPathComponent(probe.lastPathComponent.lowercased()).path)
+    @Test("the 409 carries Docker's message with the holder's full Docker ID")
+    func conflictNamesTheHolderID() async throws {
+        let holder = try makeContainerSnapshot(nativeId: "web", networks: [], labels: [:])
+        let client = StaticSnapshotClientMock(snapshot: holder)
+
+        let abort = try #require(
+            await ContainerNameConflict.conflict(after: ContainerizationError(.exists, message: Self.folded), name: "WEB", client: client))
+        #expect(abort.status == .conflict)
+        #expect(
+            abort.reason
+                == "Conflict. The container name \"/WEB\" is already in use by container \"\(DockerContainerID.hexId(for: holder))\". You have to remove (or rename) that container to be able to reuse that name."
+        )
     }
 
-    @Test(
-        "a name that the file system folds onto an existing container is refused with 409 and the existing name",
-        .enabled(if: tempDirIsCaseInsensitive(), "needs a case-insensitive temporary directory")
-    )
-    func foldedNameIsRefused() throws {
-        let root = try Root()
-        #expect(ContainerNameConflict.existingEntry(id: "WEB", containersDirectory: root.dir) == "web")
-        let error = #expect(throws: Abort.self) {
-            try ContainerNameConflict.guardCreate(name: "WEB", containersDirectory: root.dir)
-        }
-        #expect(error?.status == .conflict)
-        #expect(error?.reason.contains("\"/WEB\" is already in use by container \"web\"") == true)
-    }
+    @Test("without the holder in the runtime, the 409 names it; any other error is not mapped")
+    func conflictWithoutTheHolder() async throws {
+        let client = StaticSnapshotClientMock(snapshot: try makeContainerSnapshot(nativeId: "web", networks: [], labels: [:]))
+        await client.removeSnapshot()
 
-    @Test("an unused name passes, the exact name of an existing container does not")
-    func exactAndUnusedNames() throws {
-        let root = try Root()
-        #expect(ContainerNameConflict.existingEntry(id: "api", containersDirectory: root.dir) == nil)
-        try ContainerNameConflict.guardCreate(name: "api", containersDirectory: root.dir)
-        #expect(throws: Abort.self) {
-            try ContainerNameConflict.guardCreate(name: "web", containersDirectory: root.dir)
-        }
-        try ContainerNameConflict.guardCreate(name: "web", containersDirectory: nil)
-    }
-
-    @Test("the runtime's refusal of a name in use becomes 409; other errors do not")
-    func runtimeRefusalMapsTo409() throws {
-        let root = try Root()
-        let inUse = ContainerizationError(.exists, message: "container already exists: web")
-        #expect(ContainerNameConflict.conflict(after: inUse, name: "web", containersDirectory: root.dir)?.status == .conflict)
-        // .exists for another reason (a hostname): no directory under the name, no 409.
-        let hostname = ContainerizationError(.exists, message: "hostname(s) already exist: [\"api\"]")
-        #expect(ContainerNameConflict.conflict(after: hostname, name: "api", containersDirectory: root.dir) == nil)
-        let other = ContainerizationError(.internalError, message: "boom")
-        #expect(ContainerNameConflict.conflict(after: other, name: "web", containersDirectory: root.dir) == nil)
-        #expect(ContainerNameConflict.conflict(after: inUse, name: "web", containersDirectory: nil) == nil)
+        let abort = await ContainerNameConflict.conflict(
+            after: ContainerizationError(.exists, message: "container already exists: web"), name: "web", client: client)
+        #expect(abort?.reason.contains("is already in use by container \"web\"") == true)
+        #expect(await ContainerNameConflict.conflict(after: CancellationError(), name: "web", client: client) == nil)
     }
 }

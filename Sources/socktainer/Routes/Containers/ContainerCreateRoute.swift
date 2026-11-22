@@ -159,9 +159,6 @@ extension ContainerCreateRoute {
             guard ManagedContainer.nameValid(id) else {
                 throw Abort(.badRequest, reason: "invalid container name: \(id)")
             }
-            // Before any runtime work: a name that the data root folds onto an existing container.
-            let containersDirectory = await ContainerNameConflict.containersDirectory(logger: req.logger)
-            try ContainerNameConflict.guardCreate(name: id, containersDirectory: containersDirectory)
 
             // Validate the requested platform only if provided
             var requestedPlatform = try Platform(from: containerPlatform)
@@ -798,7 +795,7 @@ extension ContainerCreateRoute {
                     container = created.container
                     createWarnings = created.warnings
                 } catch {
-                    if let conflict = ContainerNameConflict.conflict(after: error, name: id, containersDirectory: containersDirectory) {
+                    if let conflict = await ContainerNameConflict.conflict(after: error, name: id, client: client) {
                         throw conflict
                     }
                     req.logger.error("Failed to create container: \(error)")
