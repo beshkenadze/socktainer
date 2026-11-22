@@ -214,4 +214,63 @@ import Testing
 
         #expect(VolumeImageEligibility.check(imagePath: image) == .replaceable(hasLostFound: false))
     }
+
+    // MARK: Empty volumes as they were made since ContainerStack 0.1.0
+
+    /// The fixtures in Resources/ext4-volumes: empty volumes formatted by the image formatter of
+    /// each runtime that ContainerStack shipped (runtime 1.2.2, 1.3.1, 1.6.0 and 1.7.1-bshk.1:
+    /// containerization 0.40.1, 0.42.0, 0.52.1 and the fork at 5a37e406) without a journal and in
+    /// each journal mode; volumes that the installed runtime 1.7.1-bshk.1 made with each option
+    /// it accepts (`size`, `journal=ordered|writeback|journal`, `journal=ordered:8M`); and three
+    /// mke2fs 1.47.2 images (the default ext4 features, which include 64bit, metadata_csum and
+    /// orphan_file; the same without 64bit and metadata_csum; and inline_data). Each is stored up
+    /// to its last non-zero byte, deflated, with its full size in the name.
+    private static let volumeFixtures: [String] = {
+        guard let url = Bundle.module.url(forResource: "ext4-volumes", withExtension: nil) else { return [] }
+        return ((try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []).sorted()
+    }()
+
+    private func restore(_ fixture: String, into path: String) throws {
+        let directory = try #require(Bundle.module.url(forResource: "ext4-volumes", withExtension: nil))
+        let size = try #require(UInt64(fixture.split(separator: ".").dropLast().last ?? ""))
+        let data = try (Data(contentsOf: directory.appendingPathComponent(fixture)) as NSData).decompressed(using: .zlib) as Data
+        try data.write(to: URL(fileURLWithPath: path))
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+        try handle.truncate(atOffset: size)
+        try handle.close()
+    }
+
+    @Test("an empty volume made by any shipped formatter, runtime option or default mke2fs is replaceable")
+    func shippedEmptyVolumesAreReplaceable() throws {
+        #expect(Self.volumeFixtures.count == 24)
+        for fixture in Self.volumeFixtures {
+            let scratch = try Scratch()
+            let image = scratch.path("volume.img")
+            try restore(fixture, into: image)
+            let verdict = VolumeImageEligibility.check(imagePath: image)
+            if fixture.hasPrefix("mke2fs-inline-data") {
+                guard case .doubtful = verdict else {
+                    Issue.record("\(fixture): expected doubtful, got \(verdict)")
+                    continue
+                }
+            } else {
+                #expect(verdict == .replaceable(hasLostFound: true), "\(fixture)")
+            }
+        }
+    }
+
+    @Test("the copy-up still rebuilds a default mke2fs volume")
+    func copyUpRebuildsAnMke2fsVolume() throws {
+        let fixture = try #require(Self.volumeFixtures.first { $0.hasPrefix("mke2fs-default") })
+        let scratch = try Scratch()
+        let image = scratch.path("volume.img")
+        let source = scratch.path("rootfs.ext4")
+        try restore(fixture, into: image)
+        try rootfs(source)
+
+        try VolumeCopyUp.populate(volumeImagePath: image, fromRootfs: source, sourcePath: "/data", logger: logger)
+
+        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(image))
+        #expect(try reader.listDirectory(FilePath("/")).filter { $0 != "." && $0 != ".." } == ["seed"])
+    }
 }

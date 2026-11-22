@@ -74,6 +74,7 @@ let package = Package(
                 .copy("Resources/runtime-groups.v1.json"),
                 .copy("Resources/docker-cli-28.5.2-run-i-rm.json"),
                 .copy("Resources/ext2-with-files.img.deflate"),
+                .copy("Resources/ext4-volumes"),
             ],
         ),
         .target(
