@@ -35,12 +35,13 @@ struct ContainerRenameRouteTests {
         containers: [ContainerSnapshot],
         refusesDelete: Bool = false,
         listFails: Bool = false,
+        hidden: Set<String> = [],
         files: [String: [String]] = [:],
         appRootFails: Bool = false,
         recreate: (@Sendable (RenameContainerStore, ContainerConfiguration) async throws -> Void)? = nil,
         test: @escaping (Application, RenameContainerStore) async throws -> Void
     ) async throws {
-        let store = RenameContainerStore(containers: containers, refusesDelete: refusesDelete, listFails: listFails)
+        let store = RenameContainerStore(containers: containers, refusesDelete: refusesDelete, listFails: listFails, hidden: hidden)
         // The runtime's app root: each container has the directory of one that was created and
         // never started, unless `files` gives it other files.
         let appRoot = FileManager.default.temporaryDirectory.appendingPathComponent("rename-root-\(UUID().uuidString)")
@@ -266,6 +267,18 @@ struct ContainerRenameRouteTests {
         }
     }
 
+    @Test("A holder that the Docker listing hides (a DNS sidecar, a plugin-owned container) is seen by the name check")
+    func hiddenHolderIsSeen() async throws {
+        let containers = [Self.snapshot(id: "api", status: .stopped), Self.snapshot(id: "dns", status: .stopped)]
+        try await withRoute(containers: containers, hidden: ["dns"]) { app, store in
+            try await app.testing().test(.POST, "/v1.51/containers/api/rename?name=DNS") { res async in
+                #expect(res.status == .conflict)
+                #expect(res.body.string.contains("is already in use by container"))
+            }
+            #expect(await store.deleted.isEmpty)
+        }
+    }
+
     @Test("A case-only rename of the same container is not refused by the name check")
     func caseOnlyRenameOfTheSameContainer() async throws {
         try await withRoute(containers: [Self.snapshot(id: "web", status: .stopped)]) { app, store in
@@ -429,17 +442,24 @@ private actor RenameContainerStore {
     private var containers: [ContainerSnapshot]
     private let refusesDelete: Bool
     private let listFails: Bool
+    /// Containers that the runtime lists but the Docker listing hides (DNS sidecars, plugin-owned).
+    let hidden: Set<String>
     private(set) var deleted: [String] = []
 
-    init(containers: [ContainerSnapshot], refusesDelete: Bool, listFails: Bool = false) {
+    init(containers: [ContainerSnapshot], refusesDelete: Bool, listFails: Bool = false, hidden: Set<String> = []) {
         self.containers = containers
         self.refusesDelete = refusesDelete
         self.listFails = listFails
+        self.hidden = hidden
     }
 
     func all() throws -> [ContainerSnapshot] {
         if listFails { throw RenameFailure() }
         return containers
+    }
+
+    func visible() throws -> [ContainerSnapshot] {
+        try all().filter { !hidden.contains($0.id) }
     }
     func get(_ id: String) -> ContainerSnapshot? { containers.first { $0.id == id } }
 
@@ -459,7 +479,8 @@ private actor RenameContainerStore {
 private struct RenameMock: ClientContainerProtocol {
     let store: RenameContainerStore
 
-    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { try await store.all() }
+    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { try await store.visible() }
+    func listEveryRuntimeContainer() async throws -> [ContainerSnapshot] { try await store.all() }
     func getContainer(id: String) async throws -> ContainerSnapshot? { await store.get(id) }
     func enforceContainerRunning(container: ContainerSnapshot) throws {}
     func start(id: String, detachKeys: String?) async throws {}

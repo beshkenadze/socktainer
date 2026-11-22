@@ -109,11 +109,12 @@ struct ContainerRenameRoute: RouteCollection {
             // the runtime refuses the create of the target after the source is gone. So a target
             // that equals another container's name without case is refused here, before anything
             // is deleted. The source itself is excluded: a case-only rename of the same container
-            // frees its own directory before the create. A list that cannot be read stops the
-            // rename.
+            // frees its own directory before the create. The list is the runtime's own, unfiltered:
+            // a DNS sidecar or a plugin-owned container holds a directory too. A list that cannot
+            // be read stops the rename.
             let listed: [ContainerSnapshot]
             do {
-                listed = try await client.list(showAll: true, filters: [:])
+                listed = try await client.listEveryRuntimeContainer()
             } catch {
                 req.logger.error("Failed to list containers before renaming \(container.id): \(error)")
                 throw Abort(
