@@ -126,12 +126,29 @@ actor NetworkDNSManager {
         } catch {}
     }
 
+    /// The number of times that a lookup of the sidecar name is tried when it fails for another
+    /// reason than "not found".
+    static let lookupAttempts = 3
+
     /// Stops and deletes the sidecar of `networkId` under `containerId`. Returns false when no
     /// container has the name. Throws `NotSidecar` when another container has it, else the error
-    /// of the last delete attempt.
+    /// of the last lookup or delete attempt.
     static func removeSidecar(containerId: String, networkId: String, deleteAttempts: Int, runtime: SidecarRuntime) async throws -> Bool {
+        func lookUp() async throws -> ContainerSnapshot? {
+            for attempt in 1... {
+                do {
+                    return try await runtime.get(containerId)
+                } catch let error as ContainerizationError where error.code == .notFound {
+                    return nil
+                } catch {
+                    guard attempt < lookupAttempts else { throw error }
+                    await runtime.pause()
+                }
+            }
+            return nil
+        }
         func sidecar() async throws -> ContainerSnapshot? {
-            guard let snapshot = try? await runtime.get(containerId) else { return nil }
+            guard let snapshot = try await lookUp() else { return nil }
             if case .foreign(let holder) = occupant(snapshot, networkId: networkId) {
                 throw NotSidecar(holder: holder, networkId: networkId)
             }
@@ -204,19 +221,41 @@ actor NetworkDNSManager {
 
     // MARK: - Private implementation
 
+    /// Creates and starts the sidecar, and returns its address on the network.
+    typealias Launch = @Sendable () async throws -> String
+
     /// Runs outside the actor's executor to avoid deadlock with the Task created in ensureDNSContainer.
     private static func createDNSContainerWork(networkId: String, appSupportURL: URL, dnsPort: Int, containerSystemConfig: ContainerSystemConfig) async throws -> String {
-        let containerClient = ContainerClient()
+        try await createSidecar(networkId: networkId, runtime: .native) { containerId in
+            try await nativeLaunch(
+                containerId: containerId, networkId: networkId, appSupportURL: appSupportURL, dnsPort: dnsPort,
+                containerSystemConfig: containerSystemConfig)
+        }
+    }
+
+    /// Reuses the running sidecar of the network, or makes a new one. `prepare` makes what the
+    /// sidecar needs and returns the step that creates and starts it. A stale sidecar is removed
+    /// between the two; any other container under the name is left alone.
+    static func createSidecar(networkId: String, runtime: SidecarRuntime, prepare: (String) async throws -> Launch) async throws -> String {
         // Sanitize to respect Apple Container's 64-char container ID limit
         let containerId = ContainerNameUtility.sanitize(containerPrefix + networkId)
 
         // Reuse if already running
-        switch occupant(try? await containerClient.get(id: containerId), networkId: networkId) {
+        switch occupant(try? await runtime.get(containerId), networkId: networkId) {
         case .reuse(let ip): return ip
         case .foreign(let holder): throw NotSidecar(holder: holder, networkId: networkId)
         case .none, .replace: break
         }
 
+        let launch = try await prepare(containerId)
+        // Remove any stale sidecar first; any other container under the name is left alone.
+        try await clearSidecarName(containerId: containerId, networkId: networkId, runtime: runtime)
+        return try await launch()
+    }
+
+    private static func nativeLaunch(
+        containerId: String, networkId: String, appSupportURL: URL, dnsPort: Int, containerSystemConfig: ContainerSystemConfig
+    ) async throws -> Launch {
         // Get the network's gateway IP — passed to the forwarder as DNS_UPSTREAM
         let networkResource = try await NetworkClient().get(id: networkId)
         let gatewayIP = networkResource.status.ipv4Gateway.description
@@ -260,18 +299,19 @@ actor NetworkDNSManager {
         )
 
         let kernel = try await ClientKernel.getDefaultKernel(for: .current)
+        let configuration = config
 
-        // Remove any stale sidecar first; any other container under the name is left alone.
-        try await clearSidecarName(containerId: containerId, networkId: networkId, runtime: .native)
+        return {
+            let containerClient = ContainerClient()
+            try await containerClient.create(configuration: configuration, options: .default, kernel: kernel)
+            try await startDNSContainer(id: containerId, client: containerClient)
 
-        try await containerClient.create(configuration: config, options: .default, kernel: kernel)
-        try await startDNSContainer(id: containerId, client: containerClient)
-
-        let snapshot = try await containerClient.get(id: containerId)
-        guard let attachment = snapshot.networks.first(where: { $0.network == networkId }) else {
-            throw ContainerizationError(.invalidState, message: "DNS container for \(networkId) has no network attachment")
+            let snapshot = try await containerClient.get(id: containerId)
+            guard let attachment = snapshot.networks.first(where: { $0.network == networkId }) else {
+                throw ContainerizationError(.invalidState, message: "DNS container for \(networkId) has no network attachment")
+            }
+            return attachment.ipv4Address.address.description
         }
-        return attachment.ipv4Address.address.description
     }
 
     private static func startDNSContainer(id: String, client: ContainerClient) async throws {

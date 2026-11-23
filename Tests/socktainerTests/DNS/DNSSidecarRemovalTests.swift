@@ -62,21 +62,67 @@ struct DNSSidecarRemovalTests {
         #expect(await runtime.mutations == ["delete (failed)"])
     }
 
+    /// Runs the sidecar creation with `runtime` and a launch step that only records its call.
+    private static func create(_ runtime: FakeSidecarRuntime, launched: LaunchLog) async throws -> String {
+        try await NetworkDNSManager.createSidecar(networkId: network, runtime: runtime.closures) { _ in
+            {
+                await launched.add()
+                return "192.168.70.9"
+            }
+        }
+    }
+
     @Test("replacement refuses a node with the sidecar name and does not change it", arguments: [RuntimeStatus.running, .stopped])
     func replaceForeign(status: RuntimeStatus) async throws {
         let runtime = FakeSidecarRuntime(try Self.node(status))
-        await #expect(throws: NetworkDNSManager.NotSidecar.self) {
-            try await NetworkDNSManager.clearSidecarName(containerId: Self.name, networkId: Self.network, runtime: runtime.closures)
-        }
+        let launched = LaunchLog()
+        await #expect(throws: NetworkDNSManager.NotSidecar.self) { _ = try await Self.create(runtime, launched: launched) }
         #expect(await runtime.mutations.isEmpty)
+        #expect(await launched.count == 0)
     }
 
-    @Test("replacement deletes a stale sidecar of the network")
+    @Test("replacement deletes a stale sidecar of the network, then makes the new one")
     func replaceOwn() async throws {
         let runtime = FakeSidecarRuntime(try Self.sidecar(.stopped))
-        try await NetworkDNSManager.clearSidecarName(containerId: Self.name, networkId: Self.network, runtime: runtime.closures)
+        let launched = LaunchLog()
+        #expect(try await Self.create(runtime, launched: launched) == "192.168.70.9")
+        #expect(await runtime.mutations == ["delete"])
+        #expect(await launched.count == 1)
+    }
+
+    @Test("replacement does not delete a node that takes the name while the stale sidecar stops")
+    func replaceReplacedAtStop() async throws {
+        // Running, but not attached to the network: a stale sidecar, not one to reuse.
+        let stale = try makeContainerSnapshot(
+            nativeId: Self.name, ip: "192.168.71.2", network: "other",
+            labels: [NetworkDNSManager.roleLabel: NetworkDNSManager.dnsRole, NetworkDNSManager.networkLabel: Self.network], status: .running)
+        let runtime = FakeSidecarRuntime(stale, afterStop: try Self.node(.stopped))
+        let launched = LaunchLog()
+        await #expect(throws: NetworkDNSManager.NotSidecar.self) { _ = try await Self.create(runtime, launched: launched) }
+        #expect(await runtime.mutations == ["stop"], "the node is not deleted")
+        #expect(await launched.count == 0)
+    }
+
+    @Test("a lookup that fails once is tried again: cleanup still deletes the sidecar")
+    func cleanupAfterFailedLookup() async throws {
+        let runtime = FakeSidecarRuntime(try Self.sidecar(.stopped), failedLookups: 1)
+        try await Self.cleanup(runtime)
         #expect(await runtime.mutations == ["delete"])
     }
+
+    @Test("a lookup that fails once is tried again: replacement still deletes the stale sidecar")
+    func replaceAfterFailedLookup() async throws {
+        // The reuse check before the preparation takes the failed lookup.
+        let runtime = FakeSidecarRuntime(try Self.sidecar(.stopped), failedLookups: 2)
+        let launched = LaunchLog()
+        _ = try await Self.create(runtime, launched: launched)
+        #expect(await runtime.mutations == ["delete"])
+    }
+}
+
+private actor LaunchLog {
+    private(set) var count = 0
+    func add() { count += 1 }
 }
 
 /// One container under the sidecar name. A stop or a pause can put another container in its place.
@@ -85,9 +131,14 @@ private actor FakeSidecarRuntime {
     private let afterStop: ContainerSnapshot?
     private let afterPause: ContainerSnapshot?
     private var failedDeletes: Int
+    private var failedLookups: Int
     private(set) var mutations: [String] = []
 
-    init(_ occupant: ContainerSnapshot, afterStop: ContainerSnapshot? = nil, failedDeletes: Int = 0, afterPause: ContainerSnapshot? = nil) {
+    init(
+        _ occupant: ContainerSnapshot, afterStop: ContainerSnapshot? = nil, failedDeletes: Int = 0, afterPause: ContainerSnapshot? = nil,
+        failedLookups: Int = 0
+    ) {
+        self.failedLookups = failedLookups
         self.occupant = occupant
         self.afterStop = afterStop
         self.failedDeletes = failedDeletes
@@ -95,6 +146,10 @@ private actor FakeSidecarRuntime {
     }
 
     func get(_ id: String) throws -> ContainerSnapshot {
+        if failedLookups > 0 {
+            failedLookups -= 1
+            throw ContainerizationError(.interrupted, message: "XPC connection error")
+        }
         guard let occupant, occupant.id == id else { throw ContainerizationError(.notFound, message: "no container \(id)") }
         return occupant
     }
