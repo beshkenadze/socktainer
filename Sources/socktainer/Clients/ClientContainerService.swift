@@ -475,14 +475,28 @@ struct ClientContainerService: ClientContainerProtocol {
         guard !staged.isEmpty else { return }
 
         try await Self.preStartInjectionAdmission.withSlot {
-            // Docker can issue /start while attach is preparing the same container.
-            // Refresh under the gate so a stale snapshot cannot recreate it twice.
-            guard let current = try await self.getContainerWithoutPreparationWait(id: container.id) else {
-                throw ClientContainerError.notFound(id: container.id)
-            }
-            guard current.status == .stopped else { return }
-            try await self.applyPreStartInjections(container: current, staged: staged)
+            try await Self.prepareRefreshed(
+                id: container.id,
+                current: { try await self.getContainerWithoutPreparationWait(id: $0) },
+                rebuild: { try await self.applyPreStartInjections(container: $0, staged: staged) })
         }
+    }
+
+    /// The part of the preparation under the gate. Docker can issue /start while attach is
+    /// preparing the same container, so the container is looked up again here: a stale snapshot
+    /// cannot recreate it twice.
+    static func prepareRefreshed(
+        id: String,
+        current: (String) async throws -> ContainerSnapshot?,
+        rebuild: (ContainerSnapshot) async throws -> Void
+    ) async throws {
+        guard let refreshed = try await current(id) else {
+            throw ClientContainerError.notFound(id: id)
+        }
+        guard refreshed.status == .stopped else { return }
+        // A node can take the name before this lookup; it is never rebuilt.
+        try ClusterNodeGuard.refuse(refreshed)
+        try await rebuild(refreshed)
     }
 
     private func applyPreStartInjections(container: ContainerSnapshot, staged: [Filesystem]) async throws {

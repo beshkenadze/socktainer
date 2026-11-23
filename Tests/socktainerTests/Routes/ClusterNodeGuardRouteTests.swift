@@ -294,6 +294,20 @@ struct ClusterNodeGuardRouteTests {
         #expect(await runtime.calls.isEmpty, "no preparation")
     }
 
+    @Test("the start preparation does not rebuild a node that took the name before its refresh")
+    func preparationRefresh() async throws {
+        let name = Fixtures.uniqueName("node-refresh")
+        let node = try Fixtures.node(name, status: .stopped)
+        let rebuilt = Recorder()
+
+        await #expect(throws: Abort.self) {
+            try await ClientContainerService.prepareRefreshed(
+                id: name, current: { _ in node }, rebuild: { await rebuilt.add($0.id) })
+        }
+
+        #expect(await rebuilt.entries.isEmpty, "no delete and recreate with the staged mounts")
+    }
+
     @Test("exec into a running node is allowed")
     func exec() async throws {
         let name = Fixtures.uniqueName("node-exec")
