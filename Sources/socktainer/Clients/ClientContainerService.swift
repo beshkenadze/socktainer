@@ -848,8 +848,9 @@ struct ClientContainerService: ClientContainerProtocol {
 
     /// The containers `prune(filters:)` deletes from `allContainers`, DNS sidecars already removed.
     static func pruneCandidates(_ allContainers: [ContainerSnapshot], filters: [String: [String]]) -> [ContainerSnapshot] {
+        // A label filter can bring back plugin containers, but never a node of a Kubernetes cluster.
         var containersToDelete: [ContainerSnapshot] = withoutPluginContainers(allContainers, unlessLabelFilters: filters["label"])
-            .filter { $0.status == .stopped }
+            .filter { $0.status == .stopped && !ClusterNodeGuard.isNode($0) }
 
         for (key, values) in filters {
             switch key {
@@ -921,22 +922,39 @@ struct ClientContainerService: ClientContainerProtocol {
         //       Perhaps we should fetch the image size ourselves.
         let spaceReclaimed: Int64 = 0
 
-        var deletedIds: [String] = []
-
-        for container in containersToDelete {
-            do {
+        let deletedIds = await Self.deleteCandidates(
+            containersToDelete,
+            current: { id in try await containerClient.withClient { try await $0.get(id: id) } },
+            delete: { container in
                 try await containerClient.withClient { try await $0.delete(id: container.id) }
                 // Pruning reclaims a container, so it reclaims what was staged for
                 // it too: those files are whatever a client uploaded, secrets
                 // included.
                 try await PreStartInjectionStore.shared.clear(containerId: container.id)
                 ExtraHostsFile.remove(labels: container.configuration.labels)
-                deletedIds.append(container.id)
+            })
+
+        return (deletedContainers: deletedIds, spaceReclaimed: spaceReclaimed)
+    }
+
+    /// Deletes each prune candidate and returns the names of those deleted. A candidate whose
+    /// delete fails is left out, and the prune goes on. So is a candidate that is a node of a
+    /// Kubernetes cluster when its delete starts: a node can take the name after the listing.
+    static func deleteCandidates(
+        _ candidates: [ContainerSnapshot],
+        current: (String) async throws -> ContainerSnapshot?,
+        delete: (ContainerSnapshot) async throws -> Void
+    ) async -> [String] {
+        var deleted: [String] = []
+        for candidate in candidates {
+            guard let container = try? await current(candidate.id), !ClusterNodeGuard.isNode(container) else { continue }
+            do {
+                try await delete(candidate)
+                deleted.append(candidate.id)
             } catch {
                 continue
             }
         }
-
-        return (deletedContainers: deletedIds, spaceReclaimed: spaceReclaimed)
+        return deleted
     }
 }
