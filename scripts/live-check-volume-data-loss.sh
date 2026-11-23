@@ -12,8 +12,9 @@
 # Checks (each prints PASS or FAIL):
 #   D-1        a Postgres create on a volume that holds data and /lost+found keeps the data;
 #   D-2        a create on a volume that a running container uses keeps that container's writes;
-#   rejected   a Postgres create that the runtime rejects as a name conflict ("container already
-#              exists: <name>") leaves the volume image unchanged;
+#   rejected   a Postgres create that the runtime rejects as a name conflict leaves the volume
+#              image unchanged. The conflict reads "container already exists: <name>" (the
+#              runtime's text) or Docker's 409 "The container name "/<name>" is already in use";
 #   copy-up    a new volume mounted over an image directory gets that directory's contents;
 #   postgres   Postgres initialises on a new volume mounted at its PGDATA;
 #   two-a      a plain service, then Postgres, created one after the other on one new volume;
@@ -161,7 +162,7 @@ fingerprint() {
 before=$(fingerprint "$image") || die "cannot read $image"
 if new_container "$(name rjh)" "${PG[@]}" -v "$v:/var/lib/postgresql/data" "$PG_IMAGE"; then
     result rejected FAIL "the duplicate create was accepted"
-elif ! grep -qF "container already exists: $(name rjh)" "$WORK/$(name rjh).create.txt"; then
+elif ! grep -qF -e "container already exists: $(name rjh)" -e "The container name \"/$(name rjh)\" is already in use" "$WORK/$(name rjh).create.txt"; then
     result rejected FAIL "the create failed, but not on the name conflict: $(head -c 200 "$WORK/$(name rjh).create.txt")"
 else
     after=$(fingerprint "$image") || die "cannot read $image"
