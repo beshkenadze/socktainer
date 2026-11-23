@@ -80,6 +80,10 @@ actor NetworkDNSManager {
             guard let snapshot = try? await client.get(id: containerId) else {
                 return  // container already gone
             }
+            if case .foreign = Self.occupant(snapshot, networkId: networkId) {
+                log.warning("[dns-manager] did not remove \(containerId): it is not the DNS sidecar of network \(networkId)")
+                return
+            }
             if snapshot.status == .running {
                 try? await client.stop(id: containerId)
             }
@@ -132,6 +136,28 @@ actor NetworkDNSManager {
         return (try? await NetworkClient().get(id: networkId)) != nil
     }
 
+    /// What holds the name of the DNS sidecar of a network.
+    enum SidecarOccupant: Equatable {
+        case none
+        /// The running sidecar, with its address on the network.
+        case reuse(ip: String)
+        /// A sidecar of the network that must be made again.
+        case replace
+        /// A container that is not the sidecar of the network: a cluster node, an ordinary
+        /// container, or the sidecar of another network. It is left alone.
+        case foreign(String)
+    }
+
+    static func occupant(_ snapshot: ContainerSnapshot?, networkId: String) -> SidecarOccupant {
+        guard let snapshot else { return .none }
+        let labels = snapshot.configuration.labels
+        guard labels[roleLabel] == dnsRole, labels[networkLabel] == networkId else { return .foreign(snapshot.id) }
+        if snapshot.status == .running, let attachment = snapshot.networks.first(where: { $0.network == networkId }) {
+            return .reuse(ip: attachment.ipv4Address.address.description)
+        }
+        return .replace
+    }
+
     // MARK: - Private implementation
 
     /// Runs outside the actor's executor to avoid deadlock with the Task created in ensureDNSContainer.
@@ -141,11 +167,10 @@ actor NetworkDNSManager {
         let containerId = ContainerNameUtility.sanitize(containerPrefix + networkId)
 
         // Reuse if already running
-        if let snapshot = try? await containerClient.get(id: containerId),
-            snapshot.status == .running,
-            let attachment = snapshot.networks.first(where: { $0.network == networkId })
-        {
-            return attachment.ipv4Address.address.description
+        switch occupant(try? await containerClient.get(id: containerId), networkId: networkId) {
+        case .reuse(let ip): return ip
+        case .foreign(let holder): throw notSidecar(holder, networkId: networkId)
+        case .none, .replace: break
         }
 
         // Get the network's gateway IP — passed to the forwarder as DNS_UPSTREAM
@@ -192,8 +217,9 @@ actor NetworkDNSManager {
 
         let kernel = try await ClientKernel.getDefaultKernel(for: .current)
 
-        // Remove any stale container first
+        // Remove any stale sidecar first; any other container under the name is left alone.
         if let existing = try? await containerClient.get(id: containerId) {
+            if case .foreign(let holder) = occupant(existing, networkId: networkId) { throw notSidecar(holder, networkId: networkId) }
             if existing.status == .running { try? await containerClient.stop(id: containerId) }
             try? await containerClient.delete(id: containerId)
         }
@@ -206,6 +232,11 @@ actor NetworkDNSManager {
             throw ContainerizationError(.invalidState, message: "DNS container for \(networkId) has no network attachment")
         }
         return attachment.ipv4Address.address.description
+    }
+
+    private static func notSidecar(_ holder: String, networkId: String) -> ContainerizationError {
+        ContainerizationError(
+            .exists, message: "container \(holder) holds the name of the DNS sidecar of network \(networkId) but is not that sidecar; it was left alone")
     }
 
     private static func startDNSContainer(id: String, client: ContainerClient) async throws {
