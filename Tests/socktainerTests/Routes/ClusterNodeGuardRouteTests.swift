@@ -1,6 +1,6 @@
 import ContainerAPIClient
-import ContainerPersistence
 import ContainerResource
+import ContainerizationError
 import Foundation
 import Testing
 import Vapor
@@ -210,28 +210,20 @@ struct ClusterNodeGuardRouteTests {
 
     // MARK: - Create
 
-    @Test("create with the name of a node answers the Docker name conflict before any write", arguments: [false, true])
-    func create(caseOnly: Bool) async throws {
+    /// The create route has no node check: the runtime refuses a name that a node holds, and the
+    /// route maps that refusal to Docker's name conflict. The native create is not reachable with a
+    /// fake runtime, so this test starts at the refusal.
+    @Test("the runtime's refusal of a node's name becomes the Docker name conflict, and the node is not changed")
+    func createWithNodeName() async throws {
         let name = Fixtures.uniqueName("node-create")
         let runtime = RecordingNodeRuntime([try Fixtures.node(name)])
-        try await PreStartInjectionStore.shared.rememberCreateOptions(containerId: name, autoRemove: true)
-        let requested = caseOnly ? name.uppercased() : name
 
-        try await withNodeApp(runtime) { app in
-            try await app.testing().test(
-                .POST, "/v1.51/containers/create?name=\(requested)",
-                beforeRequest: { req in
-                    req.headers.contentType = .json
-                    req.body = ByteBuffer(string: #"{"Image":"\#(SharedRuntimeFixtures.absentImage)"}"#)
-                },
-                afterResponse: { res async in
-                    #expect(res.status == .conflict)
-                    #expect(Fixtures.message(res.body) == ContainerNameConflict.abort(name: requested, holderID: name).reason)
-                })
-        }
+        let conflict = await ContainerNameConflict.conflict(
+            after: ContainerizationError(.exists, message: "container already exists: \(name)"), name: name, client: runtime)
 
-        #expect(await PreStartInjectionStore.shared.createOptions(containerId: name).autoRemove, "no create-option write")
-        try await PreStartInjectionStore.shared.clear(containerId: name)
+        #expect(conflict?.status == .conflict)
+        #expect(conflict?.reason == ContainerNameConflict.abort(name: name, holderID: name).reason)
+        #expect(await runtime.calls.isEmpty)
     }
 
     // MARK: - Archive
@@ -469,8 +461,6 @@ private func withNodeApp(
                 client: runtime,
                 recreate: { configuration in await recreated.add(configuration.id) },
                 runtimeAppRoot: { URL(fileURLWithPath: "/nonexistent") }))
-        try app.register(
-            collection: ContainerCreateRoute(client: runtime, systemConfig: ContainerSystemConfig(), controlSocketPath: "/tmp/test.sock"))
         try app.register(collection: ContainerArchiveRoute(containerClient: runtime, archiveClient: archive))
         try app.register(collection: ContainerAttachRoute(client: runtime))
         try app.register(collection: ContainerAttachWSRoute(client: runtime))

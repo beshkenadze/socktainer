@@ -22,9 +22,4 @@ enum ClusterNodeGuard {
             reason: "\(container.id) is a node of a Kubernetes cluster. Use 'container cluster' or ContainerStack to start, stop or delete it."
         )
     }
-
-    /// The node that has the name `name` on the case-insensitive data root of the runtime.
-    static func node(named name: String, in containers: [ContainerSnapshot]) -> ContainerSnapshot? {
-        containers.first { isNode($0) && $0.id.lowercased() == name.lowercased() }
-    }
 }
