@@ -253,7 +253,12 @@ struct EventsRouteTests {
         try await withLiveServer { _, _, port in
             let client = try RawHTTPClient(port: port)
             let deadline = 1.0
-            let startedAt = Date()
+            let clock = ContinuousClock()
+            let startedAt = clock.now
+            let secondsSinceStart = {
+                let span = clock.now - startedAt
+                return Double(span.components.seconds) + Double(span.components.attoseconds) / 1e18
+            }
             client.get("/events?until=\(Date().timeIntervalSince1970 + deadline)")
 
             let head = try await blockingTestIO { client.read(deadline: 3) }
@@ -263,17 +268,21 @@ struct EventsRouteTests {
             // is empty" fails against a stream that closes correctly; EOF is the empty read that
             // ends the drain. Closing at once would mean a future bound was treated as a past one,
             // never closing is the bug being fixed — the deadline has to be both reached and kept.
-            // "Never closing" shows as a read that times out (nil), not as a wall-clock bound: a
-            // starved CI runner can deliver a correct close seconds late.
+            // "Never closing" shows as a read that times out (nil), or as a drain that outlives its
+            // 30 s budget, not as a tight wall-clock bound: a starved CI runner can deliver a correct
+            // close seconds late.
+            let drainBudget = 30.0
             var reachedEOF = false
-            while let chunk = try await blockingTestIO({ client.read(deadline: 10) }) {
+            while secondsSinceStart() < drainBudget,
+                let chunk = try await blockingTestIO({ client.read(deadline: 10) })
+            {
                 if chunk.isEmpty {
                     reachedEOF = true
                     break
                 }
             }
-            let elapsed = Date().timeIntervalSince(startedAt)
-            #expect(reachedEOF, "the connection did not close: a read waited 10 s with nothing to read")
+            let elapsed = secondsSinceStart()
+            #expect(reachedEOF, "the connection did not close within \(drainBudget)s (elapsed \(elapsed)s)")
             #expect(elapsed >= deadline, "closed after \(elapsed)s, deadline was \(deadline)s")
         }
     }
