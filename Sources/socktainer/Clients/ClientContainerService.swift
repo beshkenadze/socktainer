@@ -249,7 +249,8 @@ struct ClientContainerService: ClientContainerProtocol {
     /// `container machine` VMs) are managed through that plugin, and removing one from
     /// under it breaks what it manages, so they stay out of Docker listings and prunes —
     /// much as `container ls` hides machines. A `label` filter that names the plugin
-    /// label brings them back. Lookups by name or ID still find them.
+    /// label brings them back, but a prune never deletes a cluster node
+    /// (`ClusterNodeGuard`). Lookups by name or ID still find them.
     static func isPluginContainer(_ snapshot: ContainerSnapshot) -> Bool {
         snapshot.configuration.labels[ResourceLabelKeys.plugin] != nil
     }
