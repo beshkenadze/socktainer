@@ -133,9 +133,9 @@ func configure(
     try app.register(collection: SwarmUpdateRoute())
 
     // --- network routes ---
-    try app.register(collection: NetworkConnectRoute(client: containerClient))
+    try app.register(collection: NetworkConnectRoute())
     try app.register(collection: NetworkCreateRoute(client: networkClient))
-    try app.register(collection: NetworkDisconnectRoute(client: containerClient))
+    try app.register(collection: NetworkDisconnectRoute())
     try app.register(collection: NetworkInspectRoute(client: networkClient))
     try app.register(collection: NetworkListRoute())
     try app.register(collection: NetworkPruneRoute(client: networkClient))

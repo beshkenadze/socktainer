@@ -22,7 +22,7 @@ enum SharedRuntimeRouter {
         } else if pattern == "/commit" {
             reference = req.query[String.self, at: "container"]
         } else if method == .POST, pattern == "/networks/{id}/connect" || pattern == "/networks/{id}/disconnect" {
-            reference = try await NetworkConnectRoute.container(req)
+            reference = try await networkContainer(req)
         } else {
             return nil
         }
@@ -42,6 +42,16 @@ enum SharedRuntimeRouter {
         case (.GET, "/containers/{id}/logs"): return try logs(req, session)
         default: throw Abort(.conflict, reason: notSupported)
         }
+    }
+
+    private struct NetworkContainer: Decodable {
+        let Container: String
+    }
+
+    /// The container of a network connect or disconnect, from the request body.
+    private static func networkContainer(_ req: Request) async throws -> String? {
+        guard let body = try await req.body.collect(max: req.application.routes.defaultMaxBodySize.value).get() else { return nil }
+        return try? JSONDecoder().decode(NetworkContainer.self, from: body).Container
     }
 
     private static func attach(_ req: Request, _ session: SharedSession, _ manager: SharedRuntimeManager) async -> Response {
