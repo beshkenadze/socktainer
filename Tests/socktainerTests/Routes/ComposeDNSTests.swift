@@ -337,7 +337,7 @@ struct ComposeDNSTests {
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
             regexRouter.installMiddleware(on: app)
-            try app.register(collection: NetworkConnectRoute())
+            try app.register(collection: NetworkConnectRoute(client: SessionRouteHarness.NoContainers()))
 
             try await app.testing().test(.POST, "/v1.51/networks/myapp_default/connect") { res async in
                 #expect(res.status == .ok)
@@ -351,7 +351,7 @@ struct ComposeDNSTests {
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
             regexRouter.installMiddleware(on: app)
-            try app.register(collection: NetworkDisconnectRoute())
+            try app.register(collection: NetworkDisconnectRoute(client: SessionRouteHarness.NoContainers()))
 
             try await app.testing().test(.POST, "/v1.51/networks/myapp_default/disconnect") { res async in
                 #expect(res.status == .ok)

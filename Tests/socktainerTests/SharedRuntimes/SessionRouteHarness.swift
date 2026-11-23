@@ -81,9 +81,9 @@ enum SessionRouteHarness {
             try app.register(collection: ContainerLogsRoute(client: containers))
             try app.register(collection: ContainerAttachRoute(client: containers))
             try app.register(collection: ExecRoute(client: containers))
-            try app.register(collection: NetworkConnectRoute())
+            try app.register(collection: NetworkConnectRoute(client: containers))
             try app.register(collection: ContainerRenameRoute(client: containers))
-            try app.register(collection: NetworkDisconnectRoute())
+            try app.register(collection: NetworkDisconnectRoute(client: containers))
             // A stand-in under the pattern of the archive route, which needs an archive client.
             try app.regexRouter.register(.GET, pattern: "/containers/{id:.*}/archive") { _ in "archive of main" }
 
