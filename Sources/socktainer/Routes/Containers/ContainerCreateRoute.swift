@@ -795,6 +795,9 @@ extension ContainerCreateRoute {
                     container = created.container
                     createWarnings = created.warnings
                 } catch {
+                    if let conflict = await ContainerNameConflict.conflict(after: error, name: id, client: client) {
+                        throw conflict
+                    }
                     req.logger.error("Failed to create container: \(error)")
                     throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
                 }

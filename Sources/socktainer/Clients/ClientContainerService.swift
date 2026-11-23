@@ -188,6 +188,9 @@ actor ContainerExitCodeStore {
 
 protocol ClientContainerProtocol: Sendable {
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot]
+    /// Every container of the runtime, as the runtime lists it: DNS sidecars and plugin-owned
+    /// containers included, no filter. For checks of the runtime's own names.
+    func listEveryRuntimeContainer() async throws -> [ContainerSnapshot]
     func getContainer(id: String) async throws -> ContainerSnapshot?
     func enforceContainerRunning(container: ContainerSnapshot) throws
 
@@ -212,8 +215,19 @@ enum ClientContainerError: Error {
     case renameRequiresUnstarted(id: String)
 }
 
+extension ClientContainerProtocol {
+    /// For fakes that hold only Docker-visible containers.
+    func listEveryRuntimeContainer() async throws -> [ContainerSnapshot] {
+        try await list(showAll: true, filters: [:])
+    }
+}
+
 struct ClientContainerService: ClientContainerProtocol {
     private let containerClient = ReconnectingContainerClient(makeClient: { ContainerClient() })
+
+    func listEveryRuntimeContainer() async throws -> [ContainerSnapshot] {
+        try await containerClient.withClient { try await $0.list() }
+    }
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
         let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })

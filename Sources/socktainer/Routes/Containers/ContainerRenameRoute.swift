@@ -25,12 +25,16 @@ struct ContainerRenameRoute: RouteCollection {
     /// Creates the replacement container. Injected so the success path — which is the whole point
     /// of the route — can be exercised without an Apple Container daemon.
     typealias Recreate = @Sendable (ContainerConfiguration) async throws -> Void
+    /// The runtime's app root, as the runtime reports it. Injected for tests.
+    typealias AppRoot = @Sendable () async throws -> URL
     let client: ClientContainerProtocol
     let recreate: Recreate
+    let runtimeAppRoot: AppRoot
 
     init(
         client: ClientContainerProtocol,
-        recreate: Recreate? = nil
+        recreate: Recreate? = nil,
+        runtimeAppRoot: AppRoot? = nil
     ) {
         self.client = client
         self.recreate =
@@ -38,13 +42,18 @@ struct ContainerRenameRoute: RouteCollection {
                 let kernel = try await ClientKernel.getDefaultKernel(for: .current)
                 try await ContainerClient().create(configuration: configuration, options: .default, kernel: kernel)
             }
+        self.runtimeAppRoot =
+            runtimeAppRoot ?? {
+                let health = try await ClientHealthCheck.ping(timeout: .seconds(2))
+                return URL(fileURLWithPath: health.appRoot.path(percentEncoded: false))
+            }
     }
 
     func boot(routes: RoutesBuilder) throws {
         try routes.registerVersionedRoute(
             .POST,
             pattern: "/containers/{id}/rename",
-            use: ContainerRenameRoute.handler(client: client, recreate: recreate)
+            use: ContainerRenameRoute.handler(client: client, recreate: recreate, runtimeAppRoot: runtimeAppRoot)
         )
     }
 
@@ -54,7 +63,8 @@ struct ContainerRenameRoute: RouteCollection {
 
     static func handler(
         client: ClientContainerProtocol,
-        recreate: @escaping Recreate
+        recreate: @escaping Recreate,
+        runtimeAppRoot: @escaping AppRoot
     ) -> @Sendable (Request) async throws -> Response {
         { req in
             guard let id = req.parameters.get("id") else {
@@ -70,7 +80,24 @@ struct ContainerRenameRoute: RouteCollection {
             // those straight back.
             let newName = ContainerNameUtility.sanitize(requestedName.hasPrefix("/") ? String(requestedName.dropFirst()) : requestedName)
 
-            guard let container = try await client.getContainer(id: id) else {
+            // Every list or lookup before the delete: a failure stops the rename with the same 503,
+            // and nothing is changed. A ClientContainerError (an ambiguous ID, an invalid name) is
+            // the lookup's answer, not a failure, and keeps its own status.
+            func lookup<T>(_ body: () async throws -> T) async throws -> T {
+                do {
+                    return try await body()
+                } catch let answer as ClientContainerError {
+                    throw answer
+                } catch {
+                    req.logger.error("Failed to look up containers before renaming \(id): \(error)")
+                    throw Abort(
+                        .serviceUnavailable,
+                        reason: "Cannot rename container \(id): the container list could not be read (\(error)). Nothing was changed"
+                    )
+                }
+            }
+
+            guard let container = try await lookup({ try await client.getContainer(id: id) }) else {
                 throw Abort(.notFound, reason: "No such container: \(id)")
             }
 
@@ -79,7 +106,7 @@ struct ContainerRenameRoute: RouteCollection {
                 return Response(status: .noContent)
             }
 
-            if try await client.getContainer(id: newName) != nil {
+            if try await lookup({ try await client.getContainer(id: newName) }) != nil {
                 throw Abort(.conflict, reason: "Conflict. The container name \"/\(newName)\" is already in use")
             }
 
@@ -92,6 +119,40 @@ struct ContainerRenameRoute: RouteCollection {
                     reason: "Cannot rename a running container: stop it first. Apple Container has no rename, "
                         + "so the container is recreated under the new name."
                 )
+            }
+
+            // The runtime keeps a container's state in a directory named after it, and its data
+            // root is case-insensitive by default: there `web` and `WEB` are one directory, and
+            // the runtime refuses the create of the target after the source is gone. So a target
+            // that equals another container's name without case is refused here, before anything
+            // is deleted. The source itself is excluded: a case-only rename of the same container
+            // frees its own directory before the create. The list is the runtime's own, unfiltered:
+            // a DNS sidecar or a plugin-owned container holds a directory too. A list that cannot
+            // be read stops the rename.
+            let listed = try await lookup { try await client.listEveryRuntimeContainer() }
+            if let holder = listed.first(where: { $0.id != container.id && $0.id.lowercased() == newName.lowercased() }) {
+                throw ContainerNameConflict.abort(name: newName, holderID: ContainerNameConflict.holderID(of: holder))
+            }
+
+            // The delete below loses the container's writable file system, logs and start history.
+            // Go on only when the bridge can show that it never ran (RenameSafety). This is a check
+            // before the delete: a start through the native CLI in between is not seen, and only a
+            // rename in the runtime closes that.
+            let reason: String?
+            do {
+                // The health call can wait for a reply that never comes: answer at the bound.
+                let appRoot = try await Bounded.value(within: .seconds(2)) { try await runtimeAppRoot() }
+                let hexId = DockerContainerID.hexId(for: container)
+                let nativeRecord = await ContainerExitCodeStore.shared.get(id: container.id)
+                let hexRecord = await ContainerExitCodeStore.shared.get(id: hexId)
+                let hasExitRecord = nativeRecord != nil || hexRecord != nil
+                reason = RenameSafety.reasonToRefuse(
+                    container, hasExitRecord: hasExitRecord, hasRunHistory: ContainerRunHistory.hasRun(id: container.id), appRoot: appRoot)
+            } catch {
+                reason = "the runtime's app root could not be read (\(error))"
+            }
+            if let reason {
+                throw Abort(.conflict, reason: RenameSafety.refusal(id: container.id, reason: reason))
             }
 
             let retiredHexId = DockerContainerID.hexId(for: container)
