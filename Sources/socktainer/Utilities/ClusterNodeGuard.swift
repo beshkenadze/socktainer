@@ -22,4 +22,12 @@ enum ClusterNodeGuard {
             reason: "\(container.id) is a node of a Kubernetes cluster. Use 'container cluster' or ContainerStack to start, stop or delete it."
         )
     }
+
+    /// Throws Docker's 409 for an attach to a stopped container when `container` is a stopped node.
+    /// The bridge holds an attach to a stopped container open until a start through the bridge,
+    /// and a node is never started through the bridge.
+    static func refuseAttach(_ container: ContainerSnapshot) throws {
+        guard container.status == .stopped, isNode(container) else { return }
+        throw Abort(.conflict, reason: "You cannot attach to a stopped container, start it first")
+    }
 }

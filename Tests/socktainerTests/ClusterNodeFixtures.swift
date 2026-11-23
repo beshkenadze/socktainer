@@ -29,6 +29,10 @@ enum ClusterNodeFixtures {
         "\(name) is a node of a Kubernetes cluster. Use 'container cluster' or ContainerStack to start, stop or delete it."
     }
 
+    /// The body of the 409 for an attach to a stopped node: Docker's text for an attach to a
+    /// stopped container.
+    static let stoppedAttach = "You cannot attach to a stopped container, start it first"
+
     /// The `message` of a Docker error body.
     static func message(_ body: ByteBuffer) -> String? {
         let data = Data(buffer: body)

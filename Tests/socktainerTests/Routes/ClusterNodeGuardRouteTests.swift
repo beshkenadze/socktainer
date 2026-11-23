@@ -253,46 +253,44 @@ struct ClusterNodeGuardRouteTests {
 
     // MARK: - Maintenance access
 
-    /// Before the fix this attach parked stdio and waited for a start; the time limit ends that wait.
+    /// A real socket with a read deadline: before the fix these attaches parked stdio and waited
+    /// for a start, which the in-memory tester cannot end.
     @Test(
-        "HTTP attach to a stopped node streams its log, with no preparation and no parked stdio", .timeLimit(.minutes(1)),
-        arguments: ["0", "1"])
-    func httpAttach(stdin: String) async throws {
+        "attach to a stopped node is refused at entry, with no preparation and no parked stdio",
+        arguments: [AttachRequest.http, .httpUpgrade, .webSocket])
+    func attachToStoppedNode(request: AttachRequest) async throws {
         let name = Fixtures.uniqueName("node-attach")
         let runtime = RecordingNodeRuntime([try Fixtures.node(name, status: .stopped)])
-        let log = FileManager.default.temporaryDirectory.appendingPathComponent("\(name).log")
-        try Data("node log\n".utf8).write(to: log)
-        defer { try? FileManager.default.removeItem(at: log) }
 
-        try await withNodeApp(runtime, openLogs: { _ in [try FileHandle(forReadingFrom: log)] }) { app in
-            try await app.testing().test(.POST, "/v1.51/containers/\(name)/attach?stream=0&logs=1&stdout=1&stdin=\(stdin)") { res async in
-                #expect(res.status == .ok)
-                #expect(res.body.string.contains("node log"))
-            }
+        try await withNodeApp(runtime) { app in
+            app.http.server.configuration.shutdownTimeout = .milliseconds(100)
+            try await app.server.start(address: .hostname("127.0.0.1", port: 0))
+            let port = try #require(app.http.server.shared.localAddress?.port)
+            let client = try RawHTTPClient(port: port)
+            client.send(request.text(name: name))
+            let answer = try await blockingTestIO { client.read(deadline: 3) }
+            client.close()
+            await app.server.shutdown()
+
+            let text = String(data: answer ?? Data(), encoding: .utf8) ?? ""
+            #expect(text.hasPrefix("HTTP/1.1 409"), "\(text)")
+            #expect(text.contains(Fixtures.stoppedAttach))
         }
 
         #expect(await PendingAttachStart.shared.claim(containerId: name) == nil, "no parked stdio")
         #expect(await runtime.calls.isEmpty, "no preparation")
     }
 
-    /// Both attach routes use this rule. The WebSocket route cannot open its socket in these tests.
-    @Test("only a stopped container that is not a node waits for its start on attach")
-    func startsOnAttach() throws {
-        #expect(!ContainerAttachRoute.startsOnAttach(try Fixtures.node("node", status: .stopped)))
-        #expect(!ContainerAttachRoute.startsOnAttach(try Fixtures.node("node", status: .running)))
-        #expect(ContainerAttachRoute.startsOnAttach(try Fixtures.ordinary("plain", status: .stopped)))
-        #expect(!ContainerAttachRoute.startsOnAttach(try Fixtures.ordinary("plain", status: .running)))
-    }
-
-    @Test("the preparation step of both attach routes returns a stopped node unchanged")
+    @Test("the preparation step of both attach routes refuses a stopped node and returns a running one")
     func attachPreparation() async throws {
-        let name = Fixtures.uniqueName("node-prepare")
-        let runtime = RecordingNodeRuntime([try Fixtures.node(name, status: .stopped)])
+        let stopped = Fixtures.uniqueName("node-prepare")
+        let running = Fixtures.uniqueName("node-running")
+        let runtime = RecordingNodeRuntime([try Fixtures.node(stopped, status: .stopped), try Fixtures.node(running)])
 
-        let prepared = try await ContainerAttachRoute.preparedContainer(id: name, client: runtime)
+        await #expect(throws: Abort.self) { try await ContainerAttachRoute.preparedContainer(id: stopped, client: runtime) }
+        let prepared = try await ContainerAttachRoute.preparedContainer(id: running, client: runtime)
 
-        #expect(prepared.id == name)
-        #expect(prepared.status == .stopped)
+        #expect(prepared.id == running)
         #expect(await runtime.calls.isEmpty, "no preparation")
     }
 
@@ -370,6 +368,67 @@ struct ClusterNodeGuardRouteTests {
 
 // MARK: - Harness
 
+enum AttachRequest: CaseIterable, Sendable {
+    case http, httpUpgrade, webSocket
+
+    func text(name: String) -> String {
+        switch self {
+        case .http:
+            "POST /v1.51/containers/\(name)/attach?stream=1&stdout=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        case .httpUpgrade:
+            "POST /v1.51/containers/\(name)/attach?stream=1&stdout=1&stdin=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n"
+                + "Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+        case .webSocket:
+            "GET /v1.51/containers/\(name)/attach/ws?stream=1&stdout=1 HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
+                + "Upgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        }
+    }
+}
+
+/// A raw TCP client with a read deadline.
+private final class RawHTTPClient: @unchecked Sendable {
+    private var fd: Int32
+
+    init(port: Int) throws {
+        fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw Abort(.internalServerError, reason: "socket() failed") }
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = UInt16(port).bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let connected = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        guard connected == 0 else {
+            Darwin.close(fd)
+            throw Abort(.internalServerError, reason: "connect() failed: \(errno)")
+        }
+    }
+
+    func send(_ text: String) {
+        _ = text.withCString { Darwin.send(fd, $0, strlen($0), 0) }
+    }
+
+    /// Reads once. Empty data means EOF; nil means that the deadline elapsed with nothing to read.
+    func read(deadline: TimeInterval) -> Data? {
+        var tv = timeval(tv_sec: Int(deadline), tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var buffer = [UInt8](repeating: 0, count: 65_536)
+        let received = recv(fd, &buffer, buffer.count, 0)
+        if received == 0 { return Data() }
+        guard received > 0 else { return nil }
+        return Data(buffer.prefix(received))
+    }
+
+    func close() {
+        guard fd >= 0 else { return }
+        Darwin.close(fd)
+        fd = -1
+    }
+
+    deinit { close() }
+}
+
 /// A runtime whose first lookup fails, as after a dropped connection; later lookups find `node`.
 private actor FirstLookupFails: ClientContainerProtocol {
     struct Dropped: Error {}
@@ -429,7 +488,6 @@ private func withNodeApp(
     _ runtime: RecordingNodeRuntime,
     archive: RecordingArchive = RecordingArchive(),
     recreated: Recorder = Recorder(),
-    openLogs: @escaping ContainerAttachRoute.OpenLogs = ContainerAttachRoute.nativeLogs,
     configure: @escaping @Sendable (Application) -> Void = { _ in },
     _ test: @escaping (Application) async throws -> Void
 ) async throws {
@@ -452,7 +510,7 @@ private func withNodeApp(
                 recreate: { configuration in await recreated.add(configuration.id) },
                 runtimeAppRoot: { URL(fileURLWithPath: "/nonexistent") }))
         try app.register(collection: ContainerArchiveRoute(containerClient: runtime, archiveClient: archive))
-        try app.register(collection: ContainerAttachRoute(client: runtime, openLogs: openLogs))
+        try app.register(collection: ContainerAttachRoute(client: runtime))
         try app.register(collection: ContainerAttachWSRoute(client: runtime))
         try app.register(collection: ExecRoute(client: runtime))
         try await test(app)
