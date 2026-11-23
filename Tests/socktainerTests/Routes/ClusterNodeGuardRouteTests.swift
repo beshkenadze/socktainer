@@ -267,9 +267,14 @@ struct ClusterNodeGuardRouteTests {
         let runtime = RecordingNodeRuntime([try Fixtures.node(name, status: .stopped)])
         // Another client already waits for this node, so the attach answers 409 right after its
         // preparation step instead of waiting for a start.
+        // The parked pipes belong to PendingAttachStart until `cancel` gives them back; when the
+        // test ends early, its adoption timeout closes them.
         let pipes = try #require(StdioPipes.make(.all))
-        let token = try #require(await PendingAttachStart.shared.park(containerId: name, pipes: pipes))
-        defer { pipes.closeAll() }
+        guard let token = await PendingAttachStart.shared.park(containerId: name, pipes: pipes) else {
+            pipes.closeAll()
+            Issue.record("could not park the other client")
+            return
+        }
 
         try await withNodeApp(runtime) { app in
             try await app.testing().test(.POST, "/v1.51/containers/\(name)/attach?stream=1&stdout=1&stdin=\(stdin)") { res async in
@@ -278,7 +283,9 @@ struct ClusterNodeGuardRouteTests {
             }
         }
 
-        _ = await PendingAttachStart.shared.cancel(containerId: name, token: token)
+        if await PendingAttachStart.shared.cancel(containerId: name, token: token) {
+            pipes.closeAll()
+        }
         #expect(await runtime.calls.isEmpty, "no preparation")
     }
 
