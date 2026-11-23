@@ -94,7 +94,8 @@ extension ContainerAttachRoute {
         guard let container = try await client.getContainer(id: id) else {
             throw Abort(.notFound, reason: "No such container: \(id)")
         }
-        guard container.status == .stopped else { return container }
+        // A node is not started through this bridge, so it gets no preparation for a start.
+        guard container.status == .stopped, !ClusterNodeGuard.isNode(container) else { return container }
         try await client.prepareForStart(container: container)
         guard let prepared = try await client.getContainer(id: id) else {
             throw Abort(.notFound, reason: "No such container: \(id)")

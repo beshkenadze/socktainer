@@ -36,6 +36,8 @@ extension ContainerStartRoute {
                 let matchList = matches.joined(separator: ", ")
                 throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
             }
+            // Outside the do block below: its catch records a start failure.
+            try ClusterNodeGuard.refuse(preStartSnapshot)
 
             let runEpoch: Int
             do {

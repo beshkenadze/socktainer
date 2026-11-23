@@ -100,13 +100,15 @@ struct ContainerRenameRoute: RouteCollection {
             guard let container = try await lookup({ try await client.getContainer(id: id) }) else {
                 throw Abort(.notFound, reason: "No such container: \(id)")
             }
+            try ClusterNodeGuard.refuse(container)
 
             if container.id == newName {
                 // Renaming to the current name is a no-op in Docker, not a conflict.
                 return Response(status: .noContent)
             }
 
-            if try await lookup({ try await client.getContainer(id: newName) }) != nil {
+            if let holder = try await lookup({ try await client.getContainer(id: newName) }) {
+                try ClusterNodeGuard.refuse(holder)
                 throw Abort(.conflict, reason: "Conflict. The container name \"/\(newName)\" is already in use")
             }
 
@@ -131,6 +133,7 @@ struct ContainerRenameRoute: RouteCollection {
             // be read stops the rename.
             let listed = try await lookup { try await client.listEveryRuntimeContainer() }
             if let holder = listed.first(where: { $0.id != container.id && $0.id.lowercased() == newName.lowercased() }) {
+                try ClusterNodeGuard.refuse(holder)
                 throw ContainerNameConflict.abort(name: newName, holderID: ContainerNameConflict.holderID(of: holder))
             }
 

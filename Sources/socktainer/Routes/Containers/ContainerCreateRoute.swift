@@ -160,6 +160,22 @@ extension ContainerCreateRoute {
                 throw Abort(.badRequest, reason: "invalid container name: \(id)")
             }
 
+            // A node keeps its name. Checked before any write (volumes, create options, a
+            // shared-runtime session); the runtime's list includes the nodes that Docker lists hide.
+            if containerName != nil {
+                let listed: [ContainerSnapshot]
+                do {
+                    listed = try await client.listEveryRuntimeContainer()
+                } catch {
+                    throw Abort(
+                        .serviceUnavailable,
+                        reason: "Cannot create container \(id): the container list could not be read (\(error)). Nothing was changed")
+                }
+                if let node = ClusterNodeGuard.node(named: id, in: listed) {
+                    throw ContainerNameConflict.abort(name: id, holderID: ContainerNameConflict.holderID(of: node))
+                }
+            }
+
             // Validate the requested platform only if provided
             var requestedPlatform = try Platform(from: containerPlatform)
 

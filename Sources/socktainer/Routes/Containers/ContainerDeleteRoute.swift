@@ -31,6 +31,7 @@ extension ContainerDeleteRoute {
             let force = query.force ?? false
 
             let snapshot = try? await client.getContainer(id: id)
+            try ClusterNodeGuard.refuse(snapshot)
             let cached = await ContainerInfoCache.shared.get(id: id)
 
             let eventImage = snapshot?.configuration.image.reference ?? cached?.image ?? ""
@@ -70,6 +71,8 @@ extension ContainerDeleteRoute {
 
             do {
                 let container = try await client.getContainer(id: id)
+                // This lookup can find a node when the first one above failed.
+                try ClusterNodeGuard.refuse(container)
 
                 // Docker Engine API: removing a running container requires force=true.
                 // Checked before any side effect (healthcheck stop, DNS cleanup) so a
