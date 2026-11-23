@@ -43,6 +43,20 @@ struct ClusterNodePruneTests {
         #expect(await deletes.ids == ["old-job"], "the node is not deleted")
     }
 
+    @Test("a candidate whose new lookup fails is still deleted")
+    func failedLookup() async throws {
+        struct Dropped: Error {}
+        let deletes = DeleteLog()
+
+        let deleted = await ClientContainerService.deleteCandidates(
+            [try Fixtures.ordinary("old-job")],
+            current: { _ in throw Dropped() },
+            delete: { container in await deletes.add(container.id) })
+
+        #expect(deleted == ["old-job"])
+        #expect(await deletes.ids == ["old-job"])
+    }
+
     @Test("a candidate whose delete fails is left out, and the prune goes on")
     func failedDelete() async throws {
         let deleted = await ClientContainerService.deleteCandidates(

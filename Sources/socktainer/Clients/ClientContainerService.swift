@@ -941,6 +941,7 @@ struct ClientContainerService: ClientContainerProtocol {
     /// Deletes each prune candidate and returns the names of those deleted. A candidate whose
     /// delete fails is left out, and the prune goes on. So is a candidate that is a node of a
     /// Kubernetes cluster when its delete starts: a node can take the name after the listing.
+    /// Only a lookup that shows a node skips a candidate; a failed lookup does not.
     static func deleteCandidates(
         _ candidates: [ContainerSnapshot],
         current: (String) async throws -> ContainerSnapshot?,
@@ -948,7 +949,7 @@ struct ClientContainerService: ClientContainerProtocol {
     ) async -> [String] {
         var deleted: [String] = []
         for candidate in candidates {
-            guard let container = try? await current(candidate.id), !ClusterNodeGuard.isNode(container) else { continue }
+            if let container = try? await current(candidate.id), ClusterNodeGuard.isNode(container) { continue }
             do {
                 try await delete(candidate)
                 deleted.append(candidate.id)
