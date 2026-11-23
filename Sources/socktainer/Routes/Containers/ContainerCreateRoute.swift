@@ -528,9 +528,10 @@ extension ContainerCreateRoute {
             containerConfiguration.labels = labelsWithTimestamp
 
             var resolvedMounts: [Filesystem] = []
-            // Named volumes worth a copy-up, collected here and populated once the
-            // container exists: the image's contents are only reachable from it.
-            var copyUpCandidates: [(source: String, destination: String)] = []
+            // The ext4 named volumes of this container: VolumeImageWrites decides, around the
+            // native create, which of their images the host may write.
+            var volumeWrites: [VolumeImageWrites.Volume] = []
+            var createWarnings: [String] = []
 
             // Docker creates missing bind-mount source directories on the host automatically.
             // Parser.mounts() validates that the source path exists and throws if not, so we
@@ -593,11 +594,15 @@ extension ContainerCreateRoute {
                 let namedVolumeMounts = volumeMounts.filter { !$0.Source.isEmpty }
                 if !namedVolumeMounts.isEmpty {
                     let volumeStrings = namedVolumeMounts.map { mount in
-                        var volumeString = "\(mount.Source):\(mount.Target)"
+                        var options: [String] = []
                         if mount.ReadOnly == true {
-                            volumeString += ":ro"
+                            options.append("ro")
                         }
-                        return volumeString
+                        if mount.VolumeOptions?.NoCopy == true {
+                            options.append("nocopy")
+                        }
+                        return ([mount.Source, mount.Target] + (options.isEmpty ? [] : [options.joined(separator: ",")]))
+                            .joined(separator: ":")
                     }
                     let volumeMountsOrFs = try Parser.volumes(volumeStrings)
                     mountsOrFs.append(contentsOf: volumeMountsOrFs)
@@ -690,19 +695,7 @@ extension ContainerCreateRoute {
                             createdAnonymousVolumes.append(volume.name)
                         }
 
-                        // Strip /lost+found when PGDATA is set (any value) — that
-                        // reliably signals a Postgres container, and named volumes are
-                        // always mounted at their root so /lost+found is always reachable.
-                        // An empty volume is rebuilt by the copy-up below, which drops
-                        // /lost+found as part of it; reformatting here would be undone.
-                        if VolumeImageCleaner.isPostgresDataVolume(mergedEnv: mergedEnv),
-                            volume.format == "ext4",
-                            VolumeImageCleaner.isEnabled(labels: volume.labels),
-                            !VolumeCopyUp.isEmpty(volumeImagePath: volume.source)
-                        {
-                            VolumeImageCleaner.removeLostFound(imagePath: volume.source, logger: req.logger)
-                        }
-
+                        let (mountOptions, noCopy) = VolumeImageWrites.splitNoCopy(parsed.options)
                         // Per-volume sync label wins; fall back to global --volume-sync (default: nosync).
                         let syncMode =
                             volume.labels[Filesystem.SyncMode.socktainerLabel]
@@ -714,11 +707,14 @@ extension ContainerCreateRoute {
                             format: volume.format,
                             source: volume.source,
                             destination: parsed.destination,
-                            options: parsed.options,
+                            options: mountOptions,
                             sync: syncMode
                         )
                         if volume.format == "ext4" {
-                            copyUpCandidates.append((source: volume.source, destination: parsed.destination))
+                            volumeWrites.append(
+                                VolumeImageWrites.Volume(
+                                    name: volume.name, source: volume.source, destination: parsed.destination,
+                                    labels: volume.labels, noCopy: noCopy))
                         }
                         resolvedMounts.append(volumeMount)
                     }
@@ -769,24 +765,35 @@ extension ContainerCreateRoute {
                     // collides with the name.
                     try await PreStartInjectionStore.shared.rememberCreateOptions(
                         containerId: containerConfiguration.id, autoRemove: options.autoRemove)
-                    do {
-                        // Generated last, inside this cleanup scope, so no earlier failure can strand it.
-                        if !extraHosts.isEmpty,
-                            !containerConfiguration.mounts.contains(where: { $0.destination == ExtraHostsFile.guestPath })
-                        {
-                            let generated = try ExtraHostsFile.create(extraHosts: extraHosts, hostname: hostname)
-                            containerConfiguration.mounts.append(generated.mount)
-                            containerConfiguration.labels[ExtraHostsFile.label] = generated.label
-                        }
-                        try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
-                    } catch {
-                        try? await PreStartInjectionStore.shared.clear(containerId: containerConfiguration.id)
-                        ExtraHostsFile.remove(labels: containerConfiguration.labels)
-                        throw error
-                    }
-                    container = try await containerClient.get(id: containerConfiguration.id)
-                    req.logger.debug("Container created successfully with ID: \(container.id)")
-                    ContainerCreateRoute.populateEmptyVolumes(copyUpCandidates, for: container, logger: req.logger)
+                    let created = try await VolumeImageWrites.create(
+                        volumes: volumeWrites,
+                        mergedEnv: mergedEnv,
+                        listContainers: { try await containerClient.list() },
+                        nativeCreate: {
+                            do {
+                                // Generated last, inside this cleanup scope, so no earlier failure can strand it.
+                                if !extraHosts.isEmpty,
+                                    !containerConfiguration.mounts.contains(where: { $0.destination == ExtraHostsFile.guestPath })
+                                {
+                                    let generated = try ExtraHostsFile.create(extraHosts: extraHosts, hostname: hostname)
+                                    containerConfiguration.mounts.append(generated.mount)
+                                    containerConfiguration.labels[ExtraHostsFile.label] = generated.label
+                                }
+                                try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
+                            } catch {
+                                try? await PreStartInjectionStore.shared.clear(containerId: containerConfiguration.id)
+                                ExtraHostsFile.remove(labels: containerConfiguration.labels)
+                                throw error
+                            }
+                            let container = try await containerClient.get(id: containerConfiguration.id)
+                            req.logger.debug("Container created successfully with ID: \(container.id)")
+                            return container
+                        },
+                        writer: VolumeImageWrites.Production(logger: req.logger),
+                        logger: req.logger
+                    )
+                    container = created.container
+                    createWarnings = created.warnings
                 } catch {
                     req.logger.error("Failed to create container: \(error)")
                     throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
@@ -810,7 +817,7 @@ extension ContainerCreateRoute {
                 await broadcaster.broadcast(ContainerCreateRoute.makeCreateEvent(for: container))
             }
             // Docker Engine API: POST /containers/create returns 201 Created.
-            let createResponse = RESTContainerCreate(Id: hexId, Warnings: [])
+            let createResponse = RESTContainerCreate(Id: hexId, Warnings: createWarnings)
             let httpResponse = try await createResponse.encodeResponse(for: req)
             httpResponse.status = .created
             return httpResponse
@@ -965,30 +972,26 @@ extension ContainerCreateRoute {
     /// the container exists, which is when the image's filesystem can be read, and
     /// always before it starts. Best-effort: a volume that cannot be prepared is
     /// left as it was rather than failing the creation.
+    /// Copies up each candidate; returns why each one that did not complete failed, keyed by
+    /// the volume's image path.
     static func populateEmptyVolumes(
         _ candidates: [(source: String, destination: String)],
         for container: ContainerSnapshot,
         logger: Logger
-    ) {
-        guard !candidates.isEmpty else { return }
+    ) -> [String: VolumeCopyUp.Failure] {
+        guard !candidates.isEmpty else { return [:] }
         let appSupport = URL(fileURLWithPath: "\(NSHomeDirectory())/Library/Application Support/com.apple.container")
         guard
             let rootfs = VolumeCopyUp.imageFilesystem(
                 containerId: container.id, appSupportPath: appSupport)
-        else { return }
-
-        for candidate in candidates where VolumeCopyUp.isEmpty(volumeImagePath: candidate.source) {
-            do {
-                try VolumeCopyUp.populate(
-                    volumeImagePath: candidate.source,
-                    fromRootfs: rootfs.path,
-                    sourcePath: candidate.destination,
-                    logger: logger
-                )
-            } catch {
-                logger.warning("[volume-copyup] \(candidate.destination) left empty: \(error)")
-            }
+        else {
+            let reason = "the container's image file system could not be found"
+            return Dictionary(
+                candidates.map { ($0.source, VolumeCopyUp.Failure(reason: reason, verdict: VolumeImageEligibility.check(imagePath: $0.source))) },
+                uniquingKeysWith: { first, _ in first })
         }
+
+        return VolumeCopyUp.populateInOrder(candidates, fromRootfs: rootfs.path, logger: logger)
     }
 
     static func makeCreateEvent(for container: ContainerSnapshot) -> DockerEvent {
@@ -1023,9 +1026,13 @@ extension ContainerCreateRoute {
         guard mount.Target.hasPrefix("/") else {
             throw ContainerizationError(.invalidArgument, message: "invalid volume destination: \(mount.Target)")
         }
+        var options: [String] = mount.ReadOnly == true ? ["ro"] : []
+        if mount.VolumeOptions?.NoCopy == true {
+            options.append("nocopy")
+        }
         return ParsedVolume(
             name: VolumeStorage.generateAnonymousVolumeName(), destination: mount.Target,
-            options: mount.ReadOnly == true ? ["ro"] : [], isAnonymous: true)
+            options: options, isAnonymous: true)
     }
 
     static func validateCpuLimits(hostConfig: HostConfig?) -> String? {

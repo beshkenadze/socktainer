@@ -12,18 +12,6 @@ import SystemPackage
 /// instead, which is why an image like Postgres cannot initialise its own data
 /// directory on a new volume.
 enum VolumeCopyUp {
-    /// True when the volume holds nothing but what a freshly formatted EXT4 image
-    /// always carries. Copy-up applies to empty volumes only: Docker leaves a
-    /// volume that already has contents alone.
-    static func isEmpty(volumeImagePath: String) -> Bool {
-        guard let reader = try? EXT4.EXT4Reader(blockDevice: FilePath(volumeImagePath)),
-            let entries = try? reader.listDirectory(FilePath("/"))
-        else {
-            return false
-        }
-        return entries.allSatisfy { $0 == "." || $0 == ".." || $0 == "lost+found" }
-    }
-
     /// Where the image's filesystem lives for a container that has been created
     /// but never started. Apple Container writes the reference at create time;
     /// until the container runs there is no per-container rootfs to read.
@@ -46,11 +34,58 @@ enum VolumeCopyUp {
         let source = URL(fileURLWithPath: config.containerRootFilesystem.source)
         return FileManager.default.fileExists(atPath: source.path) ? source : nil
     }
+    /// Copies up each mount in the order given, as 166bbd5 did: each mount is judged again right
+    /// before its write, so a volume that an earlier mount filled is skipped, and a volume that an
+    /// earlier mount left empty (its copy-up failed, or its path was absent) gets the next mount.
+    /// Returns, per image path, why its volume was not prepared, with the verdict of the last
+    /// eligibility check of that image.
+    static func populateInOrder(
+        _ mounts: [(source: String, destination: String)],
+        fromRootfs rootfs: String,
+        logger: Logger
+    ) -> [String: Failure] {
+        var failures: [String: Failure] = [:]
+        var prepared = Set<String>()
+        for mount in mounts {
+            let verdict = VolumeImageEligibility.check(imagePath: mount.source)
+            switch verdict {
+            case .holdsData:
+                failures[mount.source] = nil
+                continue
+            case .doubtful(let reason):
+                if !prepared.contains(mount.source) {
+                    failures[mount.source] = Failure(reason: "its image could not be judged: \(reason)", verdict: verdict)
+                }
+                continue
+            case .replaceable:
+                break
+            }
+            do {
+                try populate(volumeImagePath: mount.source, fromRootfs: rootfs, sourcePath: mount.destination, logger: logger)
+                prepared.insert(mount.source)
+                failures[mount.source] = nil
+            } catch {
+                logger.warning("[volume-copyup] \(mount.destination) not copied: \(error)")
+                if !prepared.contains(mount.source) {
+                    failures[mount.source] = Failure(reason: "the copy-up failed: \(error)", verdict: verdict)
+                }
+            }
+        }
+        return failures
+    }
 
     /// Rebuilds the volume image so its root carries what the image holds at
     /// `sourcePath`. Runs even when the image has nothing there, because the
     /// rebuild is also what drops `/lost+found` — a Docker volume never has one,
-    /// and Postgres refuses a data directory that does.
+    /// and Postgres refuses a data directory that does. Only an image that
+    /// `VolumeImageEligibility` finds empty and clean is replaced; it throws for
+    /// any other, which is left as it is.
+    /// Why a volume was not prepared, and what the last eligibility check of its image found.
+    struct Failure: Equatable, Sendable {
+        let reason: String
+        let verdict: VolumeImageEligibility.Verdict
+    }
+
     static func populate(
         volumeImagePath: String,
         fromRootfs rootfsPath: String,
@@ -66,40 +101,24 @@ enum VolumeCopyUp {
             if inode.isDirectory { rootInode = inode }
         }
 
-        let attributes = try FileManager.default.attributesOfItem(atPath: volumeImagePath)
-        let currentSize = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
-        let destination = URL(fileURLWithPath: volumeImagePath)
-        let staging = destination.deletingLastPathComponent()
-            .appendingPathComponent("copyup-\(UUID().uuidString).img")
-
-        var completed = false
-        defer { if !completed { try? FileManager.default.removeItem(at: staging) } }
-
-        let formatter = try EXT4.Formatter(
-            FilePath(staging.path),
-            blockSize: 4096,
-            minDiskSize: max(currentSize, 4 * 1024 * 1024)
-        )
-        if let rootInode {
-            // The mount root carries ownership of its own: a directory the image
-            // hands to a non-root user is unusable if only its children are copied.
-            try formatter.create(
-                path: FilePath("/"),
-                mode: rootInode.mode,
-                ts: timestamps(of: rootInode),
-                uid: rootInode.fullUid,
-                gid: rootInode.fullGid
-            )
-            var linkedInodes: [EXT4.InodeNumber: FilePath] = [:]
-            try copyChildren(
-                of: source, from: reader, into: formatter,
-                at: FilePath("/"), linked: &linkedInodes, logger: logger)
+        try VolumeImageReplacement.replace(imagePath: volumeImagePath) { formatter in
+            if let rootInode {
+                // The mount root carries ownership of its own: a directory the image
+                // hands to a non-root user is unusable if only its children are copied.
+                try formatter.create(
+                    path: FilePath("/"),
+                    mode: rootInode.mode,
+                    ts: timestamps(of: rootInode),
+                    uid: rootInode.fullUid,
+                    gid: rootInode.fullGid
+                )
+                var linkedInodes: [EXT4.InodeNumber: FilePath] = [:]
+                try copyChildren(
+                    of: source, from: reader, into: formatter,
+                    at: FilePath("/"), linked: &linkedInodes, logger: logger)
+            }
+            try formatter.unlink(path: FilePath("/lost+found"))
         }
-        try formatter.unlink(path: FilePath("/lost+found"))
-        try formatter.close()
-
-        _ = try FileManager.default.replaceItemAt(destination, withItemAt: staging)
-        completed = true
     }
 
     private static func copyChildren(

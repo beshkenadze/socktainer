@@ -16,7 +16,7 @@ final class VolumeCopyUpTests {
         defer { fixture.cleanUp() }
 
         try fixture.makeVolume()
-        #expect(VolumeCopyUp.isEmpty(volumeImagePath: fixture.volume.path))
+        #expect(VolumeImageEligibility.check(imagePath: fixture.volume.path) == .replaceable(hasLostFound: true))
 
         try fixture.makeRootfs { formatter in
             try formatter.create(path: FilePath("/data"), mode: EXT4.Inode.Mode(.S_IFDIR, 0o755))
@@ -26,7 +26,7 @@ final class VolumeCopyUpTests {
             volumeImagePath: fixture.volume.path, fromRootfs: fixture.rootfs.path,
             sourcePath: "/data", logger: logger)
 
-        #expect(!VolumeCopyUp.isEmpty(volumeImagePath: fixture.volume.path))
+        #expect(VolumeImageEligibility.check(imagePath: fixture.volume.path) == .holdsData)
     }
 
     @Test("contents, ownership and permissions arrive at the volume root")
