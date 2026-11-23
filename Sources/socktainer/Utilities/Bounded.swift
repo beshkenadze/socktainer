@@ -36,10 +36,12 @@ enum Bounded {
             // The timer runs on a dispatch queue, not in a task: a busy cooperative pool cannot
             // delay it. When the operation answers first, the timer's answer is dropped.
             DispatchQueue.global().asyncAfter(deadline: .now() + Self.interval(bound)) {
-                if gate.answer(.failure(TimedOut(bound: bound))) {
-                    onTimeout()
-                    work.cancel()
-                }
+                // Claim the answer, run the hook, then answer: the hook has run when the caller
+                // resumes.
+                guard let continuation = gate.claim() else { return }
+                onTimeout()
+                work.cancel()
+                continuation.resume(throwing: TimedOut(bound: bound))
             }
         }
     }
@@ -61,18 +63,19 @@ enum Bounded {
             state.withLock { $0.continuation = continuation }
         }
 
-        /// True when this answer is the one that the caller gets.
-        @discardableResult
-        func answer(_ result: Result<T, Error>) -> Bool {
-            let continuation = state.withLock { state -> CheckedContinuation<T, Error>? in
+        /// The caller's continuation, to the first claimant only.
+        func claim() -> CheckedContinuation<T, Error>? {
+            state.withLock { state -> CheckedContinuation<T, Error>? in
                 guard !state.answered, let continuation = state.continuation else { return nil }
                 state.answered = true
                 state.continuation = nil
                 return continuation
             }
-            guard let continuation else { return false }
-            continuation.resume(with: result)
-            return true
+        }
+
+        /// Answers the caller unless another answer came first.
+        func answer(_ result: Result<T, Error>) {
+            claim()?.resume(with: result)
         }
     }
 }
