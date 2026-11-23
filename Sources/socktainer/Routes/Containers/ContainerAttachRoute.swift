@@ -16,10 +16,16 @@ private struct ContainerAttachQuery: Content {
 }
 
 struct ContainerAttachRoute: RouteCollection {
+    /// Opens the log handles of a container. Injected for tests.
+    typealias OpenLogs = @Sendable (String) async throws -> [FileHandle]
+    static let nativeLogs: OpenLogs = { try await ContainerClient().logs(id: $0) }
+
     let client: ClientContainerProtocol
+    var openLogs: OpenLogs = ContainerAttachRoute.nativeLogs
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/attach", use: ContainerAttachRoute.handler(client: client))
+        try routes.registerVersionedRoute(
+            .POST, pattern: "/containers/{id}/attach", use: ContainerAttachRoute.handler(client: client, openLogs: openLogs))
     }
 }
 
@@ -60,7 +66,7 @@ extension ContainerAttachRoute {
         await broadcaster.broadcast(DockerEvent.containerEvent("detach", container: container))
     }
 
-    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
+    static func handler(client: ClientContainerProtocol, openLogs: @escaping OpenLogs = nativeLogs) -> @Sendable (Request) async throws -> Response {
         { req in
             // TODO: This should be refactored to some generic implementation that is shared
             //       with /containers/{id}/exec route.
@@ -68,7 +74,7 @@ extension ContainerAttachRoute {
             let upgradeHeader = req.headers.first(name: "Upgrade")?.lowercased()
             let shouldUpgradeToTCP = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp"
 
-            let response = try await handleAttachRequest(req: req, client: client)
+            let response = try await handleAttachRequest(req: req, client: client, openLogs: openLogs)
 
             // If client requested upgrade and handler returned OK,
             // convert to 101 Switching Protocols
@@ -88,14 +94,20 @@ extension ContainerAttachRoute {
         }
     }
 
+    /// Whether an attach to `container` waits for its start: it gets the start preparation, a DNS
+    /// sidecar and parked stdio. Any other attach streams the container's log. A cluster node is
+    /// never started through this bridge (ClusterNodeGuard), so its attach streams the log.
+    static func startsOnAttach(_ container: ContainerSnapshot) -> Bool {
+        container.status == .stopped && !ClusterNodeGuard.isNode(container)
+    }
+
     /// Preparation can recreate the container, or wait while another request
     /// starts it. Select the attach path using the fresh state in either case.
     static func preparedContainer(id: String, client: ClientContainerProtocol) async throws -> ContainerSnapshot {
         guard let container = try await client.getContainer(id: id) else {
             throw Abort(.notFound, reason: "No such container: \(id)")
         }
-        // A node is not started through this bridge, so it gets no preparation for a start.
-        guard container.status == .stopped, !ClusterNodeGuard.isNode(container) else { return container }
+        guard startsOnAttach(container) else { return container }
         try await client.prepareForStart(container: container)
         guard let prepared = try await client.getContainer(id: id) else {
             throw Abort(.notFound, reason: "No such container: \(id)")
@@ -103,7 +115,7 @@ extension ContainerAttachRoute {
         return prepared
     }
 
-    private static func handleAttachRequest(req: Request, client: ClientContainerProtocol) async throws -> Response {
+    private static func handleAttachRequest(req: Request, client: ClientContainerProtocol, openLogs: @escaping OpenLogs) async throws -> Response {
         guard let id = req.parameters.get("id") else {
             throw Abort(.badRequest, reason: "Missing container ID")
         }
@@ -152,7 +164,7 @@ extension ContainerAttachRoute {
         // for fast-exiting containers (#220): the container can produce output and exit
         // before the polling loop finds the log file, silently dropping all output.
         // Pipe-based bootstrapping captures output directly and eliminates the race.
-        if container.status == .stopped {
+        if startsOnAttach(container) {
             await ContainerStartRoute.ensureDNSSidecarBeforeStart(for: container, req: req)
             guard stdin else {
                 // Output-only attach (docker run / docker run -a STDOUT -a STDERR).
@@ -221,7 +233,7 @@ extension ContainerAttachRoute {
                 // Wait until the log file is available (container must be created first).
                 var logHandle: FileHandle? = nil
                 while logHandle == nil {
-                    if let fhs = try? await ContainerClient().logs(id: container.id), !fhs.isEmpty {
+                    if let fhs = try? await openLogs(container.id), !fhs.isEmpty {
                         logHandle = fhs[0]
                         // Close the boot-log handle we don't need.
                         if fhs.count > 1 { try? fhs[1].close() }

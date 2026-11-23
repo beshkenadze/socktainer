@@ -253,46 +253,35 @@ struct ClusterNodeGuardRouteTests {
 
     // MARK: - Maintenance access
 
-    @Test("HTTP attach to a stopped node runs no preparation", arguments: ["0", "1"])
+    /// Before the fix this attach parked stdio and waited for a start; the time limit ends that wait.
+    @Test(
+        "HTTP attach to a stopped node streams its log, with no preparation and no parked stdio", .timeLimit(.minutes(1)),
+        arguments: ["0", "1"])
     func httpAttach(stdin: String) async throws {
         let name = Fixtures.uniqueName("node-attach")
         let runtime = RecordingNodeRuntime([try Fixtures.node(name, status: .stopped)])
-        // Another client already waits for this node, so the attach answers 409 right after its
-        // preparation step instead of waiting for a start.
-        // The parked pipes belong to PendingAttachStart until `cancel` gives them back; when the
-        // test ends early, its adoption timeout closes them.
-        let pipes = try #require(StdioPipes.make(.all))
-        guard let token = await PendingAttachStart.shared.park(containerId: name, pipes: pipes) else {
-            pipes.closeAll()
-            Issue.record("could not park the other client")
-            return
-        }
+        let log = FileManager.default.temporaryDirectory.appendingPathComponent("\(name).log")
+        try Data("node log\n".utf8).write(to: log)
+        defer { try? FileManager.default.removeItem(at: log) }
 
-        try await withNodeApp(runtime) { app in
-            try await app.testing().test(.POST, "/v1.51/containers/\(name)/attach?stream=1&stdout=1&stdin=\(stdin)") { res async in
-                #expect(res.status == .conflict)
-                #expect(Fixtures.message(res.body)?.contains("already has a client attached") == true)
+        try await withNodeApp(runtime, openLogs: { _ in [try FileHandle(forReadingFrom: log)] }) { app in
+            try await app.testing().test(.POST, "/v1.51/containers/\(name)/attach?stream=0&logs=1&stdout=1&stdin=\(stdin)") { res async in
+                #expect(res.status == .ok)
+                #expect(res.body.string.contains("node log"))
             }
         }
 
-        if await PendingAttachStart.shared.cancel(containerId: name, token: token) {
-            pipes.closeAll()
-        }
+        #expect(await PendingAttachStart.shared.claim(containerId: name) == nil, "no parked stdio")
         #expect(await runtime.calls.isEmpty, "no preparation")
     }
 
-    @Test("WebSocket attach to a stopped node runs no preparation")
-    func webSocketAttach() async throws {
-        let name = Fixtures.uniqueName("node-attach-ws")
-        let runtime = RecordingNodeRuntime([try Fixtures.node(name, status: .stopped)])
-
-        try await withNodeApp(runtime) { app in
-            try await app.testing().test(.GET, "/v1.51/containers/\(name)/attach/ws?stream=1&stdout=1") { res async in
-                #expect(res.status.code < 400, "the attach is allowed")
-            }
-        }
-
-        #expect(await runtime.calls.isEmpty, "no preparation")
+    /// Both attach routes use this rule. The WebSocket route cannot open its socket in these tests.
+    @Test("only a stopped container that is not a node waits for its start on attach")
+    func startsOnAttach() throws {
+        #expect(!ContainerAttachRoute.startsOnAttach(try Fixtures.node("node", status: .stopped)))
+        #expect(!ContainerAttachRoute.startsOnAttach(try Fixtures.node("node", status: .running)))
+        #expect(ContainerAttachRoute.startsOnAttach(try Fixtures.ordinary("plain", status: .stopped)))
+        #expect(!ContainerAttachRoute.startsOnAttach(try Fixtures.ordinary("plain", status: .running)))
     }
 
     @Test("the preparation step of both attach routes returns a stopped node unchanged")
@@ -440,6 +429,7 @@ private func withNodeApp(
     _ runtime: RecordingNodeRuntime,
     archive: RecordingArchive = RecordingArchive(),
     recreated: Recorder = Recorder(),
+    openLogs: @escaping ContainerAttachRoute.OpenLogs = ContainerAttachRoute.nativeLogs,
     configure: @escaping @Sendable (Application) -> Void = { _ in },
     _ test: @escaping (Application) async throws -> Void
 ) async throws {
@@ -462,7 +452,7 @@ private func withNodeApp(
                 recreate: { configuration in await recreated.add(configuration.id) },
                 runtimeAppRoot: { URL(fileURLWithPath: "/nonexistent") }))
         try app.register(collection: ContainerArchiveRoute(containerClient: runtime, archiveClient: archive))
-        try app.register(collection: ContainerAttachRoute(client: runtime))
+        try app.register(collection: ContainerAttachRoute(client: runtime, openLogs: openLogs))
         try app.register(collection: ContainerAttachWSRoute(client: runtime))
         try app.register(collection: ExecRoute(client: runtime))
         try await test(app)

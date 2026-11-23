@@ -37,7 +37,7 @@ extension ContainerAttachWSRoute {
             // no stdcopy header, matches moby's wsContainersAttach behaviour.
             return req.webSocket { req, ws in
                 Task {
-                    if container.status == .stopped {
+                    if ContainerAttachRoute.startsOnAttach(container) {
                         await handleStopped(
                             ws: ws, req: req, hexId: id, container: container, query: query)
                     } else {
