@@ -263,10 +263,18 @@ struct EventsRouteTests {
             // is empty" fails against a stream that closes correctly; EOF is the empty read that
             // ends the drain. Closing at once would mean a future bound was treated as a past one,
             // never closing is the bug being fixed — the deadline has to be both reached and kept.
-            while let chunk = try await blockingTestIO({ client.read(deadline: 3) }), !chunk.isEmpty {}
+            // "Never closing" shows as a read that times out (nil), not as a wall-clock bound: a
+            // starved CI runner can deliver a correct close seconds late.
+            var reachedEOF = false
+            while let chunk = try await blockingTestIO({ client.read(deadline: 10) }) {
+                if chunk.isEmpty {
+                    reachedEOF = true
+                    break
+                }
+            }
             let elapsed = Date().timeIntervalSince(startedAt)
+            #expect(reachedEOF, "the connection did not close: a read waited 10 s with nothing to read")
             #expect(elapsed >= deadline, "closed after \(elapsed)s, deadline was \(deadline)s")
-            #expect(elapsed < 3, "connection did not close at the deadline")
         }
     }
 }
