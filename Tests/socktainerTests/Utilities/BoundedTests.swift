@@ -48,9 +48,12 @@ final class NeverAnswered: Sendable {
 
     @Test("an answer before the bound is returned, and an error is passed on")
     func answers() async throws {
-        #expect(try await Bounded.value(within: .seconds(5)) { 7 } == 7)
+        // With one cooperative thread, other tests can delay even an immediate reply.
+        // This bound is a watchdog. The test above checks the timeout path.
+        let watchdog = Duration.seconds(30)
+        #expect(try await Bounded.value(within: watchdog) { 7 } == 7)
         await #expect(throws: CancellationError.self) {
-            _ = try await Bounded.value(within: .seconds(5)) { () async throws -> Int in throw CancellationError() }
+            _ = try await Bounded.value(within: watchdog) { () async throws -> Int in throw CancellationError() }
         }
     }
 }

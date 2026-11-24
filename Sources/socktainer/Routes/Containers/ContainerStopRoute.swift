@@ -24,6 +24,7 @@ extension ContainerStopRoute {
             let timeout = query.t
 
             let snapshot = try? await client.getContainer(id: id)
+            try ClusterNodeGuard.refuse(snapshot)
 
             // Docker Engine API: stopping an already-stopped container is a 304
             // Not Modified with no stop/die event (moby's containerStop returns

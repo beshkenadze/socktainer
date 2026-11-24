@@ -24,6 +24,7 @@ extension ContainerRestartRoute {
             let timeout = query.t
 
             let snapshot = try? await client.getContainer(id: id)
+            try ClusterNodeGuard.refuse(snapshot)
 
             if let nativeId = snapshot?.id {
                 await ContainerRestartState.shared.reset(id: nativeId)

@@ -249,7 +249,8 @@ struct ClientContainerService: ClientContainerProtocol {
     /// `container machine` VMs) are managed through that plugin, and removing one from
     /// under it breaks what it manages, so they stay out of Docker listings and prunes —
     /// much as `container ls` hides machines. A `label` filter that names the plugin
-    /// label brings them back. Lookups by name or ID still find them.
+    /// label brings them back, but a prune never deletes a cluster node
+    /// (`ClusterNodeGuard`). Lookups by name or ID still find them.
     static func isPluginContainer(_ snapshot: ContainerSnapshot) -> Bool {
         snapshot.configuration.labels[ResourceLabelKeys.plugin] != nil
     }
@@ -474,14 +475,28 @@ struct ClientContainerService: ClientContainerProtocol {
         guard !staged.isEmpty else { return }
 
         try await Self.preStartInjectionAdmission.withSlot {
-            // Docker can issue /start while attach is preparing the same container.
-            // Refresh under the gate so a stale snapshot cannot recreate it twice.
-            guard let current = try await self.getContainerWithoutPreparationWait(id: container.id) else {
-                throw ClientContainerError.notFound(id: container.id)
-            }
-            guard current.status == .stopped else { return }
-            try await self.applyPreStartInjections(container: current, staged: staged)
+            try await Self.prepareRefreshed(
+                id: container.id,
+                current: { try await self.getContainerWithoutPreparationWait(id: $0) },
+                rebuild: { try await self.applyPreStartInjections(container: $0, staged: staged) })
         }
+    }
+
+    /// The part of the preparation under the gate. Docker can issue /start while attach is
+    /// preparing the same container, so the container is looked up again here: a stale snapshot
+    /// cannot recreate it twice.
+    static func prepareRefreshed(
+        id: String,
+        current: (String) async throws -> ContainerSnapshot?,
+        rebuild: (ContainerSnapshot) async throws -> Void
+    ) async throws {
+        guard let refreshed = try await current(id) else {
+            throw ClientContainerError.notFound(id: id)
+        }
+        guard refreshed.status == .stopped else { return }
+        // A node can take the name before this lookup; it is never rebuilt.
+        try ClusterNodeGuard.refuse(refreshed)
+        try await rebuild(refreshed)
     }
 
     private func applyPreStartInjections(container: ContainerSnapshot, staged: [Filesystem]) async throws {
@@ -848,8 +863,9 @@ struct ClientContainerService: ClientContainerProtocol {
 
     /// The containers `prune(filters:)` deletes from `allContainers`, DNS sidecars already removed.
     static func pruneCandidates(_ allContainers: [ContainerSnapshot], filters: [String: [String]]) -> [ContainerSnapshot] {
+        // A label filter can bring back plugin containers, but never a node of a Kubernetes cluster.
         var containersToDelete: [ContainerSnapshot] = withoutPluginContainers(allContainers, unlessLabelFilters: filters["label"])
-            .filter { $0.status == .stopped }
+            .filter { $0.status == .stopped && !ClusterNodeGuard.isNode($0) }
 
         for (key, values) in filters {
             switch key {
@@ -921,22 +937,40 @@ struct ClientContainerService: ClientContainerProtocol {
         //       Perhaps we should fetch the image size ourselves.
         let spaceReclaimed: Int64 = 0
 
-        var deletedIds: [String] = []
-
-        for container in containersToDelete {
-            do {
+        let deletedIds = await Self.deleteCandidates(
+            containersToDelete,
+            current: { id in try await containerClient.withClient { try await $0.get(id: id) } },
+            delete: { container in
                 try await containerClient.withClient { try await $0.delete(id: container.id) }
                 // Pruning reclaims a container, so it reclaims what was staged for
                 // it too: those files are whatever a client uploaded, secrets
                 // included.
                 try await PreStartInjectionStore.shared.clear(containerId: container.id)
                 ExtraHostsFile.remove(labels: container.configuration.labels)
-                deletedIds.append(container.id)
+            })
+
+        return (deletedContainers: deletedIds, spaceReclaimed: spaceReclaimed)
+    }
+
+    /// Deletes each prune candidate and returns the names of those deleted. A candidate whose
+    /// delete fails is left out, and the prune goes on. So is a candidate that is a node of a
+    /// Kubernetes cluster when its delete starts: a node can take the name after the listing.
+    /// Only a lookup that shows a node skips a candidate; a failed lookup does not.
+    static func deleteCandidates(
+        _ candidates: [ContainerSnapshot],
+        current: (String) async throws -> ContainerSnapshot?,
+        delete: (ContainerSnapshot) async throws -> Void
+    ) async -> [String] {
+        var deleted: [String] = []
+        for candidate in candidates {
+            if let container = try? await current(candidate.id), ClusterNodeGuard.isNode(container) { continue }
+            do {
+                try await delete(candidate)
+                deleted.append(candidate.id)
             } catch {
                 continue
             }
         }
-
-        return (deletedContainers: deletedIds, spaceReclaimed: spaceReclaimed)
+        return deleted
     }
 }

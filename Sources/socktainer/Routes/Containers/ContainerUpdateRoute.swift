@@ -40,6 +40,7 @@ struct ContainerUpdateRoute: RouteCollection {
             } catch ClientContainerError.ambiguousId(let reference, let matches) {
                 throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matches.joined(separator: ", "))")
             }
+            try ClusterNodeGuard.refuse(container)
 
             let body = try req.content.decode(ContainerUpdateRequest.self)
             let fixedResources = Self.requestedFixedResources(body)

@@ -116,6 +116,7 @@ struct ContainerArchiveRoute: RouteCollection {
             guard let container = try await containerClient.getContainer(id: id) else {
                 throw Abort(.notFound, reason: "No such container: \(id)")
             }
+            try ClusterNodeGuard.refuse(container)
 
             let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             let tarPath = tempDir.appendingPathComponent("archive.tar")

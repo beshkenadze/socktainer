@@ -31,7 +31,7 @@ extension ContainerPruneRoute {
             // carry image/name/labels (moby emits a `destroy` per removed container, then
             // the aggregate `prune`). The container is gone by the time prune() returns.
             var preSnapshots = (try? await client.list(showAll: true, filters: [:])) ?? []
-            // Plugin containers are only listed when asked for, and only pruned then too.
+            // Plugin containers are only listed when asked for, and only pruned then too (never a cluster node).
             if ClientContainerService.namesPluginLabel(parsedFilters["label"] ?? []) {
                 preSnapshots += (try? await client.list(showAll: true, filters: ["label": [ResourceLabelKeys.plugin]])) ?? []
             }

@@ -25,6 +25,7 @@ extension ContainerKillRoute {
 
             let signal = query.signal ?? nil
             let snapshot = try? await client.getContainer(id: containerId)
+            try ClusterNodeGuard.refuse(snapshot)
 
             do {
                 try await client.kill(id: containerId, signal: signal)

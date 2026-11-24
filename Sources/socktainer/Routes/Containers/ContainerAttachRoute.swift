@@ -94,11 +94,14 @@ extension ContainerAttachRoute {
         guard let container = try await client.getContainer(id: id) else {
             throw Abort(.notFound, reason: "No such container: \(id)")
         }
+        // Before the preparation, the DNS sidecar and the parked stdio of both attach routes.
+        try ClusterNodeGuard.refuseAttach(container)
         guard container.status == .stopped else { return container }
         try await client.prepareForStart(container: container)
         guard let prepared = try await client.getContainer(id: id) else {
             throw Abort(.notFound, reason: "No such container: \(id)")
         }
+        try ClusterNodeGuard.refuseAttach(prepared)
         return prepared
     }
 
